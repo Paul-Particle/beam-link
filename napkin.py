@@ -56,6 +56,38 @@ def surface_precision(frequency_hz, fraction=1 / 16):
     return wavelength(frequency_hz) * fraction
 
 
+def power_density_limited_diameter(power_w, density_wcm2=25.0):
+    """Min aperture diameter to radiate/collect `power_w` without exceeding a surface
+    power-density limit (~25 W/cm² for solid-state arrays and rectennas alike):
+    d = 2·√(P/(π·S)). Small apertures hit this floor long before the diffraction
+    minimum — which is why the 'diffraction-tiny' feed dish is really power-density-bound."""
+    area_m2 = power_w / (density_wcm2 * 1e4)
+    return 2.0 * np.sqrt(area_m2 / np.pi)
+
+
+# --- Atmospheric attenuation (rain) -------------------------------------------
+
+RAIN_K, RAIN_ALPHA = 0.1871, 1.0214   # ITU-R P.838, 30 GHz, horizontal pol (conservative)
+
+
+def specific_rain_attenuation(rain_rate_mmh, k=RAIN_K, alpha=RAIN_ALPHA):
+    """ITU-R P.838 specific attenuation γ = k·R^α [dB/km]. Defaults: 30 GHz, H-pol."""
+    return k * rain_rate_mmh ** alpha
+
+
+def rain_fade_db(rain_rate_mmh, rain_height_km, elevation_deg=90.0, k=RAIN_K, alpha=RAIN_ALPHA):
+    """Rain attenuation over a slant path through a rain layer of depth `rain_height_km`
+    at the given elevation: γ·h_R/sin(ε). 90° = vertical hop; low (grazing) elevation
+    blows the path length — and hence the dB — up."""
+    path_km = rain_height_km / np.sin(np.radians(elevation_deg))
+    return specific_rain_attenuation(rain_rate_mmh, k, alpha) * path_km
+
+
+def db_to_fraction(db):
+    """Power fraction surviving `db` of attenuation: 10^(−db/10)."""
+    return 10.0 ** (-db / 10.0)
+
+
 # --- Flight profile -----------------------------------------------------------
 
 def glide_range_km(lift_to_drag, altitude_drop_m):
