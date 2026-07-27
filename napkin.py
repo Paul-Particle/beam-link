@@ -163,6 +163,67 @@ def aerostat_diameter_m(altitude_m, cable_kg_per_m, payload_kg, gas="hydrogen"):
     return (6.0 * volume / np.pi) ** (1 / 3)
 
 
+# --- Curvature, wind, and tether blow-over ------------------------------------
+
+def line_of_sight_km(alt1_m, alt2_m, earth_radius_m=6.371e6):
+    """Geometric line-of-sight range between two altitudes over a spherical Earth:
+    √(2R·h1)+√(2R·h2). Caps ground-station reach; quantifies the reach benefit of a relay."""
+    return (np.sqrt(2 * earth_radius_m * alt1_m) + np.sqrt(2 * earth_radius_m * alt2_m)) / 1e3
+
+
+def wind_profile(altitude_m, v_jet=40.0, v_strato=20.0, v_surface=8.0,
+                 jet_center_m=11000.0, jet_sigma_m=2500.0):
+    """Stylized wind speed vs altitude: a Gaussian jet-stream bump at the tropopause over a
+    background rising from surface to stratosphere. Napkin only — real profiles vary widely."""
+    jet = v_jet * np.exp(-0.5 * ((altitude_m - jet_center_m) / jet_sigma_m) ** 2)
+    background = v_surface + (v_strato - v_surface) * np.clip(altitude_m / 20000.0, 0, 1)
+    return np.maximum(jet, background)
+
+
+def tether_blowover(aerostat_diam_m, payload_kg, target_alt_m=20000.0, gas="hydrogen",
+                    v_jet=40.0, v_strato=20.0, v_surface=8.0, tether="Dyneema (UHMWPE)",
+                    safety_factor=2.0, cd_cable=1.1, cd_sphere=0.5, envelope_kgm2=0.15, steps=800):
+    """Static blow-over of a tethered stratospheric aerostat under a wind profile.
+
+    Net buoyancy/free lift tensions the cable; the aerostat's bluff-body drag plus the tether's
+    distributed drag tilt it. Returns free lift, the two drag terms, tilt at the anchor, downwind
+    excursion, the altitude actually reached on a target-length cable, and the breaking/peak-tension
+    margin. STATIC only — no vortex-induced vibration, gusts, or dynamics (the real open risk).
+    """
+    sigma, rho_cable = TETHER_MATERIALS[tether]
+    volume = np.pi / 6 * aerostat_diam_m ** 3
+    gross_lift = volume * net_lift_per_m3(target_alt_m, gas) * GRAVITY          # net-of-gas lift, N
+    envelope_mass = np.pi * aerostat_diam_m ** 2 * envelope_kgm2
+    cable_diam = 2 * np.sqrt(gross_lift * safety_factor / sigma / np.pi)
+    cable_weight_per_m = rho_cable * np.pi * (cable_diam / 2) ** 2 * GRAVITY
+    cable_mass = cable_weight_per_m / GRAVITY * target_alt_m
+    free_lift = gross_lift - GRAVITY * (payload_kg + envelope_mass + cable_mass)
+    h = np.linspace(0, target_alt_m, steps)
+    dh = h[1] - h[0]
+    v = wind_profile(h, v_jet, v_strato, v_surface)
+    drag_per_len = 0.5 * air_density(h) * v ** 2 * cd_cable * cable_diam
+    drag_above = np.cumsum(drag_per_len[::-1])[::-1] * dh                       # drag from h up to top
+    v_top = wind_profile(np.array([target_alt_m]), v_jet, v_strato, v_surface)[0]
+    aero_drag = 0.5 * air_density(target_alt_m) * v_top ** 2 * cd_sphere * (np.pi / 4 * aerostat_diam_m ** 2)
+    tension_x = aero_drag + drag_above
+    tension_z = free_lift - cable_weight_per_m * (target_alt_m - h)
+    tilt = np.clip(np.arctan2(tension_x, np.maximum(tension_z, 1.0)), 0, np.radians(88))
+    excursion = np.trapezoid(np.tan(tilt), h)
+    arc = np.trapezoid(1.0 / np.cos(tilt), h)
+    tension = np.sqrt(tension_x ** 2 + tension_z ** 2)
+    return dict(free_lift_t=free_lift / GRAVITY / 1e3, aero_drag_kn=aero_drag / 1e3,
+                tether_drag_kn=drag_above[0] / 1e3, tilt_deg=np.degrees(tilt[0]),
+                excursion_km=excursion / 1e3,
+                altitude_reached_km=np.trapezoid(np.cos(tilt), h) / arc * target_alt_m / 1e3,
+                tension_margin=sigma * np.pi * (cable_diam / 2) ** 2 / tension.max())
+
+
+def station_keeping_power_mw(horizontal_force_n, wind_ms, eta=0.6):
+    """Power to hold station against a steady wind = thrust·wind/η, and thrust = the horizontal
+    drag → the power scales as wind³. Must be delivered aloft. η optimistic for thin-air props."""
+    return horizontal_force_n * wind_ms / eta / 1e6
+
+
 # --- Tables & figure ----------------------------------------------------------
 
 def emitter_table():
