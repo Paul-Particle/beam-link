@@ -36,6 +36,16 @@ def wavelength(frequency_hz):
     return SPEED_OF_LIGHT / frequency_hz
 
 
+def coupling_tau(frequency_hz, distance_m, emitter_radius_m, receiver_radius_m):
+    """Goubau aperture-coupling parameter τ = π·r_t·r_r/(λ·D)."""
+    return np.pi * emitter_radius_m * receiver_radius_m / (wavelength(frequency_hz) * distance_m)
+
+
+def collection_efficiency(tau):
+    """Fraction of radiated power caught by the receiving aperture: η ≈ 1−exp(−τ²)."""
+    return 1.0 - np.exp(-(tau ** 2))
+
+
 def required_emitter_radius(frequency_hz, distance_m, receiver_radius_m, tau_target=2.0):
     """r_t = τ·λ·D/(π·r_r); τ≈2 → ~94% collection."""
     return tau_target * wavelength(frequency_hz) * distance_m / (np.pi * receiver_radius_m)
