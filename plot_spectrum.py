@@ -39,28 +39,35 @@ def main():
 
     figure = go.Figure()
 
+    loss_db_90 = -10.0 * np.log10(0.90)          # 0.4576 dB (10% lost)
+    hover = ("<b>%{fullData.name}</b><br>%{x:.1f} GHz<br>"
+             "γ = %{y:.4g} dB/km<br>90%% reach = %{customdata:,.3g} km<extra></extra>")
+
     # Gaseous absorption — one solid line per atmospheric state.
     for column, label in GASEOUS_LABELS.items():
+        gamma = spectrum[column].to_numpy()
         figure.add_trace(go.Scatter(
-            x=frequency_ghz, y=spectrum[column],
+            x=frequency_ghz, y=gamma,
             name=label, mode="lines",
             line=dict(color=GASEOUS_COLORS[column], width=2),
+            customdata=loss_db_90 / gamma, hovertemplate=hover,
         ))
 
     # Rain — frequency-dependent specific attenuation (P.838), dashed.
     rain_k, rain_alpha = napkin.rain_coefficients(frequency_ghz)
     for rate_mmh, label in RAIN_RATES:
+        gamma = napkin.specific_rain_attenuation(rate_mmh, rain_k, rain_alpha)
         figure.add_trace(go.Scatter(
-            x=frequency_ghz,
-            y=napkin.specific_rain_attenuation(rate_mmh, rain_k, rain_alpha),
+            x=frequency_ghz, y=gamma,
             name=label, mode="lines",
             line=dict(color="#4dd0e1", width=1.6,
                       dash="dash" if rate_mmh == 10 else "dot"),
+            customdata=loss_db_90 / gamma, hovertemplate=hover,
         ))
 
     # Vertical markers as Scatter primitives (traces use raw data coords on a log
     # axis reliably, unlike add_vline/add_vrect). Annotations DO take log10 coords.
-    y_lo, y_hi = 2e-4, 2e2
+    y_lo, y_hi = 3e-5, 2e2
 
     # O2 60 GHz absorption wall — shaded band.
     figure.add_trace(go.Scatter(
@@ -94,7 +101,7 @@ def main():
                    tickvals=[1, 2, 5, 10, 20, 30, 50, 60, 100, 200],
                    ticktext=["1", "2", "5", "10", "20", "30", "50", "60", "100", "200"]),
         yaxis=dict(title="Specific attenuation γ (dB/km)", type="log",
-                   range=[np.log10(2e-4), np.log10(2e2)]),
+                   range=[np.log10(y_lo), np.log10(y_hi)]),
         legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.4)"),
         width=1000, height=640,
     )
@@ -102,8 +109,7 @@ def main():
     # Secondary axis: distance over which 90% of the energy survives, L90 = C/γ.
     # A pure inverse of γ, so on a log axis it is just a reversed, relabelled twin
     # (atmospheric absorption only — beam spreading is separate).
-    loss_db_90 = -10.0 * np.log10(0.90)          # 0.4576 dB
-    l90_km = [1000, 100, 10, 1, 0.1, 0.01]
+    l90_km = [10000, 1000, 100, 10, 1, 0.1, 0.01]
     figure.add_trace(go.Scatter(                 # invisible anchor so y2 renders
         x=[frequency_ghz[0]], y=[loss_db_90 / y_lo],
         yaxis="y2", mode="markers", marker=dict(opacity=0),
