@@ -65,6 +65,38 @@ def power_density_limited_diameter(power_w, density_wcm2=25.0):
     return 2.0 * np.sqrt(area_m2 / np.pi)
 
 
+# --- Passive frequency multiplication (the "gearbox") -------------------------
+# Manley-Rowe permits ~100% f -> n·f conversion for an IDEAL lossless nonlinear
+# reactance (varactor); real multipliers fall well short, and a high order like
+# 5.8 -> 30 GHz (~x6) is built as a cascade whose per-stage losses compound.
+
+def multiplier_factor_prime(input_ghz=5.8, output_ghz=30.0):
+    """Required integer multiplication order (rounded) to reach `output_ghz`."""
+    return round(output_ghz / input_ghz)
+
+
+def cascade_efficiency(order, stage_efficiency=0.7):
+    """End-to-end efficiency of a multiplier chain realizing `order` as a product
+    of small prime stages (x2/x3), each at `stage_efficiency`. A x6 = x2·x3 is two
+    stages; x5 (5.8->30, if taken as prime) is one hard high-order stage. Returns
+    (efficiency, [prime stages])."""
+    stages = _prime_stages(order)
+    return stage_efficiency ** len(stages), stages
+
+
+def _prime_stages(n):
+    """Factor `n` into a list of small prime stages (a x6 -> [2, 3])."""
+    stages, d = [], 2
+    while d * d <= n:
+        while n % d == 0:
+            stages.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        stages.append(n)
+    return stages or [1]
+
+
 # --- Atmospheric attenuation (rain) -------------------------------------------
 
 RAIN_K, RAIN_ALPHA = 0.1871, 1.0214   # ITU-R P.838, 30 GHz, horizontal pol (conservative)
