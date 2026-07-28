@@ -285,6 +285,41 @@ def delivery_efficiency(eta_grid_to_rf=ETA_GRID_TO_RF, eta_beam=ETA_BEAM,
     return eta_grid_to_rf * eta_beam * eta_rectenna
 
 
+# --- Frequency as the master dial: the electronics vs aperture tradeoff --------
+# The DC→RF amplifier's efficiency (PAE) falls steeply with frequency; the required
+# EMITTER aperture GROWS with wavelength (∝ λ ∝ 1/f) once the belly rectenna is
+# capped by the airframe. So low frequency = efficient electronics but a huge emitter;
+# high frequency = tiny emitter but lossy, hot, less-mature electronics. Anchors are
+# #(verify), read off the 2019-2025 GaN literature (C-band saturated ~65% PAE / 80%
+# rectenna; Ka-band ~40% PAE / ~72% rectenna).
+
+def pae_dc_to_rf(frequency_ghz):
+    """GaN power-amplifier PAE vs frequency, CW/saturated (beaming needs no linearity).
+    Linear between anchors (5.8 GHz → 0.65, 34.8 GHz → 0.40), clipped to a sane band."""
+    slope = (0.40 - 0.65) / (34.8 - 5.8)
+    return float(np.clip(0.65 + slope * (frequency_ghz - 5.8), 0.30, 0.72))
+
+
+def eta_grid_to_rf_band(frequency_ghz, eta_ac_dc=0.98):
+    """Station grid→RF = SiC AC/DC front end (mature ~0.98) × GaN PA PAE(f)."""
+    return eta_ac_dc * pae_dc_to_rf(frequency_ghz)
+
+
+def rectenna_efficiency_band(frequency_ghz):
+    """RF→DC Schottky rectenna efficiency; ~0.80 demonstrated at 5.8 GHz, lower and
+    less mature at Ka. Anchors (5.8 → 0.80, 34.8 → 0.72)."""
+    slope = (0.72 - 0.80) / (34.8 - 5.8)
+    return float(np.clip(0.80 + slope * (frequency_ghz - 5.8), 0.65, 0.82))
+
+
+def emitter_diameter_m(frequency_ghz, slant_km, rectenna_radius_m=20.0, tau_target=2.0):
+    """Transmit-aperture diameter for near-full geometric capture (τ≈2 → ~98%) at the
+    given slant range, with the belly rectenna capped at rectenna_radius_m by the
+    airframe: r_t = τ·λ·D/(π·r_r) ∝ λ. Halving the frequency ~doubles this diameter."""
+    return 2.0 * required_emitter_radius(frequency_ghz * 1e9, slant_km * 1e3,
+                                         rectenna_radius_m, tau_target)
+
+
 def energy_cost_per_flight(cruise_mw, route_km=5500.0, speed_ms=250.0,
                            electricity_usd_per_mwh=30.0, eta_delivery=None):
     """Grid-energy cost to fly one beamed flight. Delivered (drivetrain-input) energy is
@@ -349,15 +384,30 @@ def station_power_mw(airborne_per_station, cruise_mw):
     return airborne_per_station * cruise_mw
 
 
-def station_capex_musd(deliver_mw, fixed_musd=50.0, array_musd_per_rf_mw=2.5,
-                       supply_musd_per_grid_mw=1.2):
-    """Station cost split by what drives it: a FIXED platform/siting cost (per station,
-    the mid-ocean pain — a floating structure exists whether it radiates 1 or 100 MW),
-    plus a phased array ∝ RF transmit power, plus power provisioning ∝ grid draw
-    (mid-ocean = a local floating plant). Anchors ~$190M at 19 MW delivered #(verify)."""
-    rf_mw = deliver_mw / (ETA_BEAM * ETA_RECTENNA)
-    grid_mw = rf_mw / ETA_GRID_TO_RF
-    return fixed_musd + array_musd_per_rf_mw * rf_mw + supply_musd_per_grid_mw * grid_mw
+def station_capex_musd(deliver_mw, frequency_ghz=34.8, aircraft_alt_km=11.0,
+                       min_elevation_deg=15.0, rectenna_radius_m=20.0, fixed_musd=50.0,
+                       array_musd_per_rf_mw=2.5, supply_musd_per_grid_mw=1.2,
+                       cooling_musd_per_waste_mw=1.0, aperture_musd_per_m2=0.005):
+    """Station cost, now frequency-aware, split by what drives each part:
+      fixed    — platform/siting (mid-ocean pain; exists regardless of power);
+      array    — T/R modules ∝ RF power (element COUNT is ~frequency-invariant);
+      supply   — power provisioning ∝ grid draw (worse at low PAE);
+      cooling  — heat rejection ∝ station waste heat (worse at low PAE → high freq);
+      aperture — structure/platform ∝ EMITTER AREA ∝ λ² (worse at low freq).
+    This makes the aperture penalty (favours high f) fight the PAE/thermal penalty
+    (favours low f). Returns a dict. #(verify) coefficients."""
+    eta_rect = rectenna_efficiency_band(frequency_ghz)
+    eta_grid_rf = eta_grid_to_rf_band(frequency_ghz)
+    rf_mw = deliver_mw / (ETA_BEAM * eta_rect)
+    grid_mw = rf_mw / eta_grid_rf
+    waste_mw = grid_mw - rf_mw
+    slant_km = aircraft_alt_km / np.sin(np.radians(min_elevation_deg))
+    emitter_diam = emitter_diameter_m(frequency_ghz, slant_km, rectenna_radius_m)
+    aperture_area_m2 = np.pi * (emitter_diam / 2) ** 2
+    musd = (fixed_musd + array_musd_per_rf_mw * rf_mw + supply_musd_per_grid_mw * grid_mw
+            + cooling_musd_per_waste_mw * waste_mw + aperture_musd_per_m2 * aperture_area_m2)
+    return dict(musd=musd, rf_mw=rf_mw, grid_mw=grid_mw, waste_mw=waste_mw,
+                emitter_diam_m=emitter_diam, eta_grid_rf=eta_grid_rf, eta_rect=eta_rect)
 
 
 def infra_cost_per_flight(n_stations, station_musd, throughput_per_day,
@@ -384,36 +434,59 @@ def aircraft_cost_per_flight(aircraft_musd, flights_per_year=500.0, rate=0.08,
 def econ_comparison(cruise_mw=None, route_km=5500.0, speed_ms=250.0,
                     electricity_usd_per_mwh=30.0, fuel_usd_per_tonne=850.0,
                     fuel_tonnes=37.0, aircraft_alt_km=11.0, min_elevation_deg=15.0,
-                    airborne_per_station=2.0, powered_fraction=0.5,
+                    frequency_ghz=34.8, airborne_per_station=2.0, powered_fraction=0.5,
                     station_fixed_musd=50.0, beamed_aircraft_musd=100.0,
                     fossil_aircraft_musd=150.0, flights_per_year=500.0):
     """Per-flight cost difference on the terms that diverge, with the operating concept
-    baked in: station power scales with utilization, throughput is derived from packing,
-    and station cost = fixed + power-scaling. `verdict_usd` = beamed − fossil (neg = win)."""
+    AND the frequency tradeoff baked in: PAE(f) and rectenna η(f) set the delivery
+    efficiency (→ energy) and station heat/supply, while emitter aperture ∝ λ² sets a
+    station structure cost. `verdict_usd` = beamed − fossil (neg = win)."""
     if cruise_mw is None:
         cruise_mw = mass_buildup()["cruise_mw"]
     n = station_count(route_km, aircraft_alt_km, min_elevation_deg)
     transit_h = flight_hours(route_km, speed_ms)
     throughput = corridor_throughput_per_day(airborne_per_station, n, transit_h)
     st_deliver_mw = station_power_mw(airborne_per_station, cruise_mw)
-    st_musd = station_capex_musd(st_deliver_mw, fixed_musd=station_fixed_musd)
+    st = station_capex_musd(st_deliver_mw, frequency_ghz=frequency_ghz,
+                            aircraft_alt_km=aircraft_alt_km, min_elevation_deg=min_elevation_deg,
+                            fixed_musd=station_fixed_musd)
+    eta_deliv = st["eta_grid_rf"] * ETA_BEAM * st["eta_rect"]
 
-    energy = energy_cost_per_flight(cruise_mw, route_km, speed_ms, electricity_usd_per_mwh)
+    energy = energy_cost_per_flight(cruise_mw, route_km, speed_ms, electricity_usd_per_mwh,
+                                    eta_delivery=eta_deliv)
     fuel = fuel_cost_per_flight(fuel_tonnes, fuel_usd_per_tonne)
-    infra = infra_cost_per_flight(n, st_musd, throughput)
+    infra = infra_cost_per_flight(n, st["musd"], throughput)
     beamed_ac = aircraft_cost_per_flight(beamed_aircraft_musd, flights_per_year)
     fossil_ac = aircraft_cost_per_flight(fossil_aircraft_musd, flights_per_year)
     beamed_total = energy["cost_usd"] + infra["cost_usd"] + beamed_ac
     fossil_total = fuel["cost_usd"] + fossil_ac
     return dict(cruise_mw=cruise_mw, n_stations=n, throughput_per_day=throughput,
+                frequency_ghz=frequency_ghz, eta_delivery=eta_deliv,
+                emitter_diam_m=st["emitter_diam_m"], station_waste_mw=st["waste_mw"],
                 station_deliver_mw=st_deliver_mw, boost_mw=boost_power_mw(cruise_mw, powered_fraction),
-                station_musd=st_musd, infra_capex_busd=infra["capex_busd"],
+                station_musd=st["musd"], infra_capex_busd=infra["capex_busd"],
                 beamed_energy_usd=energy["cost_usd"], beamed_grid_mwh=energy["grid_mwh"],
                 beamed_infra_usd=infra["cost_usd"], beamed_aircraft_usd=beamed_ac,
                 beamed_total_usd=beamed_total,
                 fossil_fuel_usd=fuel["cost_usd"], fossil_aircraft_usd=fossil_ac,
                 fossil_total_usd=fossil_total,
                 verdict_usd=beamed_total - fossil_total)
+
+
+def frequency_tradeoff(frequencies=(5.8, 11.6, 17.4, 23.2, 34.8)):
+    """Sweep the master dial: emitter aperture (favours high f) vs PAE/rectenna/thermal
+    (favour low f), everything else at the minimum-slack baseline. Shows why the choice
+    is a genuine two-sided optimum, not a free win either way."""
+    rows = []
+    for f in frequencies:
+        r = econ_comparison(frequency_ghz=f)
+        rows.append((f, round(r["emitter_diam_m"]), round(pae_dc_to_rf(f), 2),
+                     round(rectenna_efficiency_band(f), 2), round(r["eta_delivery"], 3),
+                     round(r["station_waste_mw"], 1), round(r["station_musd"]),
+                     round(r["beamed_energy_usd"]), round(r["verdict_usd"])))
+    return pd.DataFrame(rows, columns=["f_GHz", "emitter_m", "PAE", "eta_rect",
+                                       "deliv_eff", "waste_MW", "station_$M",
+                                       "energy_$", "verdict_$"])
 
 
 def econ_table():
