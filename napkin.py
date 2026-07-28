@@ -162,9 +162,14 @@ def db_to_fraction(db):
 
 # --- Flight profile -----------------------------------------------------------
 
-# Reference airframe = lifting body / BWB. Same L/D is assumed for the fossil
-# comparator (airframe gains are not a beaming benefit). Tube-and-wing ~17-19.
-REFERENCE_LIFT_TO_DRAG = 22.0
+# Lifting body / BWB. The bare AIRFRAME L/D is shared with the fossil comparator
+# (airframe gains are not a beaming benefit — tube-and-wing ~17-19). The BEAMED
+# plane earns a modest bump from its ELECTRIC-PROPULSION INTEGRATION — boundary-
+# layer ingestion, no podded nacelles, distributed fans — which is an energy-path
+# advantage, so it is legitimately credited to the concept (#(verify): ~+5-10%).
+AIRFRAME_LIFT_TO_DRAG = 22.0
+BEAMED_LIFT_TO_DRAG = 24.0
+REFERENCE_LIFT_TO_DRAG = BEAMED_LIFT_TO_DRAG   # headline value used downstream
 
 
 def glide_range_km(lift_to_drag, altitude_drop_m):
@@ -192,6 +197,68 @@ def climb_power_mw(mass_kg, speed_ms, lift_to_drag, climb_rate_ms, eta_chain=0.7
 def beam_power_mw(electrical_mw, rectenna_eff=0.85, collection_eff=0.90):
     """What the emitter must put into the beam to deliver a given electrical power on board."""
     return electrical_mw / rectenna_eff / collection_eff
+
+
+# --- Mass buildup (the size cascade, made concrete) ---------------------------
+
+def mass_buildup(payload_t=40.0, speed_ms=250.0, lift_to_drag=BEAMED_LIFT_TO_DRAG,
+                 climb_rate_ms=4.0, eta_chain=0.85, struct_fraction=0.30,
+                 systems_fraction=0.10, motor_specific_power_kw_per_kg=5.0,
+                 battery_specific_energy_wh_per_kg=250.0, buffer_minutes=5.0,
+                 rectenna_mass_t=2.0, max_iter=200, tol=1.0):
+    """No-fuel beamed-electric mass buildup by fixed-point iteration `#(verify)`.
+
+    The point that dooms battery-electric aviation — hours of stored energy at
+    ~250 Wh/kg — does NOT apply here: energy arrives continuously, so the battery is
+    only a *buffer* (minutes; the real reserve is the glide, L/D·Δh). MTOW closes on
+    itself: structure & systems scale with MTOW, the motor with the peak (climb)
+    power that mass demands, the buffer battery with the cruise power. Contrast a
+    fuel burner, whose ~40% takeoff fuel inflates MTOW and hence structure — remove
+    it and the whole aircraft shrinks. Returns component masses (t), MTOW, powers."""
+    payload = payload_t * 1e3
+    rectenna = rectenna_mass_t * 1e3
+    mtow = payload * 2.0
+    for _ in range(max_iter):
+        cruise_w = mtow * GRAVITY * speed_ms / lift_to_drag / eta_chain
+        peak_w = cruise_w + mtow * GRAVITY * climb_rate_ms / eta_chain
+        motor = peak_w / (motor_specific_power_kw_per_kg * 1e3)
+        battery = cruise_w * (buffer_minutes / 60.0) / battery_specific_energy_wh_per_kg
+        structure = struct_fraction * mtow
+        systems = systems_fraction * mtow
+        mtow_new = payload + structure + systems + motor + battery + rectenna
+        converged = abs(mtow_new - mtow) < tol
+        mtow = mtow_new
+        if converged:
+            break
+    return dict(payload_t=payload / 1e3, structure_t=structure / 1e3,
+                systems_t=systems / 1e3, motor_t=motor / 1e3,
+                battery_t=battery / 1e3, rectenna_t=rectenna / 1e3,
+                mtow_t=mtow / 1e3, cruise_mw=cruise_w / 1e6, peak_mw=peak_w / 1e6,
+                empty_fraction=(mtow - payload) / mtow)
+
+
+# --- Airframe silhouette (the rectenna aperture is not constant) --------------
+
+def silhouette_area_m2(semi_span_m, semi_length_m, semi_thickness_m,
+                       elevation_deg, azimuth_deg=0.0):
+    """Orthogonal silhouette (shadow) area of a BWB approximated as an ellipsoid with
+    semi-axes (span, length, thickness), viewed from `elevation_deg` above the wing
+    plane and `azimuth_deg` around it (0 = nose-on, 90 = side-on). Exact for an
+    ellipsoid: A = π·√((b·c·nx)² + (c·a·ny)² + (a·b·nz)²)."""
+    a, b, c = semi_span_m, semi_length_m, semi_thickness_m
+    el, az = np.radians(elevation_deg), np.radians(azimuth_deg)
+    nx = np.cos(el) * np.sin(az)     # span-ward
+    ny = np.cos(el) * np.cos(az)     # length-ward (nose)
+    nz = np.sin(el)                  # thickness-ward (belly / nadir)
+    return np.pi * np.sqrt((b * c * nx) ** 2 + (c * a * ny) ** 2 + (a * b * nz) ** 2)
+
+
+def effective_rectenna_radius_m(planform_radius_m, elevation_deg):
+    """Effective radius of a flat belly rectenna seen by an emitter at elevation ε:
+    projected area ∝ sin ε (cosine law off the nadir), so radius ∝ √(sin ε). Full
+    value directly overhead (ε=90°); it collapses toward the grazing pass — i.e. the
+    beam-budget r_r ≈ 20 m holds only near nadir."""
+    return planform_radius_m * np.sqrt(np.sin(np.radians(elevation_deg)))
 
 
 # --- Pass geometry & dwell ----------------------------------------------------
