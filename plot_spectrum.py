@@ -78,7 +78,7 @@ def main():
                           showarrow=False, font=dict(color="#ff8a80", size=11))
 
     # Operating frequencies (the frequency dial).
-    for freq_ghz, text in [(5.8, "5.8 GHz uplink"), (30.0, "30 GHz downlink")]:
+    for freq_ghz, text in [(5.8, "5.8 GHz uplink"), (34.8, "34.8 GHz = 5.8×6 downlink")]:
         figure.add_trace(go.Scatter(
             x=[freq_ghz, freq_ghz], y=[y_lo, y_hi], mode="lines",
             line=dict(color="#ffffff", width=1, dash="dot"), opacity=0.35,
