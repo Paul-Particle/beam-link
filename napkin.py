@@ -99,7 +99,47 @@ def _prime_stages(n):
 
 # --- Atmospheric attenuation (rain) -------------------------------------------
 
-RAIN_K, RAIN_ALPHA = 0.1871, 1.0214   # ITU-R P.838, 30 GHz, horizontal pol (conservative)
+# ITU-R P.838-3 curve-fit coefficients (Gaussian sums in log-frequency). Valid
+# 1–1000 GHz. Ported so k, α can be evaluated at ANY frequency, not just 30 GHz.
+_P838 = {
+    "kh": dict(aj=[-5.33980, -0.35351, -0.23789, -0.94158],
+               bj=[-0.10008, 1.2697, 0.86036, 0.64552],
+               cj=[1.13098, 0.454, 0.15354, 0.16817], m=-0.18961, c=0.71147),
+    "kv": dict(aj=[-3.80595, -3.44965, -0.39902, 0.50167],
+               bj=[0.56934, -0.22911, 0.73042, 1.07319],
+               cj=[0.81061, 0.51059, 0.11899, 0.27195], m=-0.16398, c=0.63297),
+    "ah": dict(aj=[-0.14318, 0.29591, 0.32177, -5.37610, 16.1721],
+               bj=[1.82442, 0.77564, 0.63773, -0.96230, -3.29980],
+               cj=[-0.55187, 0.19822, 0.13164, 1.47828, 3.4399], m=0.67849, c=-1.95537),
+    "av": dict(aj=[-0.07771, 0.56727, -0.20238, -48.2991, 48.5833],
+               bj=[2.3384, 0.95545, 1.1452, 0.791669, 0.791459],
+               cj=[-0.76284, 0.54039, 0.26809, 0.116226, 0.116479], m=-0.053739, c=0.83433),
+}
+
+
+def _p838_term(frequency_ghz, coeffs, is_k):
+    log_f = np.log10(frequency_ghz)
+    gaussians = sum(a * np.exp(-(((log_f - b) / c) ** 2))
+                    for a, b, c in zip(coeffs["aj"], coeffs["bj"], coeffs["cj"]))
+    value = gaussians + coeffs["m"] * log_f + coeffs["c"]
+    return 10.0 ** value if is_k else value
+
+
+def rain_coefficients(frequency_ghz, elevation_deg=90.0, polarization_tilt_deg=0.0):
+    """ITU-R P.838-3 (k, α) for rain specific attenuation at arbitrary frequency,
+    path elevation, and polarization tilt (τ=0 horizontal, 90 vertical, 45 circular)."""
+    kh = _p838_term(frequency_ghz, _P838["kh"], is_k=True)
+    kv = _p838_term(frequency_ghz, _P838["kv"], is_k=True)
+    ah = _p838_term(frequency_ghz, _P838["ah"], is_k=False)
+    av = _p838_term(frequency_ghz, _P838["av"], is_k=False)
+    cos_el2 = np.cos(np.radians(elevation_deg)) ** 2
+    cos_2tau = np.cos(np.radians(2 * polarization_tilt_deg))
+    k = (kh + kv + (kh - kv) * cos_el2 * cos_2tau) / 2.0
+    alpha = (kh * ah + kv * av + (kh * ah - kv * av) * cos_el2 * cos_2tau) / (2.0 * k)
+    return k, alpha
+
+
+RAIN_K, RAIN_ALPHA = rain_coefficients(30.0)   # 30 GHz, vertical path (project reference)
 
 
 def specific_rain_attenuation(rain_rate_mmh, k=RAIN_K, alpha=RAIN_ALPHA):
