@@ -20,12 +20,14 @@ GASEOUS_LABELS = {
     "temperate": "Temperate (ITU std, 7.5 g/m³)",
     "tropical_humid": "Tropical humid (20 g/m³)",
     "cruise_11km": "Cruise 11 km (thin dry air)",
+    "relay_20km": "Relay 20 km (thinner still)",
 }
 GASEOUS_COLORS = {
     "dry_cold": "#7fb3ff",
     "temperate": "#4caf50",
     "tropical_humid": "#ff9800",
     "cruise_11km": "#b39ddb",
+    "relay_20km": "#f48fb1",
 }
 RAIN_RATES = [(10.0, "Rain 10 mm/h (moderate)"),
               (50.0, "Rain 50 mm/h (heavy tropical)")]

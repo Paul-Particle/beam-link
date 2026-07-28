@@ -22,10 +22,13 @@ CONDITIONS = [
     ("dry_cold",       1013.0,  0.5, 273.0, "polar / winter — near-dry, oxygen only"),
     ("temperate",      1013.0,  7.5, 288.0, "ITU standard sea-level reference"),
     ("tropical_humid", 1013.0, 20.0, 300.0, "hot & humid — monsoon boundary layer"),
-    ("cruise_11km",     226.0,  0.05, 217.0, "11 km: thin dry air (relay-above-weather)"),
+    ("cruise_11km",     226.0,  0.05, 217.0, "11 km: thin dry air (aircraft cruise)"),
+    ("relay_20km",       55.0,  0.005, 217.0, "20 km: stratospheric relay — thinner still"),
 ]
 
-frequency_ghz = np.logspace(np.log10(1.0), np.log10(200.0), 600)
+# Dense grid: at 20 km the low pressure narrows the O2 lines until they resolve
+# individually, so the 50-70 GHz complex needs fine sampling to render cleanly.
+frequency_ghz = np.logspace(np.log10(1.0), np.log10(200.0), 2400)
 
 frame = pd.DataFrame({"frequency_ghz": frequency_ghz})
 notes = {}
