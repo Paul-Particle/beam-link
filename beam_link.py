@@ -132,6 +132,25 @@ class Atmosphere:
         return napkin.db_to_fraction(self.path_loss_db(freq_ghz, h_low_m, h_high_m, elevation_deg, weather))
 
 
+# Shared, lazily-loaded singletons so sweeps don't reload the .npz tables per call.
+_ATMOSPHERE = None
+_SILHOUETTE = None
+
+
+def get_atmosphere():
+    global _ATMOSPHERE
+    if _ATMOSPHERE is None:
+        _ATMOSPHERE = Atmosphere()
+    return _ATMOSPHERE
+
+
+def get_silhouette():
+    global _SILHOUETTE
+    if _SILHOUETTE is None:
+        _SILHOUETTE = BWBSilhouette()
+    return _SILHOUETTE
+
+
 # --- Geometry -----------------------------------------------------------------
 
 def geometry(from_pos, to_pos):
@@ -294,7 +313,7 @@ class LinkConfig:
 
     def silhouette(self):
         if self._silhouette is None:
-            self._silhouette = BWBSilhouette()
+            self._silhouette = get_silhouette()
         return self._silhouette
 
 
@@ -315,7 +334,7 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
 
     Efficiency is defined grid busbar → DC delivered at the rectenna terminals (the
     onboard drivetrain is NOT included here — napkin folds it into cruise_mw)."""
-    atmos = Atmosphere()
+    atmos = get_atmosphere()
     station = np.asarray(cfg.station_pos, dtype=float)
     plane = np.asarray(cfg.plane_pos, dtype=float)
     stages = {}
