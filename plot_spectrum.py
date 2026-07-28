@@ -97,6 +97,23 @@ def main():
         width=1000, height=640,
     )
 
+    # Secondary axis: distance over which 90% of the energy survives, L90 = C/γ.
+    # A pure inverse of γ, so on a log axis it is just a reversed, relabelled twin
+    # (atmospheric absorption only — beam spreading is separate).
+    loss_db_90 = -10.0 * np.log10(0.90)          # 0.4576 dB
+    l90_km = [1000, 100, 10, 1, 0.1, 0.01]
+    figure.add_trace(go.Scatter(                 # invisible anchor so y2 renders
+        x=[frequency_ghz[0]], y=[loss_db_90 / y_lo],
+        yaxis="y2", mode="markers", marker=dict(opacity=0),
+        hoverinfo="skip", showlegend=False))
+    figure.update_layout(yaxis2=dict(
+        title="Distance to keep 90% of energy (absorption only)",
+        overlaying="y", side="right", type="log",
+        range=[np.log10(loss_db_90 / y_lo), np.log10(loss_db_90 / y_hi)],  # reversed
+        tickvals=l90_km,
+        ticktext=[f"{k:g} km" if k >= 1 else f"{int(k*1000)} m" for k in l90_km],
+        showgrid=False))
+
     return figure
 
 
