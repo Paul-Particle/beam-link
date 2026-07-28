@@ -162,6 +162,11 @@ def db_to_fraction(db):
 
 # --- Flight profile -----------------------------------------------------------
 
+# Reference airframe = lifting body / BWB. Same L/D is assumed for the fossil
+# comparator (airframe gains are not a beaming benefit). Tube-and-wing ~17-19.
+REFERENCE_LIFT_TO_DRAG = 22.0
+
+
 def glide_range_km(lift_to_drag, altitude_drop_m):
     return lift_to_drag * altitude_drop_m / 1e3
 
@@ -311,7 +316,7 @@ def emitter_table():
 def power_table(mass_t=200, speed_ms=250, eta=0.78):
     mass = mass_t * 1e3
     rows = []
-    for ld in (15, 20, 30):
+    for ld in (15, REFERENCE_LIFT_TO_DRAG, 30):   # tube-wing / lifting-body ref / aspirational
         cruise = cruise_power_mw(mass, speed_ms, ld, eta)
         for vc in (5, 10):
             climb = climb_power_mw(mass, speed_ms, ld, vc, eta)
