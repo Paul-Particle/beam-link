@@ -261,6 +261,203 @@ def effective_rectenna_radius_m(planform_radius_m, elevation_deg):
     return planform_radius_m * np.sqrt(np.sin(np.radians(elevation_deg)))
 
 
+# --- First-pass techno-economics ----------------------------------------------
+# The comparison the whole project must beat: jet fuel, unsubsidized, on a
+# transatlantic widebody. We compare only the terms that DIFFER — energy source
+# and ground infrastructure — because crew, maintenance, navigation, and airport
+# fees are ~equal for the same route/aircraft class and cancel in the difference.
+# Everything here is #(verify): order-of-magnitude, levers exposed for turning.
+
+def flight_hours(route_km=5500.0, speed_ms=250.0):
+    return route_km * 1e3 / speed_ms / 3600.0
+
+
+# Delivery-chain efficiencies, grid busbar → rectenna DC output (#(verify)):
+ETA_GRID_TO_RF = 0.55    # AC→DC→RF at the station (GaN PA-dominated, ~40-60% observed)
+ETA_BEAM = 0.80          # transmit aperture → captured at rectenna (atmos + spillover + geometry)
+ETA_RECTENNA = 0.80      # RF→DC rectification (~72-82% demonstrated)
+
+
+def delivery_efficiency(eta_grid_to_rf=ETA_GRID_TO_RF, eta_beam=ETA_BEAM,
+                        eta_rectenna=ETA_RECTENNA):
+    """Grid busbar → rectenna DC output. The onboard motor/drivetrain (~0.85) is already
+    folded into cruise_mw, so this stops at the rectenna terminals — do NOT double-count it."""
+    return eta_grid_to_rf * eta_beam * eta_rectenna
+
+
+def energy_cost_per_flight(cruise_mw, route_km=5500.0, speed_ms=250.0,
+                           electricity_usd_per_mwh=30.0, eta_delivery=None):
+    """Grid-energy cost to fly one beamed flight. Delivered (drivetrain-input) energy is
+    cruise power × block time; grid draw is that over the delivery chain."""
+    if eta_delivery is None:
+        eta_delivery = delivery_efficiency()
+    delivered_mwh = cruise_mw * flight_hours(route_km, speed_ms)
+    grid_mwh = delivered_mwh / eta_delivery
+    return dict(delivered_mwh=delivered_mwh, grid_mwh=grid_mwh,
+                cost_usd=grid_mwh * electricity_usd_per_mwh)
+
+
+def fuel_cost_per_flight(fuel_tonnes=37.0, fuel_usd_per_tonne=850.0):
+    """Fossil comparator's block-fuel cost. 37 t #(verify) ≈ a 787-class widebody over
+    5500 km (~5.6 t/h × 6.1 h + climb); Jet-A ~$850/t (volatile: $600-1200)."""
+    return dict(fuel_tonnes=fuel_tonnes, cost_usd=fuel_tonnes * fuel_usd_per_tonne)
+
+
+def station_spacing_km(aircraft_alt_km=11.0, min_elevation_deg=15.0):
+    """Along-track spacing that keeps the aircraft above `min_elevation_deg` from the
+    nearest station: 2·h/tan(ε). Low ε → wide spacing (few stations) but long slant
+    path and collapsed rectenna aperture (√sin ε); high ε → many stations. This single
+    knob dominates station count, and station count dominates the economics."""
+    return 2.0 * aircraft_alt_km / np.tan(np.radians(min_elevation_deg))
+
+
+def station_count(route_km=5500.0, aircraft_alt_km=11.0, min_elevation_deg=15.0):
+    spacing = station_spacing_km(aircraft_alt_km, min_elevation_deg)
+    return int(np.ceil(route_km / spacing)) + 1
+
+
+def capital_recovery_factor(rate=0.08, years=25):
+    """Annual fraction of a capex to recover principal + interest over `years`."""
+    r = rate
+    return r * (1 + r) ** years / ((1 + r) ** years - 1)
+
+
+# --- Utilization & the boost-glide operating concept --------------------------
+# The plane is POWERED ("boosted") only while passing over a station at high
+# elevation (good geometry, full aperture), and GLIDES through the low-elevation
+# gap between stations — so we never beam at low elevation, and the sawtooth is
+# synchronized to station spacing by design. `airborne_per_station` is the target
+# packing: ~2 (one boosting + one coasting) is "minimum-slack" operation.
+
+def corridor_throughput_per_day(airborne_per_station, n_stations, transit_h):
+    """Flights/day the corridor delivers: a fleet of (airborne_per_station·n) planes,
+    each clearing the corridor in transit_h, completes at fleet/transit rate."""
+    return airborne_per_station * n_stations / transit_h * 24.0
+
+
+def boost_power_mw(cruise_mw, powered_fraction=0.5):
+    """Instantaneous power a plane must receive while boosting: it takes on all of a
+    cycle's energy during the powered fraction φ, so boost = cruise/φ (the glide returns
+    the climbed potential energy). φ≈0.5 is the one-boost/one-coast sawtooth."""
+    return cruise_mw / powered_fraction
+
+
+def station_power_mw(airborne_per_station, cruise_mw):
+    """Delivered (drivetrain-input) power a station must radiate. It serves (φ·a) planes
+    at once, each drawing (cruise/φ) → a·cruise total, INDEPENDENT of the duty φ. At
+    minimum-slack utilization the station runs here continuously (capacity factor ≈ 1)."""
+    return airborne_per_station * cruise_mw
+
+
+def station_capex_musd(deliver_mw, fixed_musd=50.0, array_musd_per_rf_mw=2.5,
+                       supply_musd_per_grid_mw=1.2):
+    """Station cost split by what drives it: a FIXED platform/siting cost (per station,
+    the mid-ocean pain — a floating structure exists whether it radiates 1 or 100 MW),
+    plus a phased array ∝ RF transmit power, plus power provisioning ∝ grid draw
+    (mid-ocean = a local floating plant). Anchors ~$190M at 19 MW delivered #(verify)."""
+    rf_mw = deliver_mw / (ETA_BEAM * ETA_RECTENNA)
+    grid_mw = rf_mw / ETA_GRID_TO_RF
+    return fixed_musd + array_musd_per_rf_mw * rf_mw + supply_musd_per_grid_mw * grid_mw
+
+
+def infra_cost_per_flight(n_stations, station_musd, throughput_per_day,
+                          rate=0.08, life_years=25, om_fraction=0.03):
+    """Ground-infrastructure charge per flight = corridor capex, annualized, over the
+    flights the corridor carries. With station cost ∝ its power and station power ∝
+    utilization, the POWER-scaling part of this is utilization- and count-invariant (a
+    capacity rental); only the FIXED per-station part is reduced by packing planes in."""
+    capex_usd = n_stations * station_musd * 1e6
+    annual_usd = capex_usd * (capital_recovery_factor(rate, life_years) + om_fraction)
+    annual_flights = throughput_per_day * 365.0
+    return dict(capex_busd=capex_usd / 1e9, annual_busd=annual_usd / 1e9,
+                annual_flights=annual_flights, cost_usd=annual_usd / annual_flights)
+
+
+def aircraft_cost_per_flight(aircraft_musd, flights_per_year=500.0, rate=0.08,
+                             life_years=25, om_fraction=0.0):
+    """Ownership charge per flight for one airframe. Beamed airframe is far lighter
+    (~80 t vs ~250 t MTOW) but novel/low-volume; fossil widebody ~$150M #(verify)."""
+    annual_usd = aircraft_musd * 1e6 * (capital_recovery_factor(rate, life_years) + om_fraction)
+    return annual_usd / flights_per_year
+
+
+def econ_comparison(cruise_mw=None, route_km=5500.0, speed_ms=250.0,
+                    electricity_usd_per_mwh=30.0, fuel_usd_per_tonne=850.0,
+                    fuel_tonnes=37.0, aircraft_alt_km=11.0, min_elevation_deg=15.0,
+                    airborne_per_station=2.0, powered_fraction=0.5,
+                    station_fixed_musd=50.0, beamed_aircraft_musd=100.0,
+                    fossil_aircraft_musd=150.0, flights_per_year=500.0):
+    """Per-flight cost difference on the terms that diverge, with the operating concept
+    baked in: station power scales with utilization, throughput is derived from packing,
+    and station cost = fixed + power-scaling. `verdict_usd` = beamed − fossil (neg = win)."""
+    if cruise_mw is None:
+        cruise_mw = mass_buildup()["cruise_mw"]
+    n = station_count(route_km, aircraft_alt_km, min_elevation_deg)
+    transit_h = flight_hours(route_km, speed_ms)
+    throughput = corridor_throughput_per_day(airborne_per_station, n, transit_h)
+    st_deliver_mw = station_power_mw(airborne_per_station, cruise_mw)
+    st_musd = station_capex_musd(st_deliver_mw, fixed_musd=station_fixed_musd)
+
+    energy = energy_cost_per_flight(cruise_mw, route_km, speed_ms, electricity_usd_per_mwh)
+    fuel = fuel_cost_per_flight(fuel_tonnes, fuel_usd_per_tonne)
+    infra = infra_cost_per_flight(n, st_musd, throughput)
+    beamed_ac = aircraft_cost_per_flight(beamed_aircraft_musd, flights_per_year)
+    fossil_ac = aircraft_cost_per_flight(fossil_aircraft_musd, flights_per_year)
+    beamed_total = energy["cost_usd"] + infra["cost_usd"] + beamed_ac
+    fossil_total = fuel["cost_usd"] + fossil_ac
+    return dict(cruise_mw=cruise_mw, n_stations=n, throughput_per_day=throughput,
+                station_deliver_mw=st_deliver_mw, boost_mw=boost_power_mw(cruise_mw, powered_fraction),
+                station_musd=st_musd, infra_capex_busd=infra["capex_busd"],
+                beamed_energy_usd=energy["cost_usd"], beamed_grid_mwh=energy["grid_mwh"],
+                beamed_infra_usd=infra["cost_usd"], beamed_aircraft_usd=beamed_ac,
+                beamed_total_usd=beamed_total,
+                fossil_fuel_usd=fuel["cost_usd"], fossil_aircraft_usd=fossil_ac,
+                fossil_total_usd=fossil_total,
+                verdict_usd=beamed_total - fossil_total)
+
+
+def econ_table():
+    """Per-flight cost breakdown at the baseline (minimum-slack) assumptions."""
+    e = econ_comparison()
+    rows = [
+        ("energy: fuel (fossil)", e["fossil_fuel_usd"]),
+        ("energy: electricity (beamed)", e["beamed_energy_usd"]),
+        ("aircraft ownership (fossil)", e["fossil_aircraft_usd"]),
+        ("aircraft ownership (beamed)", e["beamed_aircraft_usd"]),
+        (f"beam infra ({e['n_stations']} stn × ${e['station_musd']:.0f}M = "
+         f"${e['infra_capex_busd']:.0f}B, {e['throughput_per_day']:.0f}/day)",
+         e["beamed_infra_usd"]),
+        ("— beamed total (diverging terms)", e["beamed_total_usd"]),
+        ("— fossil total (diverging terms)", e["fossil_total_usd"]),
+        ("— verdict (beamed − fossil)", e["verdict_usd"]),
+    ]
+    return pd.DataFrame(rows, columns=["term", "usd_per_flight"]).round(0)
+
+
+def econ_sensitivity():
+    """One-at-a-time swing of the levers around the minimum-slack baseline (verdict
+    $/flight; negative = beamed wins). Baseline: 15° elevation, 2 airborne/station,
+    $30/MWh, $50M fixed/station. Watch that utilization and elevation now move the
+    POWER-scaling infra cost too — the count/utilization cancellation leaves only the
+    fixed-per-station part and the capacity rental."""
+    base = dict(min_elevation_deg=15.0, airborne_per_station=2.0,
+                electricity_usd_per_mwh=30.0, station_fixed_musd=50.0)
+    sweeps = {
+        "min_elevation_deg": [8, 12, 15, 20, 30],
+        "airborne_per_station": [0.5, 1.0, 2.0, 3.0],
+        "electricity_usd_per_mwh": [15, 30, 60, 100],
+        "station_fixed_musd": [20, 50, 100, 200],
+    }
+    rows = []
+    for lever, values in sweeps.items():
+        for v in values:
+            kw = dict(base); kw[lever] = v
+            r = econ_comparison(**kw)
+            rows.append((lever, v, r["n_stations"], round(r["throughput_per_day"]),
+                         round(r["verdict_usd"])))
+    return pd.DataFrame(rows, columns=["lever", "value", "n_stations", "per_day", "verdict_usd"])
+
+
 # --- Pass geometry & dwell ----------------------------------------------------
 
 def pass_geometry(plane_alt_m, station_alt_m, alongtrack_m, lateral_offset_m=0.0):
