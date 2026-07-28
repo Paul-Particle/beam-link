@@ -302,6 +302,10 @@ class LinkConfig:
     relay_aperture_diam_m: float = 60.0            # relay receive/transmit aperture
     weather: str = "clear"
 
+    # Emitter aperture: fixed physical diameter (m) if given, else sized to tau_target
+    # per geometry. A real station's emitter is FIXED, so capture DROPS at low
+    # elevation instead of the emitter growing — set this for realistic pass profiles.
+    emitter_diam_m: float | None = None
     tau_target: float = 2.0
     polarization: str = "circular"
     spot_match: float = 0.90
@@ -344,6 +348,7 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
         f = cfg.f_emit_plane_ghz
         area, r_recv, beta, roll = _plane_receiver(cfg, station)
         h = hop(atmos, f, station, plane, r_recv, cfg.weather, cfg.tau_target,
+                emitter_diam_m=cfg.emitter_diam_m,
                 scan_deg=0.0, error_efficiency=cfg.emitter_error_efficiency)
         rect, rect_parts = rectenna_derate(f, beta, cfg.polarization, roll,
                                            cfg.spot_match, cfg.incidence_floor)
@@ -418,6 +423,55 @@ def best_path(cfg: LinkConfig, delivered_mw=None):
     relayed = evaluate(cfg, delivered_mw)
     chosen = direct if direct["eta_end_to_end"] >= relayed["eta_end_to_end"] else relayed
     return dict(chosen=chosen, direct=direct, relayed=relayed)
+
+
+# --- Pass profile (the boost-over-station window) ------------------------------
+
+def emitter_for_reference(frequency_ghz, station_pos, plane_alt_m=11_000.0,
+                          reference_elevation_deg=60.0, tau_target=2.0,
+                          silhouette=None):
+    """Physical emitter diameter that hits `tau_target` at a chosen reference
+    elevation (e.g. near overhead) — the FIXED aperture a station is built with."""
+    ground = plane_alt_m / np.tan(np.radians(reference_elevation_deg))
+    plane = np.array([station_pos[0] + ground, station_pos[1], plane_alt_m])
+    _, _, unit = geometry(plane, np.asarray(station_pos, dtype=float))
+    beta, alpha = beta_alpha_from_enu(unit, 0.0, 0.0, 0.0)
+    sil = silhouette or get_silhouette()
+    r_recv = receiver_radius_from_silhouette(sil.area(beta, alpha))
+    slant = np.linalg.norm(plane - np.asarray(station_pos, dtype=float))
+    return float(size_emitter_diameter(frequency_ghz, slant, r_recv, tau_target))
+
+
+def pass_profile(frequency_ghz=30.0, plane_alt_m=11_000.0, lateral_offset_m=0.0,
+                 alongtrack_m=None, weather="clear", delivered_mw=10.0,
+                 emitter_diam_m=None, reference_elevation_deg=60.0):
+    """Sweep a plane along a straight over-flight past a fixed-emitter station and
+    return per-position link metrics — the realistic 'how big is the powering
+    window' picture behind the boost-over-station concept. Fully vectorized.
+
+    The emitter is FIXED (built for `reference_elevation_deg`), so capture and hence
+    delivered-power capability fall away from overhead. Returns a dict of arrays."""
+    if alongtrack_m is None:
+        alongtrack_m = np.linspace(-120_000.0, 120_000.0, 241)
+    station = (0.0, 0.0, 0.0)
+    if emitter_diam_m is None:
+        emitter_diam_m = emitter_for_reference(frequency_ghz, station, plane_alt_m,
+                                               reference_elevation_deg)
+    x = np.asarray(alongtrack_m, dtype=float)
+    plane = np.stack([x, np.full_like(x, lateral_offset_m),
+                      np.full_like(x, plane_alt_m)], axis=1)
+    cfg = LinkConfig(station_pos=station, plane_pos=plane, f_emit_plane_ghz=frequency_ghz,
+                     weather=weather, emitter_diam_m=emitter_diam_m)
+    s = evaluate(cfg, delivered_mw)
+    # Power the fixed emitter can actually deliver, if it radiates the SAME RF it
+    # would need to make `delivered_mw` at the reference geometry (capture-limited).
+    eta_ref = np.max(s["eta_end_to_end"])
+    grid_ref = delivered_mw / eta_ref
+    deliverable_mw = grid_ref * s["eta_end_to_end"]
+    return dict(alongtrack_km=x / 1e3, elevation_deg=s["elevation_deg"],
+                eta_end_to_end=s["eta_end_to_end"], capture=s["capture"],
+                silhouette_m2=s["silhouette_m2"], deliverable_mw=deliverable_mw,
+                emitter_diam_m=emitter_diam_m, eta_ref=eta_ref)
 
 
 # --- Reporting ----------------------------------------------------------------

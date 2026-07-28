@@ -245,6 +245,87 @@ def figure_attitude(frequency_ghz=30.0, delivered_mw=10.0,
     return path
 
 
+# --- 6. Pass profile: the powering window ------------------------------------
+
+def figure_pass(frequency_ghz=30.0, speed_ms=250.0, path=f"{OUT}/beam_link_pass.html"):
+    station = (0.0, 0.0, 0.0)
+    ref_elevs = [80.0, 60.0, 40.0, 20.0, 10.0]
+    fig = make_subplots(
+        rows=1, cols=2, horizontal_spacing=0.12,
+        specs=[[{}, {"secondary_y": True}]],
+        subplot_titles=("Deliverable power through a pass (fixed emitter, normalised)",
+                        "Powering window & dwell vs emitter size"))
+
+    widths_km, dwell_s, diams = [], [], []
+    for ref, color in zip(ref_elevs, PALETTE):
+        diam = bl.emitter_for_reference(frequency_ghz, station, reference_elevation_deg=ref)
+        p = bl.pass_profile(frequency_ghz=frequency_ghz, emitter_diam_m=diam)
+        norm = p["deliverable_mw"] / np.max(p["deliverable_mw"])
+        fig.add_trace(go.Scatter(x=p["alongtrack_km"], y=norm, mode="lines",
+                                 name=f"Ø {diam:.0f} m (built for {ref:.0f}°)",
+                                 line=dict(color=color)), row=1, col=1)
+        mask = norm >= 0.5
+        xin = p["alongtrack_km"][mask]
+        w = float(xin.max() - xin.min()) if mask.any() else 0.0
+        widths_km.append(w); dwell_s.append(w * 1e3 / speed_ms); diams.append(diam)
+    fig.add_trace(go.Scatter(x=[-120, 120], y=[0.5, 0.5], mode="lines",
+                             line=dict(color="grey", dash="dot"), name="50%"), row=1, col=1)
+    fig.update_xaxes(title_text="along-track offset from station (km)", row=1, col=1)
+    fig.update_yaxes(title_text="deliverable power (fraction of overhead)", row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=diams, y=widths_km, mode="lines+markers",
+                             name="≥50% window (km)", line=dict(color="#1f77b4")),
+                  row=1, col=2, secondary_y=False)
+    fig.add_trace(go.Scatter(x=diams, y=dwell_s, mode="lines+markers",
+                             name=f"dwell @ {speed_ms:.0f} m/s (s)", line=dict(color="#d62728")),
+                  row=1, col=2, secondary_y=True)
+    fig.update_xaxes(title_text="emitter diameter (m)", row=1, col=2)
+    fig.update_yaxes(title_text="≥50% window width (km)", row=1, col=2, secondary_y=False, rangemode="tozero")
+    fig.update_yaxes(title_text=f"dwell @ {speed_ms:.0f} m/s (s)", row=1, col=2, secondary_y=True, rangemode="tozero")
+    fig.update_layout(
+        template="plotly_white", height=520, width=1180,
+        title=(f"Boost-over-station window at {frequency_ghz:.0f} GHz: a bigger emitter buys a wider "
+               f"powering window — the emitter-size ↔ station-spacing coupling"),
+        legend=dict(orientation="h", y=-0.2))
+    os.makedirs(OUT, exist_ok=True)
+    fig.write_html(path, include_plotlyjs="inline")
+    return path
+
+
+# --- 7. Receive-side derate sensitivity --------------------------------------
+
+def figure_derate_sensitivity(frequency_ghz=30.0, elevation_deg=30.0, delivered_mw=10.0,
+                              path=f"{OUT}/beam_link_derate_sensitivity.html"):
+    """How much do the 'simple approximation' receive-side factors move the answer?
+    Sweep each around its default, holding the others, and show the swing in η."""
+    station, plane = bl.reference_geometry(elevation_deg)
+    base = dict(station_pos=station, plane_pos=plane, f_emit_plane_ghz=frequency_ghz)
+    sweeps = {
+        "spot_match": np.linspace(0.6, 1.0, 21),
+        "incidence_floor": np.linspace(0.5, 1.0, 21),
+        "pointing_error_m": np.linspace(0.0, 8.0, 21),
+    }
+    fig = go.Figure()
+    for (lever, values), color in zip(sweeps.items(), PALETTE):
+        eta = []
+        for v in values:
+            cfg = bl.LinkConfig(**base, **{lever: float(v)})
+            eta.append(float(bl.evaluate(cfg, delivered_mw)["eta_end_to_end"]))
+        # normalise x to 0..1 across each lever's range for a shared axis
+        xn = (values - values.min()) / (values.max() - values.min())
+        fig.add_trace(go.Scatter(x=xn, y=eta, mode="lines", name=lever, line=dict(color=color)))
+    fig.update_layout(
+        template="plotly_white", height=500, width=900,
+        title=(f"Sensitivity of η to the 'simple approximation' receive-side factors "
+               f"({frequency_ghz:.0f} GHz, {elevation_deg:.0f}° elev) — which knobs actually matter"),
+        xaxis_title="each lever swept low→high across its plausible range (normalised)",
+        yaxis_title="η end-to-end", legend=dict(orientation="h", y=-0.18))
+    fig.update_yaxes(rangemode="tozero")
+    os.makedirs(OUT, exist_ok=True)
+    fig.write_html(path, include_plotlyjs="inline")
+    return path
+
+
 def build_all():
     paths = [
         figure_waterfall(),
@@ -252,6 +333,8 @@ def build_all():
         figure_geometry(),
         figure_architecture_weather(),
         figure_attitude(),
+        figure_pass(),
+        figure_derate_sensitivity(),
     ]
     print("wrote:")
     for p in paths:

@@ -159,11 +159,41 @@ def test_vectorized():
     check("silhouette lookup vectorizes", areas.shape == betas.shape and np.all(np.diff(areas) < 0))
 
 
+def test_pass_profile():
+    print("\n[pass profile / fixed emitter]")
+    # A fixed emitter delivers most overhead and falls off both ways symmetrically.
+    p = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=60.0)
+    peak_idx = int(np.argmax(p["deliverable_mw"]))
+    check("peak delivery is overhead (x≈0)", abs(p["alongtrack_km"][peak_idx]) < 2.0,
+          f"peak at {p['alongtrack_km'][peak_idx]:.1f} km")
+    left = p["deliverable_mw"][p["alongtrack_km"] < 0]
+    right = p["deliverable_mw"][p["alongtrack_km"] > 0][::-1]
+    n = min(len(left), len(right))
+    check("pass profile symmetric about overhead",
+          np.allclose(left[-n:], right[:n], rtol=0.02))
+
+    # A larger emitter (built for a lower reference elevation) widens the window.
+    def window_km(ref):
+        pp = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=ref)
+        norm = pp["deliverable_mw"] / pp["deliverable_mw"].max()
+        xin = pp["alongtrack_km"][norm >= 0.5]
+        return float(xin.max() - xin.min()), pp["emitter_diam_m"]
+    w60, d60 = window_km(60.0)
+    w20, d20 = window_km(20.0)
+    check("bigger emitter → wider powering window", w20 > w60 and d20 > d60,
+          f"Ø{d60:.0f}m→{w60:.0f}km vs Ø{d20:.0f}m→{w20:.0f}km")
+
+    # Fixed emitter: capture DROPS off-overhead (vs sized-to-τ which holds ~0.98).
+    check("fixed-emitter capture falls off-overhead",
+          p["capture"][peak_idx] > 0.95 and np.min(p["capture"]) < 0.3)
+
+
 if __name__ == "__main__":
     test_silhouette()
     test_atmosphere()
     test_coupling()
     test_end_to_end()
     test_vectorized()
+    test_pass_profile()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)
