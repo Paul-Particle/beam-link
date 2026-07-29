@@ -457,7 +457,7 @@ class LinkConfig:
     # pick it per geometry (try each order, keep whichever delivers more under the density
     # cap — flat top for a contained spot, peaked Gaussian when it overspills). #(verify)
     adaptive_profile: bool = True
-    profile_orders: tuple = (1.0, 3.0)              # candidate orders when adaptive_profile
+    profile_orders: tuple = (1.0, 2.0, 3.0, 4.0)    # candidate orders when adaptive_profile
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
     # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
