@@ -58,7 +58,7 @@ function applyFrame(k) {
   cur = k;
   return Promise.all(proms);
 }
-function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 30); }); }
+function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 12); }); }
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
 btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
@@ -229,11 +229,25 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
+                          grid_nA=200, emitter_diam_m=None, write=True,
                           path=f"{OUT}/beam_link_flyby_animation.html"):
+    """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
+
+    `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct → `emitter_diam_m`, relay →
+    `relay_aperture_diam_m`) and bypasses the far-reference auto-sizing — so emitter size can
+    be swept as the single variable. `grid_nA` is the panel-A silhouette-grid resolution
+    (lower it for lighter embedded figures)."""
     archs = bl.standard_architectures(weather=weather)
     if arch_name not in archs:
         raise KeyError(f"{arch_name!r} not in {list(archs)}")
-    kw = _size_emitter_far(archs[arch_name], size_ref_elev_deg, plane_alt_m)
+    kw = dict(archs[arch_name])
+    if emitter_diam_m is not None:
+        if kw.get("relay_pos") is not None:
+            kw["relay_aperture_diam_m"] = float(emitter_diam_m)
+        else:
+            kw["emitter_diam_m"] = float(emitter_diam_m)
+    else:
+        kw = _size_emitter_far(kw, size_ref_elev_deg, plane_alt_m)
     lateral_m = lateral_offset_km * 1e3
 
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
@@ -254,8 +268,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     EXT = max_silhouette_extent() * 1.08
     gx = np.linspace(-EXT, EXT, grid_n)              # contour grid (smooth beam)
     gy = np.linspace(-EXT, EXT, grid_n)
-    grid_nA = 200                                    # fine grid for the silhouette heatmap
-    gxA = np.linspace(-EXT, EXT, grid_nA)
+    gxA = np.linspace(-EXT, EXT, grid_nA)            # fine grid for the silhouette heatmap
     gyA = np.linspace(-EXT, EXT, grid_nA)
 
     def encircled_grid(f):
@@ -323,8 +336,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     slant_series = np.array([f["slant_m"] for f in frames_phys])
     max_slant = float(slant_series.max())
     R_max = max(max(f["emitter_radius_m"], f["w0"], f["sil_radial_m"]) for f in frames_phys) * 1.1
-    dist_norm = np.linspace(0.0, 1.0, 110)
-    radial = np.linspace(-R_max, R_max, 90)
+    dist_norm = np.linspace(0.0, 1.0, 96)
+    radial = np.linspace(-R_max, R_max, 76)
     r_t0 = frames_phys[0]["emitter_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
 
@@ -364,7 +377,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # ---- Panel A (1,1): incidence heatmap (filled outline) + encircled-energy contour ---
     i_incA = len(fig.data)
     fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
-                             colorscale="Viridis", zmin=0, zmax=1, zauto=False,
+                             colorscale="Plasma", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=9, color="#ff9a9a"))
@@ -426,7 +439,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.add_trace(go.Mesh3d(x=coarse_v[:, 0], y=coarse_v[:, 1], z=-coarse_v[:, 2],
                             i=coarse_f[:, 0], j=coarse_f[:, 1], k=coarse_f[:, 2],
                             intensity=frames_phys[0]["face_incidence"], intensitymode="cell",
-                            colorscale="Viridis", cmin=0, cmax=1, showscale=False,
+                            colorscale="Plasma", cmin=0, cmax=1, showscale=False,
                             flatshading=True, name="BWB", hoverinfo="skip"), row=2, col=1)
     look0 = frames_phys[0]["look"]
     i_arrow = len(fig.data)
@@ -461,7 +474,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # ---- Panel F (2,3): converging beam channel; white emitter line + plane slice -------
     i_fheat = len(fig.data)
     fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel_norm(frames_phys[0]),
-                             colorscale="Inferno", zmin=0, zmax=1, zauto=False,
+                             colorscale="Plasma", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=2, col=3)
     fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",
                              line=dict(color="white", width=5), name="emitter aperture",
@@ -540,25 +553,40 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                        text="red contours = enclosed beam-energy fraction (centre→edge)",
                        showarrow=False, font=dict(size=9, color="#ff9a9a"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
+    aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
         template="plotly_dark", height=940, width=1680,
-        title=(f"Flyby animation — {arch_name}, {weather} weather, {pass_kind}, "
+        title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
                f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
-    os.makedirs(OUT, exist_ok=True)
-    fig.write_html(path, include_plotlyjs="inline", auto_play=False,
-                   post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
-    return path
+    if write:
+        os.makedirs(OUT, exist_ok=True)
+        fig.write_html(path, include_plotlyjs="inline", auto_play=False,
+                       post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
+    return fig
+
+
+# Emitter-size study: hold everything else fixed (normal weather, lateral pass) and sweep
+# only the emitter aperture, for both the ground-direct and relay architectures. The point
+# is to isolate how much the emitter size — not the weather — drives the comparison.
+STUDY_WEATHER = "clear"
+STUDY_LATERAL_KM = 60.0
+EMITTER_LARGE_M = 50.0
+EMITTER_SMALL_M = 15.0
+DIRECT_ARCH = "5.8 direct"
+RELAY_ARCH = "relay ×3 mult 5.8→17.4"
+
+# (label, arch_name, emitter_diam_m, tag) for the four study cases.
+STUDY_CASES = [
+    ("Relay ×3 — large emitter (50 m)", RELAY_ARCH, EMITTER_LARGE_M, "relay_large"),
+    ("Relay ×3 — small emitter (15 m)", RELAY_ARCH, EMITTER_SMALL_M, "relay_small"),
+    ("5.8 direct — large emitter (50 m)", DIRECT_ARCH, EMITTER_LARGE_M, "direct_large"),
+    ("5.8 direct — small emitter (15 m)", DIRECT_ARCH, EMITTER_SMALL_M, "direct_small"),
+]
 
 
 if __name__ == "__main__":
-    runs = [
-        ("5.8 direct", "storm", 0.0, "58_headon"),
-        ("5.8 direct", "storm", 60.0, "58_lateral"),
-        ("relay ×3 mult 5.8→17.4", "light_rain", 0.0, "relay_headon"),
-        ("relay ×3 mult 5.8→17.4", "light_rain", 60.0, "relay_lateral"),
-    ]
-    for arch, weather, lateral, tag in runs:
-        p = build_flyby_animation(arch_name=arch, weather=weather, lateral_offset_km=lateral,
-                                  path=f"{OUT}/beam_link_flyby_animation_{tag}.html")
-        print("wrote", p)
+    for _label, arch, diam, tag in STUDY_CASES:
+        build_flyby_animation(arch_name=arch, weather=STUDY_WEATHER, lateral_offset_km=STUDY_LATERAL_KM,
+                              emitter_diam_m=diam, path=f"{OUT}/beam_link_flyby_animation_{tag}.html")
+        print("wrote", f"{OUT}/beam_link_flyby_animation_{tag}.html")
