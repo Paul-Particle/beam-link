@@ -31,6 +31,18 @@ import geo
 OUT = "out"
 
 
+def _box_sum(a, r):
+    """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
+    box filter used to fill the gaps between Monte-Carlo silhouette samples."""
+    height, width = a.shape
+    padded = np.pad(a, r)
+    out = np.zeros_like(a)
+    for di in range(2 * r + 1):
+        for dj in range(2 * r + 1):
+            out += padded[di:di + height, dj:dj + width]
+    return out
+
+
 # --- one frame's worth of physics --------------------------------------------
 
 def _localize(downrange_m, crossrange_m, altitude_m, basis):
@@ -199,15 +211,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # FIXED panel-A window = the airframe's max silhouette extent (same every frame AND
     # every run, so silhouettes compare directly). 1:1 aspect via scaleanchor below.
     EXT = max_silhouette_extent() * 1.08
-    gx = np.linspace(-EXT, EXT, grid_n)
+    gx = np.linspace(-EXT, EXT, grid_n)              # contour grid (smooth beam)
     gy = np.linspace(-EXT, EXT, grid_n)
+    grid_nA = 200                                    # fine grid for the silhouette heatmap
+    gxA = np.linspace(-EXT, EXT, grid_nA)
+    gyA = np.linspace(-EXT, EXT, grid_nA)
 
     def encircled_grid(f):
         """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
         of total beam energy carried by all cells at least as bright — so contours at
         0.1…0.9 are rings enclosing that fraction of the delivered energy (centre ≈ 0,
-        spilling out to 1). (The silhouette itself is drawn as a high-detail sample scatter,
-        not a binned grid — finer, and far smaller in the HTML.)"""
+        spilling out to 1). Drawn as an SVG contour over the silhouette heatmap."""
         beam_grid = _beam_on_grid(f["field"], f["w0"], f["shaped"], gx, gy,
                                   profile_order=f["profile_order"])
         flat = beam_grid.ravel()
@@ -215,25 +229,26 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         csum = np.cumsum(flat[order]) / max(flat.sum(), 1e-30)
         encircled = np.empty_like(flat)
         encircled[order] = csum
-        return encircled.reshape(beam_grid.shape)
+        return encircled.reshape(beam_grid.shape).astype(np.float32)
 
     def incidence_grid(f):
-        """The silhouette's incidence field binned onto the fixed panel-A grid: mean
-        incidence of the samples falling in each cell, NaN where the silhouette isn't —
-        a clean filled outline (no scatter holes) that an SVG contour can overlay (a
-        WebGL scatter would render ABOVE the contour and hide it)."""
+        """The silhouette's incidence on the fine panel-A grid, BOX-SMOOTHED to fill the
+        gaps between Monte-Carlo samples: a clean, high-res filled outline instead of
+        per-cell speckle. NaN only where no sample lies within the smoothing radius (so
+        the true outline is preserved). An SVG heatmap so the contour can overlay it (a
+        WebGL scatter would render ABOVE the contour and hide it, and left holes)."""
         fld = f["field"]
-        z = np.full(grid_n * grid_n, np.nan)
         if fld["u"].size == 0:
-            return z.reshape(grid_n, grid_n)
-        iu = np.clip(((fld["u"] + EXT) / (2 * EXT) * (grid_n - 1)).astype(int), 0, grid_n - 1)
-        iv = np.clip(((fld["v"] + EXT) / (2 * EXT) * (grid_n - 1)).astype(int), 0, grid_n - 1)
-        cell = iv * grid_n + iu                       # z[row=v, col=u]
-        ssum = np.zeros(grid_n * grid_n); cnt = np.zeros(grid_n * grid_n)
+            return np.full((grid_nA, grid_nA), np.nan)
+        iu = np.clip(((fld["u"] + EXT) / (2 * EXT) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
+        iv = np.clip(((fld["v"] + EXT) / (2 * EXT) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
+        cell = iv * grid_nA + iu                       # z[row=v, col=u]
+        ssum = np.zeros(grid_nA * grid_nA); cnt = np.zeros(grid_nA * grid_nA)
         np.add.at(ssum, cell, fld["incidence"]); np.add.at(cnt, cell, 1.0)
-        nz = cnt > 0
-        z[nz] = ssum[nz] / cnt[nz]
-        return z.reshape(grid_n, grid_n)
+        ss = _box_sum(ssum.reshape(grid_nA, grid_nA), 2)
+        cc = _box_sum(cnt.reshape(grid_nA, grid_nA), 2)
+        z = np.where(cc > 0.5, ss / np.maximum(cc, 1e-9), np.nan)
+        return z.astype(np.float32)                   # float32 halves the base64 payload
 
     # Static 3-D geometry (ground/cruise/stratosphere arcs; the emitter + its base).
     half = float(xs.max())
@@ -279,7 +294,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         z = _beam_channel(dist_norm, radial, f["slant_m"], max_slant,
                           f["emitter_radius_m"], f["w0"], f["profile_order"])
         mx = np.nanmax(z)
-        return z / mx if mx and mx > 0 else z
+        return (z / mx if mx and mx > 0 else z).astype(np.float32)
 
     # Panel E is an efficiency WATERFALL of the current instant (cascade of blocks from
     # 1.0 down through each stage's loss to η) — most stages are constant along the pass,
@@ -307,7 +322,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     # ---- Panel A (1,1): incidence heatmap (filled outline) + encircled-energy contour ---
     i_incA = len(fig.data)
-    fig.add_trace(go.Heatmap(x=gx, y=gy, z=incidence_grid(frames_phys[0]),
+    fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
                              colorscale="Viridis", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
@@ -440,8 +455,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ]))
     fig.frames = frames
 
-    # Uniform frame spacing = uniform time at constant speed; a short transition tweens
-    # the marker/beam positions so playback is smooth, not steppy.
+    # Uniform frame spacing = uniform time at constant speed. Transition duration MUST be 0:
+    # Heatmap/Waterfall traces can't be tweened, and a non-zero transition skips their
+    # redraw (leaving A/E/F frozen on frame 0) while only the scatter markers move.
     dt_ms = 70
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
@@ -452,7 +468,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.02, xanchor="right",
                           buttons=[dict(label="▶ play", method="animate",
                                         args=[None, dict(frame=dict(duration=dt_ms, redraw=True),
-                                                         transition=dict(duration=dt_ms, easing="linear"),
+                                                         transition=dict(duration=0),
                                                          fromcurrent=True, mode="immediate")]),
                                    dict(label="❚❚ pause", method="animate",
                                         args=[[None], dict(frame=dict(duration=0, redraw=False),
@@ -463,18 +479,22 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_yaxes(title_text="v (m)", range=[-EXT, EXT], row=1, col=1)
     fig.update_yaxes(title_text="efficiency (×)", range=[0, 1.05], row=1, col=3)
     fig.update_xaxes(tickangle=-40, tickfont=dict(size=8), row=1, col=3)
-    fig.update_xaxes(title_text="along-track (km)", row=2, col=2)
-    fig.update_yaxes(title_text="capture / η (%)", rangemode="tozero", secondary_y=False, row=2, col=2)
-    fig.update_yaxes(title_text="cumulative energy (GJ)", rangemode="tozero", secondary_y=True, row=2, col=2)
-    fig.update_xaxes(title_text="radial offset (m)", row=2, col=3)
+    # Panel D: FIXED ranges (x, both y) so nothing re-autoranges as the markers move —
+    # otherwise the plot area jitters/scrolls slightly frame to frame.
+    d_left = max(float(eta_series.max()), float(capture_series.max())) * 1.08
+    fig.update_xaxes(title_text="along-track (km)", range=[xs[0] / 1e3, xs[-1] / 1e3], row=2, col=2)
+    fig.update_yaxes(title_text="capture / η (%)", range=[0, d_left], secondary_y=False, row=2, col=2)
+    fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
+                     secondary_y=True, row=2, col=2)
+    fig.update_xaxes(title_text="radial offset (m)", range=[-R_max, R_max], row=2, col=3)
     fig.update_yaxes(title_text="distance emitter→plane (norm.)", range=[0, 1], row=2, col=3)
     # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates the
-    # vertical so the arc is visible. Aspect made less extreme + camera closer so the arc
-    # fills the viewport with the axes still in frame.
+    # vertical so the arc is visible. Narrower box (less extreme x aspect) + closer camera
+    # so the arc fills the viewport without clipping the axis labels.
     fig.update_scenes(dict(xaxis_title="downrange (km)", yaxis_title="cross (km)",
                            zaxis_title="altitude (km, exaggerated)", aspectmode="manual",
-                           aspectratio=dict(x=3.0, y=0.25, z=1.0),
-                           camera=dict(eye=dict(x=0.12, y=-2.6, z=0.6), up=dict(x=0, y=0, z=1))),
+                           aspectratio=dict(x=2.0, y=0.35, z=0.9),
+                           camera=dict(eye=dict(x=0.05, y=-2.05, z=0.5), up=dict(x=0, y=0, z=1))),
                       row=1, col=2)
     # Panel C: FIXED box so it never rescales as the beam arrow swings.
     fig.update_scenes(dict(xaxis=dict(range=[-BOX, BOX], title="nose (m)"),
