@@ -250,7 +250,7 @@ def test_overlap():
     verts, faces = make_bwb_mesh()
     normals, areas = triangle_normals_areas(verts, faces)
     samples, snorm, swt = m.get_surface_samples()
-    d = direction_from_beta_alpha(85.0, 90.0); d = d / np.linalg.norm(d)
+    d = direction_from_beta_alpha(88.0, 90.0); d = d / np.linalg.norm(d)
     convex = float(projected_area(d, normals, areas))
     raster = m.rasterize_silhouette(d, samples, snorm, swt)["area"]
     check("rasterized silhouette removes convex over-count (side, low elev)",

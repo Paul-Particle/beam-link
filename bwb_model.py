@@ -45,10 +45,35 @@ def _cuboid(center, size):
     return v, f
 
 
+def _winglet_prism(tip_center_x, y_tip, root_chord, tip_chord, height,
+                   fin_sweep, cant_deg, thickness):
+    """A realistic wingtip winglet: a thin, tapered, swept, canted-outward DORSAL fin
+    (root chord > tip chord, leading edge swept aft, canted `cant_deg` off vertical toward
+    the tip, rising in −ẑ = up in the z-down body frame). Returned as a closed thin prism
+    (8 verts, 12 triangles) so the projected-area/rasteriser see its real |n̂·d|·A. Far
+    smaller than a full fin — the big side-area radiator is the (future) sail/stabiliser."""
+    side = 1.0 if y_tip >= 0 else -1.0
+    cant = np.radians(cant_deg)
+    rise = np.array([0.0, side * np.sin(cant), -np.cos(cant)])       # up-and-outboard
+    root_center = np.array([tip_center_x, y_tip, 0.0])
+    tip_center = root_center + height * rise + np.array([-fin_sweep, 0.0, 0.0])
+    chord = np.array([1.0, 0.0, 0.0])
+    r_le, r_te = root_center + chord * root_chord / 2, root_center - chord * root_chord / 2
+    t_le, t_te = tip_center + chord * tip_chord / 2, tip_center - chord * tip_chord / 2
+    normal = np.cross(chord, rise); normal /= np.linalg.norm(normal)  # ≈ spanwise (thin)
+    off = normal * thickness / 2.0
+    quad = np.array([r_le, r_te, t_te, t_le])
+    v = np.vstack([quad - off, quad + off])
+    f = np.array([[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
+                  [1, 5, 6], [1, 6, 2], [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0]])
+    return v, f
+
+
 def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
                   root_thickness_m=6.0, tip_thickness_m=0.4, sweep_m=25.0,
                   body_fraction=0.25, n_span=71, n_theta=40,
-                  winglet_height_m=6.0, winglet_chord_m=14.0, winglet_thickness_m=0.6):
+                  winglet_height_m=3.0, winglet_root_chord_m=3.0, winglet_tip_chord_m=1.2,
+                  winglet_sweep_m=1.5, winglet_cant_deg=20.0, winglet_thickness_m=0.3):
     """A blended-wing-body as a closed lofted lens, optionally with wingtip winglets.
 
     Spanwise the chord and thickness are constant over the centre body
@@ -100,13 +125,15 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
 
     faces = np.asarray(faces, dtype=int)
 
-    # Wingtip winglets: streamwise vertical fins (thin in span, extended chord×height).
-    # They present area to a SIDE aspect at low elevation — where the belly collapses.
+    # Wingtip winglets: realistic tapered/swept/canted dorsal fins. They present some area
+    # to a SIDE aspect at low elevation, but are modest — the large side-area radiator is
+    # the (future) sail / vertical stabiliser, added separately.
     if winglet_height_m > 0:
         tip_x = -sweep_m                                   # nose-tail centre of the swept tip
         for y_tip in (-full_span_m / 2.0, full_span_m / 2.0):
-            wv, wf = _cuboid((tip_x, y_tip, winglet_height_m / 2.0),
-                             (winglet_chord_m, winglet_thickness_m, winglet_height_m))
+            wv, wf = _winglet_prism(tip_x, y_tip, winglet_root_chord_m, winglet_tip_chord_m,
+                                    winglet_height_m, winglet_sweep_m, winglet_cant_deg,
+                                    winglet_thickness_m)
             faces = np.vstack([faces, wf + len(vertices)])
             vertices = np.vstack([vertices, wv])
 
