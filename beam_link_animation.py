@@ -30,22 +30,38 @@ import geo
 
 OUT = "out"
 
-# Custom play button. Plotly's native sequenced animation only redraws Heatmap/Waterfall on
-# the FIRST frame of the sequence (the rest skip the full redraw), so A/E/F freeze during
-# play. This stepper instead fires ONE single-frame `Plotly.animate([k], redraw:true)` per
-# tick — the path that DOES redraw every trace — chained on each animate's promise so it
-# paces to the render and never backs up. The frame count is injected (`{n_frames}`) because
-# `gd.frames` isn't populated yet when this runs; `{plot_id}` is substituted by write_html.
+# Custom play button. Two problems ruled out the obvious approaches: (1) Plotly's native
+# sequenced play only redraws Heatmap/Waterfall on the FIRST frame (the rest freeze); (2)
+# stepping with `Plotly.animate([k], redraw:true)` DOES redraw them but a full redraw tears
+# down and re-renders both WebGL 3-D scenes every tick → wild flicker. So this stepper applies
+# each frame's data with `Plotly.restyle` on just the animated traces — an IN-PLACE update (no
+# full-figure teardown, no flicker) that still redraws heatmaps/waterfall. Frame count injected
+# (`{n_frames}`) since `gd.frames` isn't populated when this runs; `{plot_id}` via write_html.
 _PLAYER_JS = """
 var gd = document.getElementById("{plot_id}");
 var N = {n_frames};
 var cur = 0, playing = false, timer = null;
-var cfg = {mode: 'immediate', frame: {duration: 0, redraw: true}, transition: {duration: 0}};
-function step(k) { return Plotly.animate(gd, [String(k)], cfg).then(function(){ cur = k; }); }
-function loop() { if (!playing) return; step((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 20); }); }
+function frameByName(k) {
+  var frs = (gd._transitionData && gd._transitionData._frames) || gd.frames || [];
+  for (var i = 0; i < frs.length; i++) { if (frs[i] && frs[i].name === String(k)) return frs[i]; }
+  return null;
+}
+function applyFrame(k) {
+  var fr = frameByName(k);
+  if (!fr) return Promise.resolve();
+  var proms = [];
+  for (var j = 0; j < fr.data.length; j++) {
+    var d = fr.data[j], tr = fr.traces ? fr.traces[j] : j, upd = {};
+    for (var key in d) { if (d.hasOwnProperty(key) && key !== 'type') { upd[key] = [d[key]]; } }
+    proms.push(Plotly.restyle(gd, upd, [tr]));
+  }
+  cur = k;
+  return Promise.all(proms);
+}
+function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 30); }); }
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
-btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;';
+btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
 function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
 function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
 btn.onclick = function(){ playing ? pause() : play(); };
@@ -351,10 +367,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              colorscale="Viridis", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
-                        labelfont=dict(size=9, color="#b30000"))
+                        labelfont=dict(size=9, color="#ff9a9a"))
     i_contA = len(fig.data)
     fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
-                             colorscale="Reds", contours=contour_opts, line=dict(width=1.3),
+                             colorscale=[[0.0, "#ffcccc"], [1.0, "#ff3b3b"]],
+                             contours=contour_opts, line=dict(width=1.3),
                              hoverinfo="skip"), row=1, col=1)
 
     # ---- Panel B (1,2) (3-D geometry): arcs, emitter/base, plane + beam -----------------
@@ -521,10 +538,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                            camera=dict(eye=dict(x=1.7, y=-1.7, z=1.2))), row=2, col=1)
     fig.add_annotation(x=0.5, y=1.0, xref="x domain", yref="y domain", row=1, col=1,
                        text="red contours = enclosed beam-energy fraction (centre→edge)",
-                       showarrow=False, font=dict(size=9, color="#b30000"))
+                       showarrow=False, font=dict(size=9, color="#ff9a9a"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     fig.update_layout(
-        template="plotly_white", height=940, width=1680,
+        template="plotly_dark", height=940, width=1680,
         title=(f"Flyby animation — {arch_name}, {weather} weather, {pass_kind}, "
                f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
