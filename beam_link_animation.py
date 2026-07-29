@@ -55,9 +55,10 @@ def _beam_on_grid(field, w0, shaped, gx, gy):
     return beam.reshape(uu.shape)
 
 
-def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh):
+def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
+                   lateral_offset_m=0.0, delivered_mw=10.0):
     """Everything one frame needs, for one plane position of one architecture."""
-    plane = (x_along_m, 0.0, plane_alt_m)
+    plane = (x_along_m, lateral_offset_m, plane_alt_m)
     cfg = bl.LinkConfig(plane_pos=plane, **arch_kwargs)
     if cfg.relay_pos is not None:
         emitter = np.asarray(cfg.relay_pos, float)
@@ -73,16 +74,24 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh):
     raster = bl._cached_raster(beta, alpha)
     lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
     r_recv = bl.receiver_radius_from_silhouette(max(raster["area"], 1e-6))
-    min_waist = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
-    _, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant,
-                                           shaped=cfg.shaped_spot, min_waist_m=min_waist,
+    conv = float(bl.napkin.rectenna_efficiency_band(freq))
+    pol = float(bl.polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))
+    # Same physics as evaluate(): defocus floor, then the power-density cap, then fold
+    # the pointing error into the overlap — so panel A matches the η in panel D.
+    defocus = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
+    cap0, _, w_nom = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
+                                        min_waist_m=defocus, incidence_floor=cfg.incidence_floor)
+    w_dens = bl._density_min_waist(delivered_mw, cap0, conv * pol, cfg.max_power_density_w_m2)
+    _, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
+                                           min_waist_m=max(defocus, w_dens),
+                                           pointing_offset_m=cfg.pointing_error_m,
                                            incidence_floor=cfg.incidence_floor, return_field=True)
-    eta = float(bl.evaluate(cfg, 10.0)["eta_end_to_end"])
+    eta = float(bl.evaluate(cfg, delivered_mw)["eta_end_to_end"])
 
     verts, faces, normals = coarse_mesh
     face_incidence = np.clip(normals @ look, 0.0, 1.0)
 
-    plane_loc = _localize(x_along_m, 0.0, plane_alt_m, basis)
+    plane_loc = _localize(x_along_m, lateral_offset_m, plane_alt_m, basis)
     emitter_loc = _localize(emitter[0], emitter[1], emitter[2], basis)
     return dict(field=field, w0=w0, shaped=cfg.shaped_spot, eff=eff, eta=eta,
                 elevation=float(elevation), slant_km=slant / 1e3, beta=float(beta),
@@ -108,27 +117,27 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 
 
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
-                          plane_alt_m=11_000.0, min_elevation_deg=2.0, n_half=22,
-                          size_ref_elev_deg=8.0, grid_n=70,
+                          plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
+                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=70,
                           path=f"{OUT}/beam_link_flyby_animation.html"):
     archs = bl.standard_architectures(weather=weather)
     if arch_name not in archs:
         raise KeyError(f"{arch_name!r} not in {list(archs)}")
     kw = _size_emitter_far(archs[arch_name], size_ref_elev_deg, plane_alt_m)
+    lateral_m = lateral_offset_km * 1e3
 
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
     coarse_v, coarse_f = m.make_bwb_mesh(n_span=41, n_theta=26)
     coarse_n, _ = m.triangle_normals_areas(coarse_v, coarse_f)
     coarse_mesh = (coarse_v, coarse_f, coarse_n)
 
-    # Horizon-to-horizon, sampled uniformly in ELEVATION (dense through the angular
-    # collapse, sparse where little changes) — the plane crosses overhead at x=0.
-    e_half = np.linspace(min_elevation_deg, 90.0, n_half)
-    dr_half = np.array([float(geo.downrange_for_elevation(e, plane_alt_m)) for e in e_half])
-    dr = np.unique(np.round(dr_half, 1))
-    xs = np.unique(np.concatenate([-dr[::-1], dr]))
-    n_frames = xs.size
-    frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh) for x in xs]
+    # Horizon-to-horizon, sampled uniformly in ALONG-TRACK distance = uniformly in TIME
+    # at constant speed, so playback is smooth and physically paced (independent of the
+    # sampling). The plane's closest approach is at x=0 (offset laterally for a side pass).
+    half = float(geo.downrange_for_elevation(min_elevation_deg, plane_alt_m))
+    xs = np.linspace(-half, half, n_frames)
+    frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh,
+                                  lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
 
     # Common panel-A extent (stable axes across the pass).
     ext = max(max(np.abs(np.concatenate([f["field"]["u"], f["field"]["v"]])).max()
@@ -155,7 +164,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     half = float(xs.max())
     arc_dr = np.linspace(-half, half, 90)
     ground = np.array([_localize(d, 0, 0, basis) for d in arc_dr]) / 1e3
-    cruise = np.array([_localize(d, 0, plane_alt_m, basis) for d in arc_dr]) / 1e3
+    cruise = np.array([_localize(d, lateral_m, plane_alt_m, basis) for d in arc_dr]) / 1e3
     strato = np.array([_localize(d, 0, 20_000.0, basis) for d in arc_dr]) / 1e3
     rain_top_m = bl.WEATHER[weather]["rain_top_m"]
     rain = (np.array([_localize(d, 0, rain_top_m, basis) for d in arc_dr]) / 1e3
@@ -264,6 +273,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ]))
     fig.frames = frames
 
+    # Uniform frame spacing = uniform time at constant speed; a short transition tweens
+    # the marker/beam positions so playback is smooth, not steppy.
+    dt_ms = 70
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
@@ -272,7 +284,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                       currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)],
         updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.02, xanchor="right",
                           buttons=[dict(label="▶ play", method="animate",
-                                        args=[None, dict(frame=dict(duration=110, redraw=True),
+                                        args=[None, dict(frame=dict(duration=dt_ms, redraw=True),
+                                                         transition=dict(duration=dt_ms, easing="linear"),
                                                          fromcurrent=True, mode="immediate")]),
                                    dict(label="❚❚ pause", method="animate",
                                         args=[[None], dict(frame=dict(duration=0, redraw=False),
@@ -298,10 +311,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.add_annotation(x=0.5, y=1.0, xref="x domain", yref="y domain", row=1, col=1,
                        text="red contours = beam intensity (fraction of peak)",
                        showarrow=False, font=dict(size=9, color="#b30000"))
+    pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     fig.update_layout(
         template="plotly_white", height=900, width=1350,
-        title=(f"Flyby animation — {arch_name}, {weather} weather, horizon-to-horizon "
-               f"(±{half/1e3:.0f} km, dense at low elevation; drag the slider or press play)"),
+        title=(f"Flyby animation — {arch_name}, {weather} weather, {pass_kind}, "
+               f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
         legend=dict(orientation="h", y=1.07, x=0.5, xanchor="center", font=dict(size=10)))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline", auto_play=False)
@@ -309,10 +323,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
 
 if __name__ == "__main__":
-    for arch, weather in [("relay ×3 mult 5.8→17.4", "light_rain"),
-                          ("5.8 direct", "storm"),
-                          ("tether 30 direct", "clear")]:
-        tag = arch.split()[0].replace(".", "")
-        p = build_flyby_animation(arch_name=arch, weather=weather,
+    runs = [
+        ("5.8 direct", "storm", 0.0, "58_headon"),
+        ("5.8 direct", "storm", 60.0, "58_lateral"),
+        ("relay ×3 mult 5.8→17.4", "light_rain", 0.0, "relay_headon"),
+        ("relay ×3 mult 5.8→17.4", "light_rain", 60.0, "relay_lateral"),
+    ]
+    for arch, weather, lateral, tag in runs:
+        p = build_flyby_animation(arch_name=arch, weather=weather, lateral_offset_km=lateral,
                                   path=f"{OUT}/beam_link_flyby_animation_{tag}.html")
         print("wrote", p)

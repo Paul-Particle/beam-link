@@ -235,7 +235,8 @@ def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
 
 
 def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=False,
-                    incidence_floor=0.70, aspect_cap=8.0, min_waist_m=0.0, return_field=False):
+                    incidence_floor=0.70, aspect_cap=8.0, min_waist_m=0.0,
+                    pointing_offset_m=0.0, return_field=False):
     """Capture as the 2-D overlap of a focused beam spot with the true (self-occluded)
     silhouette — a Monte-Carlo integral over the visible surface samples, replacing
     √(A/π) sizing + τ-capture + a scalar spot_match.
@@ -245,13 +246,18 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     The spot is centred on the silhouette centroid; a ROUND emitter paints a round spot
     of waist w0, a SHAPED (phased-array) emitter re-forms it at FIXED aperture area
     (fixed etendue w_u·w_v = w0²) into an ellipse aligned to the silhouette's principal
-    axes. `min_waist_m` DEFOCUSES: the spot is never focused tighter than this (a real
-    emitter spreads the beam rather than over-concentrate it onto a tiny patch — which
-    would spike the power density and make pointing brutal). Returns:
+    axes. `min_waist_m` DEFOCUSES (spot never tighter than this).
+
+    `pointing_offset_m` folds a POINTING error into the overlap by shifting the beam
+    centre off the silhouette centroid (worst-case, along the silhouette minor axis) and
+    re-integrating — so a tiny spot that stays on the big rectenna after the shift loses
+    ~nothing, while a spot already filling the silhouette spills. (This replaces the old
+    exp(−2(δ/w)²) point-target factor, which wrongly penalised a well-contained spot.)
+    Returns:
       geom  — fraction of radiated beam power intercepted by the airframe outline
       eff   — same, weighted by the rectenna incidence response (grazing skin converts
               less: floor + (1−floor)·cosθ) — emerges from geometry, not a knob.
-      w0    — the (possibly defocused) round-spot waist (m), for pointing/reporting."""
+      w0    — the (possibly defocused) round-spot waist (m)."""
     u, v, inc, proj = raster["u"], raster["v"], raster["incidence"], raster["proj_area"]
     w0 = max(float(focused_spot_waist(wavelength_m, slant_m, emitter_radius_m)), float(min_waist_m))
     p_total = 0.5 * np.pi * w0 ** 2                    # ∫∫ exp(−2ρ²/w0²) dA
@@ -260,15 +266,22 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
         return (0.0, 0.0, w0, empty) if return_field else (0.0, 0.0, w0)
 
     inc_eff = incidence_floor + (1.0 - incidence_floor) * inc
-    if not shaped or u.size < 3:
-        beam = np.exp(-2.0 * (u ** 2 + v ** 2) / w0 ** 2)
+    # Principal axes of the silhouette (for the shaped ellipse AND the pointing offset
+    # direction — a pointing error across the thin minor axis is the worst case).
+    if u.size >= 3:
+        evals, evecs = np.linalg.eigh(np.cov(np.vstack([u, v]), aweights=np.maximum(proj, 1e-12)))
     else:
-        coords = np.vstack([u, v])
-        cov = np.cov(coords, aweights=np.maximum(proj, 1e-12))
-        evals, evecs = np.linalg.eigh(cov)            # ascending: [minor, major]
+        evals, evecs = np.array([1.0, 1.0]), np.eye(2)
+    minor_axis = evecs[:, 0]
+    du, dv = pointing_offset_m * minor_axis[0], pointing_offset_m * minor_axis[1]
+    su, sv = u - du, v - dv                            # coords relative to shifted beam centre
+
+    if not shaped or u.size < 3:
+        beam = np.exp(-2.0 * (su ** 2 + sv ** 2) / w0 ** 2)
+    else:
         aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap)
         w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
-        pc = evecs.T @ coords                          # rows: [along minor, along major]
+        pc = evecs.T @ np.vstack([su, sv])             # rows: [along minor, along major]
         beam = np.exp(-2.0 * (pc[1] ** 2 / w_major ** 2 + pc[0] ** 2 / w_minor ** 2))
     geom = min(float(np.sum(beam * proj) / p_total), 1.0)
     eff = min(float(np.sum(beam * proj * inc_eff) / p_total), 1.0)
@@ -418,6 +431,11 @@ class LinkConfig:
     incidence_floor: float = 0.70                   # rectenna element angular-response floor
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
+    # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
+    # spot to stay under it — so at high delivered power the spot is forced larger and
+    # capture drops. Default 25 W/cm² (2.5e5 W/m²), the usual solid-state array/rectenna
+    # handling limit. Set None to disable. #(verify)
+    max_power_density_w_m2: float | None = 2.5e5
 
     _silhouette: BWBSilhouette = field(default=None, repr=False)
 
@@ -444,7 +462,7 @@ def _cached_raster(beta_deg, alpha_deg, n_grid=150):
     return raster
 
 
-def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, n_grid=150):
+def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_waist_m=0.0, n_grid=150):
     """The real receive-side geometry the plane presents to an emitter at `emitter_pos`:
     rasterize the (self-occluded) silhouette toward the emitter and overlap the focused
     beam spot with it. Returns a dict with the true silhouette area, the incidence-
@@ -463,15 +481,33 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, n_grid=150):
     if emitter_diam_m is None:                     # size to τ_target on the equal-area disk
         emitter_diam_m = float(size_emitter_diameter(freq_ghz, slant, r_recv, cfg.tau_target))
     wavelength = napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
-    # Defocus: never focus tighter than ~the silhouette — spreading the beam keeps the
-    # power density sane and the pointing tolerant, at a small capture cost.
-    min_waist = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
+    # Defocus: never focus tighter than ~the silhouette (keeps the power density sane);
+    # `extra_min_waist_m` is the power-density cap, applied by the caller once the power
+    # level is known.
+    min_waist = max(cfg.defocus_fill * r_recv if cfg.defocus else 0.0, extra_min_waist_m)
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
                                         shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
-                                        min_waist_m=min_waist)
+                                        min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m)
     return dict(area=area, r_recv=r_recv, beta=float(beta), roll=float(roll),
                 slant=float(slant), elevation=float(elevation), capture=capture,
                 capture_geom=geom, spot_waist_m=w0, emitter_diam_m=float(emitter_diam_m))
+
+
+def _density_min_waist(delivered_mw, capture, rect_total, cap_w_m2):
+    """Minimum spot waist so the peak incident density stays under `cap_w_m2` at the
+    delivered power. Peak of a Gaussian of waist w carrying P is 2P/(πw²); the RF power
+    in the spot at the plane is delivered/(capture·rectenna). Returns 0 if no cap/power."""
+    if delivered_mw is None or cap_w_m2 is None or capture <= 0:
+        return 0.0
+    p_spot_w = delivered_mw * 1e6 / max(capture * rect_total, 1e-9)
+    return float(np.sqrt(2.0 * p_spot_w / (np.pi * cap_w_m2)))
+
+
+def _peak_density(delivered_mw, capture, rect_total, w0):
+    if delivered_mw is None or capture <= 0:
+        return 0.0
+    p_spot_w = delivered_mw * 1e6 / max(capture * rect_total, 1e-9)
+    return 2.0 * p_spot_w / (np.pi * w0 ** 2)
 
 
 def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
@@ -483,23 +519,27 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
     if cfg.relay_pos is None:
         # ---- direct emitter → plane (emitter at station_pos; lofted for the tether case) ----
         f = cfg.f_emit_plane_ghz
+        conv = float(napkin.rectenna_efficiency_band(f))
         pc = plane_capture(cfg, station, f, cfg.emitter_diam_m)
+        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
+        # Power-density cap: spread the spot if the peak incident density is too high.
+        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol, cfg.max_power_density_w_m2)
+        if w_req > pc["spot_waist_m"]:
+            pc = plane_capture(cfg, station, f, cfg.emitter_diam_m, extra_min_waist_m=w_req)
         a, b = _to_ecef(station), _to_ecef(plane)
         blocked = bool(geo.horizon_blocked(a, b, 64))
         atmos_t = float(napkin.db_to_fraction(atmos.path_loss_db(f, a, b, cfg.weather))) * (0.0 if blocked else 1.0)
         ap_eff = float(emitter_aperture_efficiency(0.0, cfg.emitter_error_efficiency))
-        point = float(pointing_efficiency(cfg.pointing_error_m, pc["spot_waist_m"]))
-        conv = float(napkin.rectenna_efficiency_band(f))
-        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
         eta_dc_rf = float(eta_grid_to_rf(f, cfg.pae_scenario))
 
-        eta = eta_dc_rf * ap_eff * pc["capture"] * atmos_t * point * conv * pol
+        eta = eta_dc_rf * ap_eff * pc["capture"] * atmos_t * conv * pol
         stages = dict(
             architecture="direct", dc_to_rf=eta_dc_rf, emitter_aperture=ap_eff,
             capture=pc["capture"], capture_geom=pc["capture_geom"], atmos=atmos_t,
-            pointing=point, rectenna_rf_to_dc=conv, polarization=pol,
+            rectenna_rf_to_dc=conv, polarization=pol,
             rectenna_total=conv * pol, silhouette_m2=pc["area"],
             receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], spot_waist_m=pc["spot_waist_m"],
+            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol, pc["spot_waist_m"]),
             emitter_diam_m=pc["emitter_diam_m"], slant_km=pc["slant"] / 1e3,
             elevation_deg=pc["elevation"], blocked=blocked)
 
@@ -515,31 +555,34 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
                  error_efficiency=cfg.emitter_error_efficiency)
         # down-leg: relay → plane uses the real silhouette overlap; the emitting
         # aperture is the relay's own (fixed) transmit array.
+        conv = float(napkin.rectenna_efficiency_band(f2))
         pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m)
+        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
+        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol, cfg.max_power_density_w_m2)
+        if w_req > pc["spot_waist_m"]:
+            pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m, extra_min_waist_m=w_req)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
         blocked2 = bool(geo.horizon_blocked(a2, b2, 64))
         atmos_dn = float(napkin.db_to_fraction(atmos.path_loss_db(f2, a2, b2, cfg.weather))) * (0.0 if blocked2 else 1.0)
 
         convert = float(relay_convert_efficiency(f1, f2, cfg.relay_mode,
                         stage_efficiency=cfg.relay_stage_efficiency, pae_scenario=cfg.pae_scenario))
-        point = float(pointing_efficiency(cfg.pointing_error_m, pc["spot_waist_m"]))
-        conv = float(napkin.rectenna_efficiency_band(f2))
-        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
         eta_dc_rf = float(eta_grid_to_rf(f1, cfg.pae_scenario))
 
         eta = (eta_dc_rf * float(h1.emitter_aperture_eff) * float(h1.capture) * float(h1.atmos_transmittance)
                * convert * float(emitter_aperture_efficiency(0.0, cfg.emitter_error_efficiency))
-               * pc["capture"] * atmos_dn * point * conv * pol)
+               * pc["capture"] * atmos_dn * conv * pol)
         stages = dict(
             architecture=f"relay-{cfg.relay_mode}", dc_to_rf=eta_dc_rf,
             emitter_aperture=float(h1.emitter_aperture_eff),
             capture_up=float(h1.capture), atmos_up=float(h1.atmos_transmittance),
             relay_convert=convert, relay_aperture=float(emitter_aperture_efficiency(0.0, cfg.emitter_error_efficiency)),
             capture_down=pc["capture"], capture_down_geom=pc["capture_geom"], atmos_down=atmos_dn,
-            pointing=point, rectenna_rf_to_dc=conv, polarization=pol, rectenna_total=conv * pol,
+            rectenna_rf_to_dc=conv, polarization=pol, rectenna_total=conv * pol,
             capture=pc["capture"], atmos=atmos_dn,
             silhouette_m2=pc["area"], receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"],
             spot_waist_m=pc["spot_waist_m"], emitter_diam_m=pc["emitter_diam_m"],
+            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol, pc["spot_waist_m"]),
             emitter_diam_up_m=float(h1.emitter_diam_m),
             slant_up_km=h1.slant_m / 1e3, slant_down_km=pc["slant"] / 1e3,
             elevation_up_deg=float(h1.elevation_deg), elevation_down_deg=pc["elevation"],
@@ -735,14 +778,14 @@ def waterfall(stages):
     """Ordered (stage, efficiency) chain for a result dict — for printing/plotting."""
     if stages["architecture"] == "direct":
         keys = [("DC→RF (PAE)", "dc_to_rf"), ("emitter aperture", "emitter_aperture"),
-                ("near-field capture", "capture"), ("atmosphere", "atmos"),
-                ("pointing", "pointing"), ("rectenna RF→DC+match", "rectenna_total")]
+                ("overlap capture", "capture"), ("atmosphere", "atmos"),
+                ("rectenna RF→DC+incidence", "rectenna_total")]
     else:
         keys = [("DC→RF (PAE)", "dc_to_rf"), ("emitter aperture", "emitter_aperture"),
                 ("capture up", "capture_up"), ("atmosphere up", "atmos_up"),
                 ("relay convert", "relay_convert"), ("relay aperture", "relay_aperture"),
-                ("capture down", "capture_down"), ("atmosphere down", "atmos_down"),
-                ("pointing", "pointing"), ("rectenna RF→DC+match", "rectenna_total")]
+                ("overlap capture", "capture_down"), ("atmosphere down", "atmos_down"),
+                ("rectenna RF→DC+incidence", "rectenna_total")]
     return [(label, float(stages[k])) for label, k in keys]
 
 
