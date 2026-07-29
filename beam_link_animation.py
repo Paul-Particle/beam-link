@@ -58,7 +58,7 @@ function applyFrame(k) {
   cur = k;
   return Promise.all(proms);
 }
-function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 12); }); }
+function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 8); }); }
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
 btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
@@ -134,20 +134,31 @@ def max_silhouette_extent():
     return _SIL_EXTENT
 
 
-def _beam_channel(distance_norm, radial, slant_m, max_slant_m, emitter_radius_m, w0, order):
-    """Intensity of the CONVERGING beam over a side view: y = along-beam distance (fraction
-    of the pass's max slant), x = radial offset. The spot tapers from the emitter aperture
-    (radius r_t at the emitter) to the focused waist w0 at the plane (distance = slant), so
-    the beam is an hourglass narrowing onto the aircraft. Intensity ∝ 1/w(s)² (brightens as
-    it focuses); NaN beyond the plane (no beam past the focus)."""
-    C = bl.supergaussian_area_factor(order)
+def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_m):
+    """Intensity of the CONVERGING beam over a side view: y = along-PATH distance (fraction
+    of the longest total path over the pass), x = radial offset. `segments` is a list of
+    (w_start, w_end, length_m, order) legs laid end to end along y — one leg for a direct
+    link, TWO for a relay (ground→relay up-leg, then relay→plane down-leg). Each leg tapers
+    linearly from its emitting aperture to its focal waist; intensity ∝ 1/w(s)² is normalised
+    PER LEG so both the wide, faint up-leg and the focused, bright down-leg stay visible.
+    NaN beyond the current plane position (no beam past the focus)."""
     dd, rr = np.meshgrid(distance_norm, radial, indexing="ij")   # (n_dist, n_radial)
-    s = dd * max_slant_m
-    frac = np.clip(s / max(slant_m, 1e-6), 0.0, 1.0)
-    w = emitter_radius_m + (w0 - emitter_radius_m) * frac
-    inten = np.exp(-2.0 * (rr ** 2 / w ** 2) ** order) / (np.pi * w ** 2 * C)
-    inten[s > slant_m] = np.nan                          # nothing past the plane
-    return inten
+    s = dd * total_shown_m
+    z = np.full(s.shape, np.nan)
+    cum = 0.0
+    for w_start, w_end, seg_len, order in segments:
+        in_seg = (s >= cum) & (s < cum + seg_len) & (s <= current_total_m)
+        if seg_len > 0 and np.any(in_seg):
+            frac = np.clip((s - cum) / seg_len, 0.0, 1.0)
+            w = w_start + (w_end - w_start) * frac
+            C = bl.supergaussian_area_factor(order)
+            inten = np.where(in_seg, np.exp(-2.0 * (rr ** 2 / w ** 2) ** order) / (np.pi * w ** 2 * C), np.nan)
+            mx = np.nanmax(inten)
+            if mx and mx > 0:
+                inten = inten / mx
+            z = np.where(in_seg, inten, z)
+        cum += seg_len
+    return z
 
 
 def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
@@ -199,11 +210,29 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     verts, faces, normals = coarse_mesh
     face_incidence = np.clip(normals @ look, 0.0, 1.0)
 
+    # Panel-F beam-channel legs (end-to-end along the path). Relay = a ground→relay up-leg
+    # (its ground aperture auto-sized to match the relay at that range) followed by the
+    # focused relay→plane down-leg; direct = a single ground→plane leg.
+    if cfg.relay_pos is not None:
+        station = np.asarray(cfg.station_pos, float)
+        L1 = float(bl.geometry(station, np.asarray(cfg.relay_pos, float))[0])   # ground→relay
+        r_relay = cfg.relay_aperture_diam_m / 2.0
+        r_up = bl.size_emitter_diameter(cfg.f_emit_relay_ghz, L1, r_relay, cfg.tau_target) / 2.0
+        chan_segments = [(float(r_up), r_relay, L1, 1.0), (r_relay, w0, float(slant), order)]
+        chan_total = L1 + float(slant)
+        chan_relay_m, chan_relay_radius_m, chan_emit_radius_m = L1, r_relay, float(r_up)
+    else:
+        chan_segments = [(float(diam / 2.0), w0, float(slant), order)]
+        chan_total = float(slant)
+        chan_relay_m, chan_relay_radius_m, chan_emit_radius_m = None, None, float(diam / 2.0)
+
     plane_loc = _localize(x_along_m, lateral_offset_m, plane_alt_m, basis)
     emitter_loc = _localize(emitter[0], emitter[1], emitter[2], basis)
     return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=order,
                 geom=geom, eff=eff, eta=eta, elevation=float(elevation), slant_km=slant / 1e3,
                 slant_m=float(slant), emitter_radius_m=float(diam / 2.0), sil_radial_m=sil_radial_m,
+                chan_segments=chan_segments, chan_total=chan_total, chan_relay_m=chan_relay_m,
+                chan_relay_radius_m=chan_relay_radius_m, chan_emit_radius_m=chan_emit_radius_m,
                 beta=float(beta), area=raster["area"], look=look, face_incidence=face_incidence,
                 plane_loc=plane_loc, emitter_loc=emitter_loc,
                 wf_labels=[lbl for lbl, _ in wf], wf_values=[v for _, v in wf])
@@ -228,7 +257,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
-                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
+                          n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, write=True,
                           path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
@@ -332,23 +361,20 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     dt_s = (xs[1] - xs[0]) / 250.0                                       # 250 m/s cruise
     deliverable_mw = (delivered_mw / peak) * (eta_series / 100.0)
     cum_gj = np.cumsum(deliverable_mw * dt_s) / 1e3                      # MW·s = MJ → GJ
-    # Panel F (beam channel) axes.
-    slant_series = np.array([f["slant_m"] for f in frames_phys])
-    max_slant = float(slant_series.max())
-    R_max = max(max(f["emitter_radius_m"], f["w0"], f["sil_radial_m"]) for f in frames_phys) * 1.1
+    # Panel F (beam channel) axes — y spans the whole path (relay = up-leg + down-leg), so
+    # normalise to the longest total path over the pass; the relay node sits at a fixed y.
+    max_total = max(f["chan_total"] for f in frames_phys)
+    R_max = max(max(f["chan_emit_radius_m"], f["chan_relay_radius_m"] or 0.0, f["w0"], f["sil_radial_m"])
+                for f in frames_phys) * 1.1
     dist_norm = np.linspace(0.0, 1.0, 96)
     radial = np.linspace(-R_max, R_max, 76)
-    r_t0 = frames_phys[0]["emitter_radius_m"]
+    r_t0 = frames_phys[0]["chan_emit_radius_m"]
+    relay_m0 = frames_phys[0]["chan_relay_m"]
+    relay_r0 = frames_phys[0]["chan_relay_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
 
-    def channel_norm(f):
-        """Beam-channel intensity for one frame, normalised to its own peak so every
-        frame spans the full colour range (fixed zmin/zmax below); otherwise the huge
-        frame-to-frame swing in absolute intensity leaves later frames near-flat."""
-        z = _beam_channel(dist_norm, radial, f["slant_m"], max_slant,
-                          f["emitter_radius_m"], f["w0"], f["profile_order"])
-        mx = np.nanmax(z)
-        return (z / mx if mx and mx > 0 else z).astype(np.float32)
+    def channel(f):
+        return _beam_channel(dist_norm, radial, f["chan_segments"], max_total, f["chan_total"]).astype(np.float32)
 
     # Panel E is an efficiency WATERFALL of the current instant (cascade of blocks from
     # 1.0 down through each stage's loss to η) — most stages are constant along the pass,
@@ -380,10 +406,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              colorscale="Plasma", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
-                        labelfont=dict(size=9, color="#ff9a9a"))
+                        labelfont=dict(size=9, color="#c8ffe6"))
     i_contA = len(fig.data)
+    # Bright mint-green: reads cleanly over Plasma (which has no green), unlike the old red.
     fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
-                             colorscale=[[0.0, "#ffcccc"], [1.0, "#ff3b3b"]],
+                             colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
                              contours=contour_opts, line=dict(width=1.3),
                              hoverinfo="skip"), row=1, col=1)
 
@@ -471,17 +498,24 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
                   row=2, col=2, secondary_y=True)
 
-    # ---- Panel F (2,3): converging beam channel; white emitter line + plane slice -------
+    # ---- Panel F (2,3): converging beam channel; emitter + (relay) apertures + plane slice
     i_fheat = len(fig.data)
-    fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel_norm(frames_phys[0]),
+    fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel(frames_phys[0]),
                              colorscale="Plasma", zmin=0, zmax=1, zauto=False,
                              showscale=False, hoverinfo="skip"), row=2, col=3)
     fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",
                              line=dict(color="white", width=5), name="emitter aperture",
                              showlegend=False, hoverinfo="skip"), row=2, col=3)
+    if relay_m0 is not None:                          # relay node between the two legs
+        yr = relay_m0 / max_total
+        fig.add_trace(go.Scatter(x=[-relay_r0, relay_r0], y=[yr, yr], mode="lines",
+                                 line=dict(color="#ffd24a", width=5), name="relay aperture",
+                                 showlegend=False, hoverinfo="skip"), row=2, col=3)
+        fig.add_annotation(x=0.0, y=yr, row=2, col=3, text="relay", showarrow=False,
+                           yshift=8, font=dict(size=9, color="#ffd24a"))
     sil0 = frames_phys[0]["sil_radial_m"]
     i_fplane = len(fig.data)
-    fig.add_trace(go.Scatter(x=[-sil0, sil0], y=[slant_series[0] / max_slant] * 2, mode="lines",
+    fig.add_trace(go.Scatter(x=[-sil0, sil0], y=[frames_phys[0]["chan_total"] / max_total] * 2, mode="lines",
                              line=dict(color="#00e5ff", width=4), name="plane",
                              showlegend=False, hoverinfo="skip"), row=2, col=3)
 
@@ -492,7 +526,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         p = f["plane_loc"] / 1e3
         look = f["look"]
         cur = xs[k] / 1e3
-        yy = f["slant_m"] / max_slant
+        yy = f["chan_total"] / max_total
         frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
             go.Heatmap(z=incidence_grid(f)),
             go.Contour(x=gx, y=gy, z=encircled_grid(f)),
@@ -505,7 +539,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             go.Scatter(x=[cur], y=[eta_series[k]]),
             go.Scatter(x=[cur], y=[capture_series[k]]),
             go.Scatter(x=[cur], y=[cum_gj[k]]),
-            go.Heatmap(z=channel_norm(f)),
+            go.Heatmap(z=channel(f)),
             go.Scatter(x=[-f["sil_radial_m"], f["sil_radial_m"]], y=[yy, yy]),
         ]))
     fig.frames = frames
@@ -550,8 +584,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                            aspectmode="cube",
                            camera=dict(eye=dict(x=1.7, y=-1.7, z=1.2))), row=2, col=1)
     fig.add_annotation(x=0.5, y=1.0, xref="x domain", yref="y domain", row=1, col=1,
-                       text="red contours = enclosed beam-energy fraction (centre→edge)",
-                       showarrow=False, font=dict(size=9, color="#ff9a9a"))
+                       text="green contours = enclosed beam-energy fraction (centre→edge)",
+                       showarrow=False, font=dict(size=9, color="#8fffd0"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
@@ -566,22 +600,18 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     return fig
 
 
-# Emitter-size study: hold everything else fixed (normal weather, lateral pass) and sweep
-# only the emitter aperture, for both the ground-direct and relay architectures. The point
-# is to isolate how much the emitter size — not the weather — drives the comparison.
+# Relay vs direct at a common, meaningful emitter aperture (100 m everywhere), normal weather,
+# lateral pass — the head-to-head with the emitter no longer confounding the comparison.
 STUDY_WEATHER = "clear"
 STUDY_LATERAL_KM = 60.0
-EMITTER_LARGE_M = 50.0
-EMITTER_SMALL_M = 15.0
+EMITTER_M = 100.0
 DIRECT_ARCH = "5.8 direct"
 RELAY_ARCH = "relay ×3 mult 5.8→17.4"
 
-# (label, arch_name, emitter_diam_m, tag) for the four study cases.
+# (label, arch_name, emitter_diam_m, tag).
 STUDY_CASES = [
-    ("Relay ×3 — large emitter (50 m)", RELAY_ARCH, EMITTER_LARGE_M, "relay_large"),
-    ("Relay ×3 — small emitter (15 m)", RELAY_ARCH, EMITTER_SMALL_M, "relay_small"),
-    ("5.8 direct — large emitter (50 m)", DIRECT_ARCH, EMITTER_LARGE_M, "direct_large"),
-    ("5.8 direct — small emitter (15 m)", DIRECT_ARCH, EMITTER_SMALL_M, "direct_small"),
+    ("Relay ×3 — 100 m aperture", RELAY_ARCH, EMITTER_M, "relay_100m"),
+    ("5.8 direct — 100 m emitter", DIRECT_ARCH, EMITTER_M, "direct_100m"),
 ]
 
 
