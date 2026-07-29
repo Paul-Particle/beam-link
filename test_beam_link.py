@@ -253,7 +253,9 @@ def test_overlap():
     def caps(beta):
         dd = direction_from_beta_alpha(beta, 0.0); dd = dd / np.linalg.norm(dd)
         r = m.rasterize_silhouette(dd, samples, snorm, swt)
-        return bl.overlap_capture(r, 30.0, lam, 250e3, shaped=False)  # (geom, eff, w0)
+        # Pin the floor low so this tests the MECHANISM, not the (milder, conformal-
+        # rectenna) default floor.
+        return bl.overlap_capture(r, 30.0, lam, 250e3, shaped=False, incidence_floor=0.70)
     g_over, e_over, _ = caps(5.0)     # near belly-on (overhead)
     g_low, e_low, _ = caps(85.0)      # grazing (low elevation)
     check("incidence penalty ~absent overhead", e_over / g_over > 0.9,
@@ -329,6 +331,50 @@ def test_pointing_density():
           f"1 MW → {lo:.1f} m, 40 MW → {hi:.1f} m")
 
 
+def test_flattop():
+    print("\n[flat-top (super-Gaussian) beam]")
+    def disk_raster(r_r, n=400):
+        g = np.linspace(-r_r, r_r, n)
+        uu, vv = np.meshgrid(g, g)
+        mask = uu ** 2 + vv ** 2 <= r_r ** 2
+        cell = (g[1] - g[0]) ** 2
+        return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
+                    proj_area=np.full(int(mask.sum()), cell), area=int(mask.sum()) * cell)
+    lam, D, r_t = napkin.wavelength(30e9), 200e3, 40.0
+    w = bl.focused_spot_waist(lam, D, r_t)
+    # On a rectenna comparable to the spot (r_r ≈ w), the Gaussian's tail SPILLS past the
+    # edge while a flat top is sharply contained → flat top captures MORE of the same
+    # total power. (For a target much smaller than the spot the reverse holds — a peaked
+    # beam wins — so the flat top is the tool for a CONTAINED, density-limited spot.)
+    r = disk_raster(w)
+    _, e_gauss, _ = bl.overlap_capture(r, r_t, lam, D, shaped=False, profile_order=1.0, incidence_floor=1.0)
+    _, e_flat, _ = bl.overlap_capture(r, r_t, lam, D, shaped=False, profile_order=6.0, incidence_floor=1.0)
+    check("flat-top captures ≥ Gaussian on a contained spot", e_flat >= e_gauss - 1e-9,
+          f"flat {e_flat:.3f} ≥ gauss {e_gauss:.3f}")
+    pk_g = bl._peak_density(10.0, 0.5, 0.5, w, profile_order=1.0)
+    pk_f = bl._peak_density(10.0, 0.5, 0.5, w, profile_order=4.0)
+    check("flat-top lowers peak density at equal waist/power", pk_f < pk_g,
+          f"gauss {pk_g/1e4:.1f} vs flat {pk_f/1e4:.1f} W/cm²")
+    # Under a W/m² cap, the flatter top needs a SMALLER minimum footprint for the same
+    # delivered power → less spill.
+    w_g = bl._density_min_waist(10.0, 0.5, 0.5, 2.5e5, profile_order=1.0)
+    w_f = bl._density_min_waist(10.0, 0.5, 0.5, 2.5e5, profile_order=4.0)
+    check("flat-top needs a smaller capped footprint", w_f < w_g,
+          f"gauss {w_g:.1f} m vs flat {w_f:.1f} m")
+
+
+def test_energy_balance():
+    print("\n[flyby energy balance — plane banks everything]")
+    archs = bl.standard_architectures(weather="clear")
+    r = bl.flyby(archs["relay ×3 mult 5.8→17.4"], station_spacing_km=200.0)
+    check("waste = grid − delivered energy", abs(r["waste_gj"] - (r["grid_gj"] - r["delivered_gj"])) < 1e-9,
+          f"grid {r['grid_gj']:.2f} − deliv {r['delivered_gj']:.2f} = {r['grid_gj']-r['delivered_gj']:.2f}")
+    check("energy η = delivered / grid over served window",
+          abs(r["energy_eta"] - r["delivered_gj"] / r["grid_gj"]) < 1e-6,
+          f"energy_eta {r['energy_eta']:.3f} vs deliv/grid {r['delivered_gj']/r['grid_gj']:.3f}")
+    check("0 ≤ served fraction ≤ 1", 0.0 <= r["served_frac"] <= 1.0, f"{r['served_frac']:.2f}")
+
+
 if __name__ == "__main__":
     test_silhouette()
     test_atmosphere()
@@ -340,5 +386,7 @@ if __name__ == "__main__":
     test_overlap()
     test_flyby()
     test_pointing_density()
+    test_flattop()
+    test_energy_balance()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)

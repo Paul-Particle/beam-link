@@ -38,20 +38,22 @@ def _localize(downrange_m, crossrange_m, altitude_m, basis):
     return np.array([np.dot(d, north), np.dot(d, east), np.dot(d, up)])
 
 
-def _beam_on_grid(field, w0, shaped, gx, gy):
+def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     """The beam intensity the overlap used, evaluated on a plotting grid — round, or
     the shaped ellipse aligned to the silhouette's principal axes (matching
-    overlap_capture so the picture agrees with the capture number)."""
+    overlap_capture so the picture agrees with the capture number). `profile_order` is
+    the super-Gaussian order (1 = Gaussian, >1 = flat top)."""
+    n = float(profile_order)
     uu, vv = np.meshgrid(gx, gy)
     if not shaped or field["u"].size < 3:
-        return np.exp(-2.0 * (uu ** 2 + vv ** 2) / w0 ** 2)
+        return np.exp(-2.0 * ((uu ** 2 + vv ** 2) / w0 ** 2) ** n)
     coords = np.vstack([field["u"], field["v"]])
     evals, evecs = np.linalg.eigh(np.cov(coords))
     aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, 8.0)
     w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
     flat = np.vstack([uu.ravel(), vv.ravel()])
     proj = evecs.T @ flat                       # rows: [along minor, along major]
-    beam = np.exp(-2.0 * (proj[1] ** 2 / w_major ** 2 + proj[0] ** 2 / w_minor ** 2))
+    beam = np.exp(-2.0 * (proj[1] ** 2 / w_major ** 2 + proj[0] ** 2 / w_minor ** 2) ** n)
     return beam.reshape(uu.shape)
 
 
@@ -80,12 +82,15 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     # the pointing error into the overlap — so panel A matches the η in panel D.
     defocus = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
     cap0, _, w_nom = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
-                                        min_waist_m=defocus, incidence_floor=cfg.incidence_floor)
-    w_dens = bl._density_min_waist(delivered_mw, cap0, conv * pol, cfg.max_power_density_w_m2)
+                                        min_waist_m=defocus, incidence_floor=cfg.incidence_floor,
+                                        profile_order=cfg.beam_profile_order)
+    w_dens = bl._density_min_waist(delivered_mw, cap0, conv * pol, cfg.max_power_density_w_m2,
+                                   cfg.beam_profile_order)
     _, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
                                            min_waist_m=max(defocus, w_dens),
                                            pointing_offset_m=cfg.pointing_error_m,
-                                           incidence_floor=cfg.incidence_floor, return_field=True)
+                                           incidence_floor=cfg.incidence_floor,
+                                           profile_order=cfg.beam_profile_order, return_field=True)
     eta = float(bl.evaluate(cfg, delivered_mw)["eta_end_to_end"])
 
     verts, faces, normals = coarse_mesh
@@ -93,8 +98,8 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
 
     plane_loc = _localize(x_along_m, lateral_offset_m, plane_alt_m, basis)
     emitter_loc = _localize(emitter[0], emitter[1], emitter[2], basis)
-    return dict(field=field, w0=w0, shaped=cfg.shaped_spot, eff=eff, eta=eta,
-                elevation=float(elevation), slant_km=slant / 1e3, beta=float(beta),
+    return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=cfg.beam_profile_order,
+                eff=eff, eta=eta, elevation=float(elevation), slant_km=slant / 1e3, beta=float(beta),
                 area=raster["area"], look=look, face_incidence=face_incidence,
                 plane_loc=plane_loc, emitter_loc=emitter_loc)
 
@@ -118,7 +123,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
-                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=70,
+                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=180,
                           path=f"{OUT}/beam_link_flyby_animation.html"):
     archs = bl.standard_architectures(weather=weather)
     if arch_name not in archs:
@@ -139,14 +144,21 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh,
                                   lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
 
-    # Common panel-A extent (stable axes across the pass).
-    ext = max(max(np.abs(np.concatenate([f["field"]["u"], f["field"]["v"]])).max()
-                  if f["field"]["u"].size else f["w0"], f["w0"]) for f in frames_phys) * 1.1
-    gx = np.linspace(-ext, ext, grid_n)
-    gy = np.linspace(-ext, ext, grid_n)
+    def frame_extent(f):
+        """Half-width of panel A for THIS frame: enough to show the beam's 0.2-of-peak
+        contour AND the whole silhouette. PER-FRAME (not a shared max) — otherwise the
+        far-out frames' huge defocused waist sets a giant fixed window and every overhead
+        frame collapses to an invisible central dot (the 'panel A empty' bug)."""
+        sil = (np.abs(np.concatenate([f["field"]["u"], f["field"]["v"]])).max()
+               if f["field"]["u"].size else 0.0)
+        return max(1.3 * f["w0"], sil) * 1.15
 
     def panel_a_grids(f):
-        """Silhouette incidence (NaN outside) + the beam intensity, on the common grid."""
+        """Silhouette incidence (NaN outside) + the beam intensity, on a per-frame grid
+        sized to this frame's extent; returns the grid axes so the frame can rescale."""
+        ext = frame_extent(f)
+        gx = np.linspace(-ext, ext, grid_n)
+        gy = np.linspace(-ext, ext, grid_n)
         field = f["field"]
         inc_grid = np.full((grid_n, grid_n), np.nan)
         if field["u"].size:
@@ -157,8 +169,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             np.add.at(cnt, (iv, iu), 1.0)
             covered = cnt > 0
             inc_grid[covered] = acc[covered] / cnt[covered]
-        beam_grid = _beam_on_grid(field, f["w0"], f["shaped"], gx, gy)
-        return inc_grid, beam_grid
+        beam_grid = _beam_on_grid(field, f["w0"], f["shaped"], gx, gy,
+                                  profile_order=f["profile_order"])
+        return inc_grid, beam_grid, gx, gy, ext
 
     # Static 3-D geometry (ground/cruise/stratosphere arcs; the emitter + its base).
     half = float(xs.max())
@@ -188,14 +201,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                         "C · BWB facets by beam incidence",
                         "D · end-to-end η along the pass"))
 
-    inc0, beam0 = panel_a_grids(frames_phys[0])
+    inc0, beam0, gx0, gy0, ext0 = panel_a_grids(frames_phys[0])
     contour_opts = dict(coloring="lines", showlabels=True, start=0.2, end=0.8, size=0.2,
                         labelfont=dict(size=9, color="#b30000"))
     # 0: silhouette incidence heatmap  1: beam contour (labelled = fraction of peak)
-    fig.add_trace(go.Heatmap(x=gx, y=gy, z=inc0, colorscale="Viridis", zmin=0, zmax=1,
+    fig.add_trace(go.Heatmap(x=gx0, y=gy0, z=inc0, colorscale="Viridis", zmin=0, zmax=1,
                              colorbar=dict(title="incidence", len=0.40, y=0.80, x=0.445),
                              hoverinfo="skip"), row=1, col=1)
-    fig.add_trace(go.Contour(x=gx, y=gy, z=beam0, showscale=False, colorscale="Reds",
+    fig.add_trace(go.Contour(x=gx0, y=gy0, z=beam0, showscale=False, colorscale="Reds",
                              contours=contour_opts, line=dict(width=1.4), hoverinfo="skip"),
                   row=1, col=1)
 
@@ -258,19 +271,23 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     ANIMATED = [0, 1, 9, 10, 11, 12, 14]
     frames = []
     for k, f in enumerate(frames_phys):
-        inc_g, beam_g = panel_a_grids(f)
+        inc_g, beam_g, gxk, gyk, extk = panel_a_grids(f)
         p = f["plane_loc"] / 1e3
         look = f["look"]
-        frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
-            go.Heatmap(x=gx, y=gy, z=inc_g),
-            go.Contour(x=gx, y=gy, z=beam_g),
-            go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
-            go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
-            go.Mesh3d(intensity=f["face_incidence"], intensitymode="cell"),
-            go.Scatter3d(x=[look[0] * 40, look[0] * 15], y=[look[1] * 40, look[1] * 15],
-                         z=[look[2] * 40, look[2] * 15]),
-            go.Scatter(x=[xs[k] / 1e3], y=[eta_series[k]]),
-        ]))
+        # Rescale panel A to this frame's extent (the beam waist shrinks ~40× overhead vs
+        # near the horizon) so the spot/silhouette stay legible the whole pass.
+        frames.append(go.Frame(name=str(k), traces=ANIMATED,
+            layout=go.Layout(xaxis=dict(range=[-extk, extk]), yaxis=dict(range=[-extk, extk])),
+            data=[
+                go.Heatmap(x=gxk, y=gyk, z=inc_g),
+                go.Contour(x=gxk, y=gyk, z=beam_g),
+                go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
+                go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
+                go.Mesh3d(intensity=f["face_incidence"], intensitymode="cell"),
+                go.Scatter3d(x=[look[0] * 40, look[0] * 15], y=[look[1] * 40, look[1] * 15],
+                             z=[look[2] * 40, look[2] * 15]),
+                go.Scatter(x=[xs[k] / 1e3], y=[eta_series[k]]),
+            ]))
     fig.frames = frames
 
     # Uniform frame spacing = uniform time at constant speed; a short transition tweens
@@ -291,8 +308,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                         args=[[None], dict(frame=dict(duration=0, redraw=False),
                                                            mode="immediate")])])])
 
-    fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1, row=1, col=1)
-    fig.update_yaxes(title_text="v (m)", row=1, col=1)
+    fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
+                     range=[-ext0, ext0], row=1, col=1)
+    fig.update_yaxes(title_text="v (m)", range=[-ext0, ext0], row=1, col=1)
     fig.update_xaxes(title_text="along-track (km)", row=2, col=2)
     fig.update_yaxes(title_text="η end-to-end (%)", rangemode="tozero", row=2, col=2)
     # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates

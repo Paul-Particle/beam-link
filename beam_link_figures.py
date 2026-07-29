@@ -9,13 +9,14 @@ Writes self-contained HTML figures to out/. Run:  uv run python beam_link_figure
 
 Figures:
   1. flyby profiles       — the sawtooth: deliverable power vs along-track, per arch
-  2. corridor efficiency  — mean & harmonic-mean η by architecture × weather
-  3. spacing sweep        — mean η & grid energy vs station spacing (emitter coupling)
+  2. corridor efficiency  — pass energy η & energy banked per pass by arch × weather
+  3. spacing sweep        — pass energy η & wasted grid energy vs station spacing
   4. capture overlap      — the 2-D beam × silhouette overlap along a pass (round vs
                             shaped), the static precursor to the flyby animation
   5. occlusion            — rasterized (self-occluded) vs convex silhouette area
   6. spot shape           — silhouette elongation and the emitter shape it implies
   7. frequency (physics)  — atmospheric transmittance + PAE scenarios (reference)
+  8. flat-top beam        — super-Gaussian peak-flattening vs the W/m² cap
 """
 import os
 
@@ -77,33 +78,36 @@ def figure_flyby_profiles(station_spacing_km=200.0, path=f"{OUT}/beam_link_flyby
 
 def figure_corridor_efficiency(station_spacing_km=200.0,
                                path=f"{OUT}/beam_link_corridor.html"):
-    """The flyby-integrated figure of merit that replaces the snapshot η heatmap:
-    time-average η (battery-buffered plane) and harmonic-mean η (continuous
-    must-deliver plane), by architecture × weather."""
+    """The flyby-integrated figures of merit (plane banks everything it's fed): the pass
+    ENERGY efficiency (banked / grid) and the total banked energy per pass, by
+    architecture × weather. The efficiency says how little is wasted per joule; the
+    banked-energy says how much altitude/speed the pass actually buys."""
     archs = bl.standard_architectures()
     names = list(archs)
-    mean_mat = np.zeros((len(names), len(WEATHER_ORDER)))
-    hmean_mat = np.zeros_like(mean_mat)
+    energy_mat = np.zeros((len(names), len(WEATHER_ORDER)))
+    deliv_mat = np.zeros_like(energy_mat)
     for j, weather in enumerate(WEATHER_ORDER):
         for i, name in enumerate(names):
             r = bl.flyby({**archs[name], "weather": weather}, station_spacing_km=station_spacing_km)
-            mean_mat[i, j] = r["mean_eta"] * 100
-            hmean_mat[i, j] = r["hmean_eta"] * 100
+            energy_mat[i, j] = r["energy_eta"] * 100
+            deliv_mat[i, j] = r["delivered_gj"]
 
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.16,
-                        subplot_titles=("Time-average η over the pass (buffered plane)",
-                                        "Harmonic-mean η (continuous must-deliver plane)"))
-    for col, mat in ((1, mean_mat), (2, hmean_mat)):
+                        subplot_titles=("Pass energy efficiency: banked / grid (%)",
+                                        "Energy banked per pass (GJ) — altitude/speed bought"))
+    for col, (mat, fmt, cbar) in ((1, (energy_mat, "{:.1f}", "η %")),
+                                  (2, (deliv_mat, "{:.1f}", "GJ"))):
+        m2, f2, cb = mat, fmt, cbar
         fig.add_trace(go.Heatmap(
-            z=mat, x=[WEATHER_LABEL[w] for w in WEATHER_ORDER], y=names,
-            text=[[f"{v:.1f}" for v in row] for row in mat], texttemplate="%{text}",
-            colorscale="Viridis", zmin=0, showscale=(col == 2),
-            colorbar=dict(title="η %")), row=1, col=col)
+            z=m2, x=[WEATHER_LABEL[w] for w in WEATHER_ORDER], y=names,
+            text=[[f2.format(v) for v in row] for row in m2], texttemplate="%{text}",
+            colorscale="Viridis", zmin=0, showscale=True,
+            colorbar=dict(title=cb, x=(0.44 if col == 1 else 1.0))), row=1, col=col)
     fig.update_layout(
         template="plotly_white", height=520, width=1250,
-        title=(f"Integrated over the flyby ({station_spacing_km:.0f} km spacing): the relay is the "
-               f"weather-robust continuous winner; 5.8-direct wins clear-air average but its "
-               f"harmonic mean collapses in storm; tether is flat across weather"))
+        title=(f"Integrated over the flyby ({station_spacing_km:.0f} km spacing): 5.8-direct is the "
+               f"most efficient per joule but stops serving at low elevation / in storm; the relay "
+               f"is less efficient but serves the whole pass, so it BANKS the most energy"))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")
     return path
@@ -113,39 +117,39 @@ def figure_corridor_efficiency(station_spacing_km=200.0,
 
 def figure_spacing_sweep(path=f"{OUT}/beam_link_spacing.html"):
     """The emitter-size ↔ station-spacing coupling, integrated: as stations spread out,
-    the plane spends more of each pass at low elevation, so mean η falls and the grid
-    energy per pass rises. Shown for the contenders in clear air and storm."""
+    the plane spends more of each pass at low elevation, so the pass energy efficiency
+    falls and the wasted grid energy per pass rises. Shown for the contenders in clear
+    air and storm."""
     spacings = np.linspace(60.0, 400.0, 18)
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.12,
-                        subplot_titles=("Mean η over the pass vs station spacing",
-                                        "Grid energy per pass vs station spacing (storm)"))
+                        subplot_titles=("Pass energy efficiency vs station spacing",
+                                        "Grid energy WASTED per pass vs station spacing (storm)"))
     archs = bl.standard_architectures(include_reference=False)
     names = list(archs)
     for name in names:
-        mean_clear, mean_storm, gj_storm = [], [], []
+        eff_clear, eff_storm, waste_storm = [], [], []
         for s in spacings:
-            mean_clear.append(bl.flyby({**archs[name], "weather": "clear"}, station_spacing_km=s)["mean_eta"] * 100)
+            eff_clear.append(bl.flyby({**archs[name], "weather": "clear"}, station_spacing_km=s)["energy_eta"] * 100)
             rs = bl.flyby({**archs[name], "weather": "storm"}, station_spacing_km=s)
-            mean_storm.append(rs["mean_eta"] * 100)
-            gj_storm.append(rs["grid_energy_per_pass_gj"])
+            eff_storm.append(rs["energy_eta"] * 100)
+            waste_storm.append(rs["waste_gj"])
         c = _color(name, names)
-        fig.add_trace(go.Scatter(x=spacings, y=mean_clear, mode="lines", name=name,
+        fig.add_trace(go.Scatter(x=spacings, y=eff_clear, mode="lines", name=name,
                                  legendgroup=name, line=dict(color=c)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=spacings, y=mean_storm, mode="lines", name=name,
+        fig.add_trace(go.Scatter(x=spacings, y=eff_storm, mode="lines", name=name,
                                  legendgroup=name, showlegend=False,
                                  line=dict(color=c, dash="dot")), row=1, col=1)
-        gj_storm = np.array(gj_storm, dtype=float)
-        fig.add_trace(go.Scatter(x=spacings, y=gj_storm, mode="lines", name=name,
+        fig.add_trace(go.Scatter(x=spacings, y=np.array(waste_storm, dtype=float), mode="lines", name=name,
                                  legendgroup=name, showlegend=False,
                                  line=dict(color=c)), row=1, col=2)
     fig.update_xaxes(title_text="station spacing (km)", row=1, col=1)
     fig.update_xaxes(title_text="station spacing (km)", row=1, col=2)
-    fig.update_yaxes(title_text="mean η (%)  — solid clear, dot storm", row=1, col=1, rangemode="tozero")
-    fig.update_yaxes(title_text="grid energy per pass (GJ, storm)", row=1, col=2, rangemode="tozero")
+    fig.update_yaxes(title_text="pass energy η (%)  — solid clear, dot storm", row=1, col=1, rangemode="tozero")
+    fig.update_yaxes(title_text="wasted grid energy per pass (GJ, storm)", row=1, col=2, rangemode="tozero")
     fig.update_layout(
         template="plotly_white", height=520, width=1180,
         title=("Station spacing sets how much of each pass is spent at low elevation: "
-               "wider spacing → lower mean η and higher grid energy (∞ where a pass rains out)"),
+               "wider spacing → lower pass efficiency and more wasted grid energy"),
         legend=dict(orientation="h", y=-0.2))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")
@@ -339,6 +343,46 @@ def figure_frequency(elevation_deg=30.0, path=f"{OUT}/beam_link_frequency.html")
     return path
 
 
+def figure_flattop(path=f"{OUT}/beam_link_flattop.html"):
+    """Answering 'can we flatten the peak without spilling?': a super-Gaussian spot of
+    order n puts the SAME total power through the SAME footprint at a LOWER peak. Left:
+    radial profiles at equal total power (peak drops, edge sharpens as n rises). Right:
+    for a fixed delivered power under the 25 W/cm² cap, how much power fits before the cap
+    bites (∝ 1/peak-factor) — a flat top lets you deliver more without widening (so
+    without spilling more)."""
+    r = np.linspace(0, 2.0, 400)                       # radius in units of the waist w
+    orders = [1.0, 2.0, 4.0, 8.0]
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.13,
+                        subplot_titles=("Beam radial profile at EQUAL total power & waist",
+                                        "Power deliverable under a fixed W/m² cap vs flatness"))
+    for n in orders:
+        # Peak for unit total power in unit waist: B0 = 1/(π·C(n)); shape exp(−2 r^{2n}).
+        b0 = 1.0 / (np.pi * bl.supergaussian_area_factor(n))
+        prof = b0 * np.exp(-2.0 * (r ** 2) ** n)
+        fig.add_trace(go.Scatter(x=r, y=prof, mode="lines",
+                                 name=f"n={n:.0f}" + (" (Gaussian)" if n == 1 else " (flat top)"),
+                                 legendgroup=f"{n}"), row=1, col=1)
+    ns = np.linspace(1.0, 10.0, 40)
+    # Deliverable power at a fixed peak cap and fixed waist ∝ π·w²·C(n)·cap → ∝ C(n),
+    # normalized to the Gaussian (n=1). So a flat top delivers C(n)/C(1) × more power in
+    # the SAME footprint before hitting the cap.
+    gain = np.array([bl.supergaussian_area_factor(n) for n in ns]) / bl.supergaussian_area_factor(1.0)
+    fig.add_trace(go.Scatter(x=ns, y=gain, mode="lines", line=dict(color="#d62728"),
+                             showlegend=False), row=1, col=2)
+    fig.update_xaxes(title_text="radius / waist", row=1, col=1)
+    fig.update_yaxes(title_text="intensity (equal total power)", row=1, col=1, rangemode="tozero")
+    fig.update_xaxes(title_text="super-Gaussian order n (1 = Gaussian)", row=1, col=2)
+    fig.update_yaxes(title_text="power deliverable vs Gaussian (×)", row=1, col=2, rangemode="tozero")
+    fig.update_layout(
+        template="plotly_white", height=480, width=1150,
+        title=("Flat-topping the beam (super-Gaussian) lowers the peak for the same power & footprint: "
+               "it eases the W/m² cap — up to ~2× more power in the same spot — without spilling more "
+               "(but only helps capture when the spot is CONTAINED, not already overspilling)"))
+    os.makedirs(OUT, exist_ok=True)
+    fig.write_html(path, include_plotlyjs="inline")
+    return path
+
+
 def build_all():
     paths = [
         figure_flyby_profiles(),
@@ -348,6 +392,7 @@ def build_all():
         figure_occlusion(),
         figure_spot_shape(),
         figure_frequency(),
+        figure_flattop(),
     ]
     print("wrote:")
     for p in paths:

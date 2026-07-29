@@ -30,6 +30,7 @@ generate_atmosphere_profile.py; rain/cloud are layered on per weather scenario.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import gamma
 from pathlib import Path
 
 import numpy as np
@@ -234,9 +235,19 @@ def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
     return np.sqrt(2.0) * wavelength_m * slant_m / (np.pi * np.maximum(emitter_radius_m, 1e-6))
 
 
+def supergaussian_area_factor(profile_order):
+    """C(n) with ∫∫ exp(−2(ρ²/w²)^n) dA = π·w²·C(n), so the total power in a spot of
+    waist w and peak B0 is B0·π·w²·C(n) and the peak for a given total power P is
+    B0 = P/(π·w²·C(n)). C(1)=0.5 (Gaussian); C→1 as n→∞ (ideal top-hat). A higher-order
+    super-Gaussian (flat top) puts the SAME power through the SAME footprint at a LOWER
+    peak — it eases the W/m² cap without widening the spot (so without spilling more)."""
+    n = float(profile_order)
+    return (1.0 / n) * 2.0 ** (-1.0 / n) * gamma(1.0 / n)
+
+
 def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=False,
-                    incidence_floor=0.70, aspect_cap=8.0, min_waist_m=0.0,
-                    pointing_offset_m=0.0, return_field=False):
+                    incidence_floor=0.90, aspect_cap=8.0, min_waist_m=0.0,
+                    pointing_offset_m=0.0, profile_order=1.0, return_field=False):
     """Capture as the 2-D overlap of a focused beam spot with the true (self-occluded)
     silhouette — a Monte-Carlo integral over the visible surface samples, replacing
     √(A/π) sizing + τ-capture + a scalar spot_match.
@@ -253,6 +264,8 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     re-integrating — so a tiny spot that stays on the big rectenna after the shift loses
     ~nothing, while a spot already filling the silhouette spills. (This replaces the old
     exp(−2(δ/w)²) point-target factor, which wrongly penalised a well-contained spot.)
+    `profile_order` (n) is the super-Gaussian order of the spot: n=1 is a Gaussian, n>1
+    a flat-top (lower peak for the same power/footprint — see supergaussian_area_factor).
     Returns:
       geom  — fraction of radiated beam power intercepted by the airframe outline
       eff   — same, weighted by the rectenna incidence response (grazing skin converts
@@ -260,7 +273,7 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
       w0    — the (possibly defocused) round-spot waist (m)."""
     u, v, inc, proj = raster["u"], raster["v"], raster["incidence"], raster["proj_area"]
     w0 = max(float(focused_spot_waist(wavelength_m, slant_m, emitter_radius_m)), float(min_waist_m))
-    p_total = 0.5 * np.pi * w0 ** 2                    # ∫∫ exp(−2ρ²/w0²) dA
+    p_total = np.pi * w0 ** 2 * supergaussian_area_factor(profile_order)   # ∫∫ B dA
     if u.size == 0:
         empty = dict(u=u, v=v, beam=np.array([]), incidence=inc, proj_area=proj, w0=w0)
         return (0.0, 0.0, w0, empty) if return_field else (0.0, 0.0, w0)
@@ -276,13 +289,14 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     du, dv = pointing_offset_m * minor_axis[0], pointing_offset_m * minor_axis[1]
     su, sv = u - du, v - dv                            # coords relative to shifted beam centre
 
+    n = float(profile_order)
     if not shaped or u.size < 3:
-        beam = np.exp(-2.0 * (su ** 2 + sv ** 2) / w0 ** 2)
+        beam = np.exp(-2.0 * ((su ** 2 + sv ** 2) / w0 ** 2) ** n)
     else:
         aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap)
         w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
         pc = evecs.T @ np.vstack([su, sv])             # rows: [along minor, along major]
-        beam = np.exp(-2.0 * (pc[1] ** 2 / w_major ** 2 + pc[0] ** 2 / w_minor ** 2))
+        beam = np.exp(-2.0 * (pc[1] ** 2 / w_major ** 2 + pc[0] ** 2 / w_minor ** 2) ** n)
     geom = min(float(np.sum(beam * proj) / p_total), 1.0)
     eff = min(float(np.sum(beam * proj * inc_eff) / p_total), 1.0)
     if return_field:
@@ -428,7 +442,16 @@ class LinkConfig:
     defocus: bool = True                            # spread the spot rather than over-focus onto a tiny patch
     defocus_fill: float = 0.8                       # min spot waist = defocus_fill × √(A/π)
     spot_match: float = 0.90                        # deprecated: overlap_capture supersedes it
-    incidence_floor: float = 0.70                   # rectenna element angular-response floor
+    # Rectenna element angular-response floor: the conversion still standing at grazing
+    # incidence (eff = floor + (1−floor)·cosθ). 0.90 assumes a PHASED-ARRAY / CONFORMAL
+    # rectenna that re-phases and re-matches its elements toward the beam's arrival angle,
+    # recovering most of the off-normal impedance-detuning loss. (The cosθ AREA
+    # foreshortening is separate and stays — it lives in the silhouette projection.) A
+    # fixed patch-element rectenna would sit nearer ~0.6–0.7. #(verify)
+    incidence_floor: float = 0.90
+    # Super-Gaussian order of the emitted spot: 1 = Gaussian, >1 = flat top (lower peak
+    # for the same footprint → eases the W/m² cap without spilling more). #(verify)
+    beam_profile_order: float = 1.0
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
     # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
@@ -487,27 +510,30 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_wai
     min_waist = max(cfg.defocus_fill * r_recv if cfg.defocus else 0.0, extra_min_waist_m)
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
                                         shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
-                                        min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m)
+                                        min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m,
+                                        profile_order=cfg.beam_profile_order)
     return dict(area=area, r_recv=r_recv, beta=float(beta), roll=float(roll),
                 slant=float(slant), elevation=float(elevation), capture=capture,
                 capture_geom=geom, spot_waist_m=w0, emitter_diam_m=float(emitter_diam_m))
 
 
-def _density_min_waist(delivered_mw, capture, rect_total, cap_w_m2):
+def _density_min_waist(delivered_mw, capture, rect_total, cap_w_m2, profile_order=1.0):
     """Minimum spot waist so the peak incident density stays under `cap_w_m2` at the
-    delivered power. Peak of a Gaussian of waist w carrying P is 2P/(πw²); the RF power
-    in the spot at the plane is delivered/(capture·rectenna). Returns 0 if no cap/power."""
+    delivered power. Peak of a super-Gaussian of waist w carrying P is P/(π·w²·C(n)); the
+    RF power in the spot at the plane is delivered/(capture·rectenna). A flatter top (n>1)
+    raises C(n), so the SAME power fits under the cap in a SMALLER footprint (less spill).
+    Returns 0 if no cap/power."""
     if delivered_mw is None or cap_w_m2 is None or capture <= 0:
         return 0.0
     p_spot_w = delivered_mw * 1e6 / max(capture * rect_total, 1e-9)
-    return float(np.sqrt(2.0 * p_spot_w / (np.pi * cap_w_m2)))
+    return float(np.sqrt(p_spot_w / (np.pi * cap_w_m2 * supergaussian_area_factor(profile_order))))
 
 
-def _peak_density(delivered_mw, capture, rect_total, w0):
+def _peak_density(delivered_mw, capture, rect_total, w0, profile_order=1.0):
     if delivered_mw is None or capture <= 0:
         return 0.0
     p_spot_w = delivered_mw * 1e6 / max(capture * rect_total, 1e-9)
-    return 2.0 * p_spot_w / (np.pi * w0 ** 2)
+    return p_spot_w / (np.pi * w0 ** 2 * supergaussian_area_factor(profile_order))
 
 
 def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
@@ -523,7 +549,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         pc = plane_capture(cfg, station, f, cfg.emitter_diam_m)
         pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
         # Power-density cap: spread the spot if the peak incident density is too high.
-        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol, cfg.max_power_density_w_m2)
+        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol,
+                                   cfg.max_power_density_w_m2, cfg.beam_profile_order)
         if w_req > pc["spot_waist_m"]:
             pc = plane_capture(cfg, station, f, cfg.emitter_diam_m, extra_min_waist_m=w_req)
         a, b = _to_ecef(station), _to_ecef(plane)
@@ -539,7 +566,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             rectenna_rf_to_dc=conv, polarization=pol,
             rectenna_total=conv * pol, silhouette_m2=pc["area"],
             receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], spot_waist_m=pc["spot_waist_m"],
-            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol, pc["spot_waist_m"]),
+            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
+                                            pc["spot_waist_m"], cfg.beam_profile_order),
             emitter_diam_m=pc["emitter_diam_m"], slant_km=pc["slant"] / 1e3,
             elevation_deg=pc["elevation"], blocked=blocked)
 
@@ -558,7 +586,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         conv = float(napkin.rectenna_efficiency_band(f2))
         pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m)
         pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
-        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol, cfg.max_power_density_w_m2)
+        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol,
+                                   cfg.max_power_density_w_m2, cfg.beam_profile_order)
         if w_req > pc["spot_waist_m"]:
             pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m, extra_min_waist_m=w_req)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
@@ -582,7 +611,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             capture=pc["capture"], atmos=atmos_dn,
             silhouette_m2=pc["area"], receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"],
             spot_waist_m=pc["spot_waist_m"], emitter_diam_m=pc["emitter_diam_m"],
-            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol, pc["spot_waist_m"]),
+            power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
+                                            pc["spot_waist_m"], cfg.beam_profile_order),
             emitter_diam_up_m=float(h1.emitter_diam_m),
             slant_up_km=h1.slant_m / 1e3, slant_down_km=pc["slant"] / 1e3,
             elevation_up_deg=float(h1.elevation_deg), elevation_down_deg=pc["elevation"],
@@ -724,20 +754,29 @@ def standard_architectures(station_pos=(0.0, 0.0, 0.0), weather="clear", pae_sce
 
 
 def flyby(arch_kwargs, plane_alt_m=11_000.0, lateral_offset_m=0.0, station_spacing_km=200.0,
-          speed_ms=250.0, delivered_mw=10.0, n_points=81):
+          speed_ms=250.0, delivered_mw=10.0, n_points=81, min_serve_eta=0.02):
     """Fly the plane through the window a single station serves (±spacing/2 along track,
     passing overhead at x=0) and evaluate the link at every step — the actual rising-
     and-falling tooth of the sawtooth, not a snapshot. The emitter is FIXED, so capture
     falls away from overhead as the geometry (elevation, silhouette, spot-fit) worsens.
 
-    Figures of merit over the served window:
-      mean_eta   — time-average end-to-end η (a battery-buffered plane; delivered energy
-                   per grid energy).
-      hmean_eta  — harmonic-mean η (a plane that must be fed CONTINUOUSLY at constant
-                   power: dominated by the worst points).
-      grid_energy_per_pass_gj — grid energy a station must spend to keep the plane fed
-                   at constant `delivered_mw` for one pass (∝ 1/hmean): a fuel-cost
-                   proxy, lower is better. ∞ if any point of the pass is unfeasible."""
+    OPERATING MODEL (the plane is an energy SINK, not a constant load): whatever arrives
+    is banked immediately as altitude or speed, so the plane eats all we send up to its
+    absorption ceiling `delivered_mw`. We run the emitter at a FIXED grid power (sized so
+    the plane hits that ceiling at the best point of the pass) and let the delivered power
+    ride the η curve, serving only while η ≥ `min_serve_eta` (below that the grid joules
+    are mostly spilled — not worth spending). No battery is modelled: altitude IS the
+    buffer, and it also bridges the coverage gaps BETWEEN stations.
+
+    The figure of merit is therefore the pass ENERGY BALANCE, not a harmonic mean:
+      energy_eta        — banked energy / grid energy over the served window = the
+                          delivered-weighted (arithmetic) mean of η at constant grid power.
+                          THIS is "energy doing work vs energy wasted"; waste = 1 − it.
+      delivered_gj / grid_gj / waste_gj — the absolute energy budget of one pass.
+      served_frac       — fraction of the pass actually beamed (η ≥ min_serve_eta).
+    Legacy diagnostics kept: mean_eta, peak_eta, and hmean_eta / grid_energy_per_pass_gj
+    (the pessimistic CONSTANT-delivery bound — only relevant if the plane could NOT bank,
+    which per the operating model it can, so it is a bound, not the operating case)."""
     half = station_spacing_km * 1e3 / 2.0
     x = np.linspace(-half, half, n_points)
     plane = np.stack([x, np.full_like(x, lateral_offset_m), np.full_like(x, plane_alt_m)], axis=1)
@@ -746,11 +785,18 @@ def flyby(arch_kwargs, plane_alt_m=11_000.0, lateral_offset_m=0.0, station_spaci
     eta = np.asarray(s["eta_end_to_end"], dtype=float)
     dt = (x[1] - x[0]) / speed_ms
     peak = float(np.max(eta))
-    # Deliverable profile at a fixed emitter grid power (sized to hit delivered_mw at the
-    # best point of the pass) — the shape of one tooth of the sawtooth.
-    deliverable_mw = (delivered_mw / peak if peak > 0 else np.inf) * eta
-    # Continuous feeding is only possible if the link stays feasible all pass; a single
-    # rained-out / below-horizon point makes constant-power delivery impossible → ∞.
+    # Fixed emitter grid power, sized so the plane hits its absorption ceiling
+    # (delivered_mw) at the best point; delivered then rides the η curve.
+    grid_rated_mw = delivered_mw / peak if peak > 0 else 0.0
+    deliverable_mw = grid_rated_mw * eta
+    # Serve only where it's worth it (η above the floor); banked energy = ∫delivered,
+    # grid energy = ∫grid over that window; the rest of the pass is coasted on altitude.
+    served = eta >= min_serve_eta
+    delivered_gj = float(grid_rated_mw * np.sum(eta[served]) * dt / 1e3)
+    grid_gj = float(grid_rated_mw * np.count_nonzero(served) * dt / 1e3)
+    energy_eta = float(np.mean(eta[served])) if np.any(served) else 0.0
+    # Legacy: constant-delivery (no-bank) bound — grid to keep the plane fed at a FLAT
+    # delivered_mw all pass; ∞ if any point is unfeasible (can't hold constant delivery).
     with np.errstate(divide="ignore"):
         grid_energy_gj = (float(delivered_mw * np.sum(1.0 / eta) * dt / 1e3)
                           if np.all(eta > 1e-4) else np.inf)
@@ -760,7 +806,9 @@ def flyby(arch_kwargs, plane_alt_m=11_000.0, lateral_offset_m=0.0, station_spaci
         capture=np.asarray(s["capture"], float), spot_waist_m=np.asarray(s["spot_waist_m"], float),
         deliverable_mw=deliverable_mw, mean_eta=float(np.mean(eta)),
         hmean_eta=float(len(eta) / np.sum(1.0 / np.maximum(eta, 1e-9))),
-        peak_eta=peak, grid_energy_per_pass_gj=grid_energy_gj, dt=dt)
+        peak_eta=peak, energy_eta=energy_eta, served_frac=float(np.mean(served)),
+        delivered_gj=delivered_gj, grid_gj=grid_gj, waste_gj=grid_gj - delivered_gj,
+        grid_energy_per_pass_gj=grid_energy_gj, dt=dt)
 
 
 def corridor_table(station_spacing_km=200.0, weather="clear", pae_scenario="today",
@@ -829,11 +877,10 @@ if __name__ == "__main__":
     np.set_printoptions(suppress=True)
     print("Beam-link engine — flyby-integrated over one station's serving window "
           "(plane 11 km, 200 km spacing, 10 MW delivered)\n")
-    print(f"{'architecture':26s} {'weather':11s} {'mean η':>7s} {'harm η':>7s} "
-          f"{'peak η':>7s} {'grid GJ/pass':>13s}")
+    print(f"{'architecture':26s} {'weather':11s} {'energy η':>8s} {'peak η':>7s} "
+          f"{'served':>7s} {'deliv GJ':>9s} {'grid GJ':>8s} {'waste GJ':>9s}")
     for weather in ("clear", "heavy_rain", "storm"):
         for name, r in corridor_table(weather=weather).items():
-            gj = f"{r['grid_energy_per_pass_gj']:12.1f}" if np.isfinite(r['grid_energy_per_pass_gj']) else f"{'∞':>12s}"
-            print(f"  {name:24s} {weather:11s} {r['mean_eta']*100:6.1f}% {r['hmean_eta']*100:6.1f}% "
-                  f"{r['peak_eta']*100:6.1f}% {gj}")
+            print(f"  {name:24s} {weather:11s} {r['energy_eta']*100:7.1f}% {r['peak_eta']*100:6.1f}% "
+                  f"{r['served_frac']*100:6.0f}% {r['delivered_gj']:9.2f} {r['grid_gj']:8.2f} {r['waste_gj']:9.2f}")
         print()
