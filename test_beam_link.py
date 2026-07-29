@@ -7,6 +7,7 @@ just that it runs. Run:  uv run python test_beam_link.py
 import numpy as np
 
 import napkin
+import geo
 import beam_link as bl
 from bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
@@ -54,25 +55,20 @@ def test_silhouette():
 # --- Atmosphere ---------------------------------------------------------------
 
 def test_atmosphere():
-    print("\n[atmosphere]")
+    print("\n[atmosphere — curved-path integration]")
     atmos = bl.Atmosphere()
+    S = geo.point(0.0, 0.0, 0.0)
     # Gaseous loss to 11 km ≈ loss to 20 km (stratosphere is dry).
-    g11 = atmos.gaseous_db(30.0, 0.0, 11_000.0, 90.0)
-    g20 = atmos.gaseous_db(30.0, 0.0, 20_000.0, 90.0)
-    check("stratosphere adds ~no gaseous loss above 11 km", abs(g20 - g11) < 0.02,
+    g11 = float(atmos.path_loss_db(30.0, S, geo.point(0.0, 0.0, 11_000.0), "clear"))
+    g20 = float(atmos.path_loss_db(30.0, S, geo.point(0.0, 0.0, 20_000.0), "clear"))
+    check("stratosphere adds ~no gaseous loss above 11 km", abs(g20 - g11) < 0.05,
           f"{g11:.3f} vs {g20:.3f} dB")
 
-    # Slant doubles the vertical loss at 30° elevation.
-    vert = atmos.gaseous_db(30.0, 0.0, 11_000.0, 90.0)
-    slant = atmos.gaseous_db(30.0, 0.0, 11_000.0, 30.0)
-    check("30° slant ≈ 2× vertical loss", abs(slant / vert - 2.0) < 0.02,
-          f"{slant:.3f}/{vert:.3f} = {slant/vert:.2f}")
-
-    # A downward (depression) leg is treated like the equivalent upward one.
-    down = atmos.gaseous_db(30.0, 20_000.0, 11_000.0, -43.0)
-    up = atmos.gaseous_db(30.0, 11_000.0, 20_000.0, 43.0)
-    check("depression leg == equivalent elevation leg", abs(down - up) < 1e-6,
-          f"{down:.4f} vs {up:.4f} dB")
+    # Slant ≈ doubles the vertical loss at 30° elevation.
+    d30 = geo.downrange_for_elevation(30.0, 11_000.0)
+    slant = float(atmos.path_loss_db(30.0, S, geo.point(d30, 0.0, 11_000.0), "clear"))
+    check("30° slant ≈ 2× vertical loss", abs(slant / g11 - 2.0) < 0.06,
+          f"{slant:.3f}/{g11:.3f} = {slant/g11:.2f}")
 
     # Rain hammers 30 GHz but spares 5.8 GHz.
     st, pl = bl.reference_geometry(30.0)
@@ -82,6 +78,31 @@ def test_atmosphere():
                                     weather="heavy_rain"), 10.0)["atmos"]
     check("5.8 GHz survives heavy rain, 30 GHz does not", r58 > 0.7 and r30 < 0.05,
           f"5.8→{float(r58):.3f}  30→{float(r30):.3f}")
+
+
+def test_curvature():
+    print("\n[earth curvature]")
+    S = geo.point(0.0, 0.0, 0.0)
+    # Elevation of a level plane falls with downrange and eventually goes below horizon.
+    ranges = np.array([20e3, 100e3, 200e3, 300e3, 400e3])
+    _, elev = geo.link(S, geo.point(ranges, 0.0, 11_000.0))
+    check("elevation decreases monotonically with range", np.all(np.diff(elev) < 0),
+          f"{np.round(elev, 1)} deg")
+
+    # A plane past the ~374 km line-of-sight horizon is infeasible.
+    near = bl.evaluate(bl.LinkConfig(station_pos=(0., 0, 0), plane_pos=(300e3, 0, 11e3),
+                                     f_emit_plane_ghz=30.0), 10.0)
+    far = bl.evaluate(bl.LinkConfig(station_pos=(0., 0, 0), plane_pos=(600e3, 0, 11e3),
+                                    f_emit_plane_ghz=30.0), 10.0)
+    check("plane within horizon feasible, beyond horizon not",
+          bool(near["feasible"]) and not bool(far["feasible"]))
+
+    # Curvature tilts a level plane's aspect: at range it sees the station below its
+    # own local horizon (belly no longer points at the emitter).
+    d = geo.downrange_for_elevation(20.0, 11_000.0)
+    up_comp = geo.direction_in_local_enu(geo.point(d, 0, 11_000.0), S)[2]
+    check("level plane sees distant station below its local horizon", up_comp < 0,
+          f"local-up component {float(up_comp):.3f}")
 
 
 # --- Near-field coupling ------------------------------------------------------
@@ -149,7 +170,8 @@ def test_vectorized():
     print("\n[vectorization]")
     atmos = bl.Atmosphere()
     freqs = np.array([5.8, 12.0, 20.0, 30.0, 34.8])
-    loss = atmos.path_loss_db(freqs, 0.0, 11_000.0, 30.0, "cloudy")
+    S, P = geo.point(0.0, 0.0, 0.0), geo.point(20e3, 0.0, 11_000.0)
+    loss = atmos.path_loss_db(freqs, S, P, "cloudy")
     check("path_loss_db vectorizes over frequency", loss.shape == freqs.shape
           and np.all(np.diff(loss) > 0), f"{np.round(loss, 2)} dB (rising with f)")
 
@@ -191,6 +213,7 @@ def test_pass_profile():
 if __name__ == "__main__":
     test_silhouette()
     test_atmosphere()
+    test_curvature()
     test_coupling()
     test_end_to_end()
     test_vectorized()

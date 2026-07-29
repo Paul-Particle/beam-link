@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 
 import napkin
+import geo
 from bwb_model import BWBSilhouette, beta_alpha_from_enu
 
 
@@ -56,80 +57,66 @@ WEATHER = {
 class Atmosphere:
     """Path attenuation from the altitude-resolved ITU-R absorption table.
 
-    Gaseous loss is the vertical cumulative integral between the two path
-    altitudes, divided by sin(elevation) for the slant. Rain and cloud are added
-    only over the altitude bands where they exist. All methods are vectorized."""
+    Gaseous, rain, and cloud losses are integrated along the actual (curved) slant
+    path sampled by geo.sample_altitudes: at each point the altitude above the sphere
+    sets the local specific attenuation, so the 'surface falls away' effect and the
+    stratospheric dry-out are intrinsic. All methods are vectorized over the batch and
+    over frequency."""
 
     def __init__(self, path="data/atmosphere_profile.npz"):
         p = Path(path) if Path(path).is_absolute() else Path(__file__).parent / path
         d = np.load(p)
         self.freq = d["frequency_ghz"]            # (Nf,)
         self.alt = d["altitude_m"]                # (Nh,)
-        self.gamma = d["gamma_gas_db_km"]         # (Nh, Nf)
-        self.cumulative = d["gamma_gas_cumulative_db"]   # (Nh, Nf) vertical dB 0→h
-        self.kl = d["cloud_kl_db_km_per_gm3"]     # (Nf,)
+        self.gamma = d["gamma_gas_db_km"]         # (Nh, Nf) specific gaseous atten
+        self.kl = d["cloud_kl_db_km_per_gm3"]     # (Nf,) cloud liquid coeff
 
-    def _cumulative_at(self, freq_ghz, altitude_m):
-        """Bilinear-interpolate vertical cumulative gaseous dB at (altitude, freq)."""
-        f = np.asarray(freq_ghz, dtype=float)
-        h = np.asarray(altitude_m, dtype=float)
+    def _bilinear_alt_freq(self, table, freq_ghz, altitude_m):
+        """Bilinear interp of a (Nh, Nf) table at (altitude, freq); broadcasts."""
+        f, h = np.broadcast_arrays(np.asarray(freq_ghz, dtype=float),
+                                   np.asarray(altitude_m, dtype=float))
+        h = np.clip(h, self.alt[0], self.alt[-1])
         fi = np.clip(np.searchsorted(self.freq, f) - 1, 0, self.freq.size - 2)
         hi = np.clip(np.searchsorted(self.alt, h) - 1, 0, self.alt.size - 2)
         f0, f1 = self.freq[fi], self.freq[fi + 1]
         h0, h1 = self.alt[hi], self.alt[hi + 1]
         tf = np.where(f1 > f0, (f - f0) / (f1 - f0), 0.0)
         th = np.where(h1 > h0, (h - h0) / (h1 - h0), 0.0)
-        c = self.cumulative
-        return ((1 - th) * (1 - tf) * c[hi, fi] + (1 - th) * tf * c[hi, fi + 1]
-                + th * (1 - tf) * c[hi + 1, fi] + th * tf * c[hi + 1, fi + 1])
+        return ((1 - th) * (1 - tf) * table[hi, fi] + (1 - th) * tf * table[hi, fi + 1]
+                + th * (1 - tf) * table[hi + 1, fi] + th * tf * table[hi + 1, fi + 1])
 
     def _kl_at(self, freq_ghz):
+        return np.interp(np.asarray(freq_ghz, dtype=float), self.freq, self.kl)
+
+    def path_loss_db(self, freq_ghz, from_ecef, to_ecef, weather="clear", n_path=64):
+        """Total path attenuation (dB) integrated along the curved slant path."""
+        alt, ds = geo.sample_altitudes(from_ecef, to_ecef, n_path)      # (...,n), (...)
         f = np.asarray(freq_ghz, dtype=float)
-        return np.interp(f, self.freq, self.kl)
+        f_col = f[..., None] if f.ndim else f
+        ds_km = ds / 1e3
 
-    def gaseous_db(self, freq_ghz, h_low_m, h_high_m, elevation_deg):
-        delta = self._cumulative_at(freq_ghz, h_high_m) - self._cumulative_at(freq_ghz, h_low_m)
-        # Path length depends on the angle from horizontal; a downward (depression)
-        # leg has the same slant/vertical ratio as the equivalent upward one.
-        grazing = np.clip(np.abs(elevation_deg), 0.5, 90.0)
-        return np.abs(delta) / np.sin(np.radians(grazing))
+        gamma = self._bilinear_alt_freq(self.gamma, f_col, alt)          # (...,n) dB/km
+        gaseous = np.sum(0.5 * (gamma[..., 1:] + gamma[..., :-1]), axis=-1) * ds_km
 
-    def _band_path_km(self, h_low_m, h_high_m, band_low_m, band_high_m, elevation_deg):
-        """Slant path length (km) that a link between two altitudes spends inside an
-        altitude band [band_low, band_high]."""
-        lo = np.maximum(np.minimum(h_low_m, h_high_m), band_low_m)
-        hi = np.minimum(np.maximum(h_low_m, h_high_m), band_high_m)
-        vertical = np.clip(hi - lo, 0.0, None)
-        grazing = np.clip(np.abs(elevation_deg), 0.5, 90.0)
-        return vertical / np.sin(np.radians(grazing)) / 1e3
-
-    def rain_db(self, freq_ghz, h_low_m, h_high_m, elevation_deg, weather):
         w = WEATHER[weather] if isinstance(weather, str) else weather
-        if w["rain_rate_mmh"] <= 0:
-            return np.zeros_like(np.asarray(freq_ghz, dtype=float) + np.asarray(elevation_deg, dtype=float))
-        # Circular polarization (tilt 45°) → the P.838 coefficients become
-        # elevation-independent; the slant geometry is handled by _band_path_km.
-        k, alpha = napkin.rain_coefficients(freq_ghz, elevation_deg=90.0, polarization_tilt_deg=45.0)
-        specific = napkin.specific_rain_attenuation(w["rain_rate_mmh"], k, alpha)   # dB/km
-        path_km = self._band_path_km(h_low_m, h_high_m, 0.0, w["rain_top_m"], elevation_deg)
-        return specific * path_km
+        rain = np.zeros_like(gaseous)
+        if w["rain_rate_mmh"] > 0:
+            # circular pol (tilt 45°) → P.838 coeffs elevation-independent
+            k, a = napkin.rain_coefficients(f, elevation_deg=90.0, polarization_tilt_deg=45.0)
+            specific = napkin.specific_rain_attenuation(w["rain_rate_mmh"], k, a)   # dB/km
+            seg_in = (alt[..., 1:] < w["rain_top_m"]) & (alt[..., :-1] < w["rain_top_m"])
+            rain = specific * np.sum(seg_in, axis=-1) * ds_km
+        cloud = np.zeros_like(gaseous)
+        if w["cloud_lwc_gm3"] > 0:
+            specific = self._kl_at(f) * w["cloud_lwc_gm3"]                          # dB/km
+            b_lo, b_hi = w["cloud_band_m"]
+            in_band = (alt >= b_lo) & (alt <= b_hi)
+            seg_in = in_band[..., 1:] & in_band[..., :-1]
+            cloud = specific * np.sum(seg_in, axis=-1) * ds_km
+        return gaseous + rain + cloud
 
-    def cloud_db(self, freq_ghz, h_low_m, h_high_m, elevation_deg, weather):
-        w = WEATHER[weather] if isinstance(weather, str) else weather
-        if w["cloud_lwc_gm3"] <= 0:
-            return np.zeros_like(np.asarray(freq_ghz, dtype=float) + np.asarray(elevation_deg, dtype=float))
-        specific = self._kl_at(freq_ghz) * w["cloud_lwc_gm3"]                       # dB/km
-        b_lo, b_hi = w["cloud_band_m"]
-        path_km = self._band_path_km(h_low_m, h_high_m, b_lo, b_hi, elevation_deg)
-        return specific * path_km
-
-    def path_loss_db(self, freq_ghz, h_low_m, h_high_m, elevation_deg, weather="clear"):
-        return (self.gaseous_db(freq_ghz, h_low_m, h_high_m, elevation_deg)
-                + self.rain_db(freq_ghz, h_low_m, h_high_m, elevation_deg, weather)
-                + self.cloud_db(freq_ghz, h_low_m, h_high_m, elevation_deg, weather))
-
-    def transmittance(self, freq_ghz, h_low_m, h_high_m, elevation_deg, weather="clear"):
-        return napkin.db_to_fraction(self.path_loss_db(freq_ghz, h_low_m, h_high_m, elevation_deg, weather))
+    def transmittance(self, freq_ghz, from_ecef, to_ecef, weather="clear"):
+        return napkin.db_to_fraction(self.path_loss_db(freq_ghz, from_ecef, to_ecef, weather))
 
 
 # Shared, lazily-loaded singletons so sweeps don't reload the .npz tables per call.
@@ -151,19 +138,23 @@ def get_silhouette():
     return _SILHOUETTE
 
 
-# --- Geometry -----------------------------------------------------------------
+# --- Geometry (spherical earth, via geo.py) -----------------------------------
+# Node positions are given as (downrange_m north, crossrange_m east, altitude_m)
+# relative to the station's ground point; _to_ecef maps them onto the sphere so that
+# curvature is intrinsic everywhere downstream.
+
+def _to_ecef(pos):
+    """(downrange, crossrange, altitude) → ECEF. Accepts (...,3) and broadcasts."""
+    p = np.asarray(pos, dtype=float)
+    return geo.point(p[..., 0], p[..., 1], p[..., 2])
+
 
 def geometry(from_pos, to_pos):
-    """Slant range (m), elevation of `to` seen from `from` (deg), and the unit
-    direction from→to, all in ENU. Accepts (...,3) arrays and broadcasts."""
-    a = np.asarray(from_pos, dtype=float)
-    b = np.asarray(to_pos, dtype=float)
-    delta = b - a
-    slant = np.linalg.norm(delta, axis=-1)
-    horizontal = np.linalg.norm(delta[..., :2], axis=-1)
-    elevation = np.degrees(np.arctan2(delta[..., 2], horizontal))
-    unit = delta / (slant[..., None] + 1e-30)
-    return slant, elevation, unit
+    """Slant range (m), elevation of `to` above `from`'s local horizon (deg), and the
+    from→to unit direction expressed in `from`'s LOCAL ENU. Spherical earth."""
+    a, b = _to_ecef(from_pos), _to_ecef(to_pos)
+    slant, elevation = geo.link(a, b)
+    return slant, elevation, geo.direction_in_local_enu(a, b)
 
 
 # --- Emitter / rectenna / relay efficiency pieces -----------------------------
@@ -256,6 +247,7 @@ class HopResult:
     atmos_transmittance: float
     atmos_loss_db: float
     emitter_aperture_eff: float
+    blocked: object = False
 
     def radiated_to_incident(self):
         """Fraction of radiated RF that arrives as RF on the receiver aperture."""
@@ -263,25 +255,28 @@ class HopResult:
 
 
 def hop(atmos, freq_ghz, from_pos, to_pos, receiver_radius_m, weather="clear",
-        tau_target=2.0, emitter_diam_m=None, scan_deg=0.0, error_efficiency=0.95):
-    """One emitter→receiver hop: size (or accept) the emitter aperture, compute
-    near-field capture, atmospheric transmittance, and emitter aperture efficiency."""
-    slant, elevation, _ = geometry(from_pos, to_pos)
-    h_low = np.minimum(np.asarray(from_pos)[..., 2], np.asarray(to_pos)[..., 2])
-    h_high = np.maximum(np.asarray(from_pos)[..., 2], np.asarray(to_pos)[..., 2])
+        tau_target=2.0, emitter_diam_m=None, scan_deg=0.0, error_efficiency=0.95,
+        n_path=64):
+    """One emitter→receiver hop on the spherical earth: size (or accept) the emitter
+    aperture, compute near-field capture, curved-path atmospheric transmittance (zeroed
+    if the path is blocked by the horizon), and emitter aperture efficiency.
+    `from_pos`/`to_pos` are (downrange, crossrange, altitude) triples."""
+    a, b = _to_ecef(from_pos), _to_ecef(to_pos)
+    slant, elevation = geo.link(a, b)
 
     if emitter_diam_m is None:
         emitter_diam_m = size_emitter_diameter(freq_ghz, slant, receiver_radius_m, tau_target)
     emitter_radius = np.asarray(emitter_diam_m) / 2.0
     tau = napkin.coupling_tau(freq_ghz * 1e9, slant, emitter_radius, receiver_radius_m)
     capture = napkin.collection_efficiency(tau)
-    loss_db = atmos.path_loss_db(freq_ghz, h_low, h_high, elevation, weather)
-    transmittance = napkin.db_to_fraction(loss_db)
+    blocked = geo.horizon_blocked(a, b, n_path)
+    loss_db = atmos.path_loss_db(freq_ghz, a, b, weather, n_path)
+    transmittance = napkin.db_to_fraction(loss_db) * np.where(blocked, 0.0, 1.0)
     ap_eff = emitter_aperture_efficiency(scan_deg, error_efficiency)
     return HopResult(freq_ghz=freq_ghz, slant_m=slant, elevation_deg=elevation,
                      emitter_diam_m=np.asarray(emitter_diam_m), tau=tau, capture=capture,
                      atmos_transmittance=transmittance, atmos_loss_db=loss_db,
-                     emitter_aperture_eff=ap_eff)
+                     emitter_aperture_eff=ap_eff, blocked=blocked)
 
 
 # --- Full link ----------------------------------------------------------------
@@ -363,7 +358,8 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
             rectenna_total=rect, rectenna_parts=rect_parts,
             silhouette_m2=area, receiver_radius_m=r_recv, beta_deg=beta,
             emitter_diam_m=h.emitter_diam_m, slant_km=h.slant_m / 1e3,
-            elevation_deg=h.elevation_deg, atmos_loss_db=h.atmos_loss_db)
+            elevation_deg=h.elevation_deg, atmos_loss_db=h.atmos_loss_db,
+            blocked=h.blocked)
         eta = eta_dc_rf * h.emitter_aperture_eff * h.capture * h.atmos_transmittance * point * rect
 
     else:
@@ -398,16 +394,19 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
             emitter_diam_up_m=h1.emitter_diam_m, emitter_diam_down_m=h2.emitter_diam_m,
             slant_up_km=h1.slant_m / 1e3, slant_down_km=h2.slant_m / 1e3,
             elevation_up_deg=h1.elevation_deg, elevation_down_deg=h2.elevation_deg,
-            atmos_loss_up_db=h1.atmos_loss_db, atmos_loss_down_db=h2.atmos_loss_db)
+            atmos_loss_up_db=h1.atmos_loss_db, atmos_loss_down_db=h2.atmos_loss_db,
+            blocked=np.logical_or(h1.blocked, h2.blocked))
         eta = (eta_dc_rf * h1.emitter_aperture_eff * h1.capture * h1.atmos_transmittance
                * convert * h2.emitter_aperture_eff * h2.capture * h2.atmos_transmittance
                * point * rect)
 
     stages["eta_end_to_end"] = eta
+    stages["feasible"] = np.logical_and(np.logical_not(stages["blocked"]), eta > 1e-4)
     if delivered_mw is not None:
         stages["delivered_mw"] = delivered_mw
-        stages["grid_mw"] = delivered_mw / eta
-        stages["waste_mw"] = delivered_mw / eta - delivered_mw
+        with np.errstate(divide="ignore", invalid="ignore"):
+            stages["grid_mw"] = np.where(eta > 0, delivered_mw / eta, np.inf)
+            stages["waste_mw"] = stages["grid_mw"] - delivered_mw
         stages["incident_power_density_kw_m2"] = (
             delivered_mw / stages["rectenna_total"] * 1e3 / np.maximum(stages["silhouette_m2"], 1e-6))
     return stages
@@ -432,13 +431,12 @@ def emitter_for_reference(frequency_ghz, station_pos, plane_alt_m=11_000.0,
                           silhouette=None):
     """Physical emitter diameter that hits `tau_target` at a chosen reference
     elevation (e.g. near overhead) — the FIXED aperture a station is built with."""
-    ground = plane_alt_m / np.tan(np.radians(reference_elevation_deg))
-    plane = np.array([station_pos[0] + ground, station_pos[1], plane_alt_m])
-    _, _, unit = geometry(plane, np.asarray(station_pos, dtype=float))
+    downrange = float(geo.downrange_for_elevation(reference_elevation_deg, plane_alt_m))
+    plane = (station_pos[0] + downrange, station_pos[1], plane_alt_m)
+    slant, _, unit = geometry(plane, station_pos)
     beta, alpha = beta_alpha_from_enu(unit, 0.0, 0.0, 0.0)
     sil = silhouette or get_silhouette()
     r_recv = receiver_radius_from_silhouette(sil.area(beta, alpha))
-    slant = np.linalg.norm(plane - np.asarray(station_pos, dtype=float))
     return float(size_emitter_diameter(frequency_ghz, slant, r_recv, tau_target))
 
 
@@ -511,10 +509,11 @@ def print_report(name, stages):
 # --- Named tech cases ---------------------------------------------------------
 
 def reference_geometry(elevation_deg=30.0, plane_alt_km=11.0):
-    """Station at origin (sea level); plane placed downrange so the emitter sees it
-    at `elevation_deg`. Returns (station_pos, plane_pos)."""
-    ground_range = plane_alt_km * 1e3 / np.tan(np.radians(elevation_deg))
-    return (0.0, 0.0, 0.0), (ground_range, 0.0, plane_alt_km * 1e3)
+    """Station at origin (sea level); plane placed downrange (on the sphere) so the
+    station sees it at `elevation_deg`. Returns (station_pos, plane_pos) in
+    (downrange, crossrange, altitude) coordinates."""
+    downrange = float(geo.downrange_for_elevation(elevation_deg, plane_alt_km * 1e3))
+    return (0.0, 0.0, 0.0), (downrange, 0.0, plane_alt_km * 1e3)
 
 
 def tech_cases(elevation_deg=30.0, weather="clear", delivered_mw=10.0):
