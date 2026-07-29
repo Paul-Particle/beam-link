@@ -140,15 +140,50 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
     return vertices, faces
 
 
+def _connected_components(vertices, faces):
+    """Component id (0..k-1) per vertex, via shared-vertex union-find over the faces."""
+    parent = np.arange(len(vertices))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b, c in faces:
+        ra, rb, rc = find(a), find(b), find(c)
+        if ra != rb:
+            parent[rb] = ra
+        if ra != rc:
+            parent[find(c)] = ra
+    roots = np.array([find(i) for i in range(len(vertices))])
+    _, comp = np.unique(roots, return_inverse=True)
+    return comp
+
+
 def triangle_normals_areas(vertices, faces):
-    """Outward unit normals and areas for each triangle (outward via body-centroid test)."""
+    """Outward unit normals and areas for each triangle.
+
+    Each normal is oriented to point away from the centroid of the triangle's own
+    connected component, not the whole-mesh centroid. A global centroid mis-orients a
+    thin appendage that sits far off-centre (e.g. a wingtip winglet): both of its faces
+    lie to one side of the body centre, so the global test flips the inboard face
+    outward too, leaving both faces pointing the same way. A per-component centroid,
+    which the lofted body and each winglet are each star-convex about, orients both
+    faces of every part correctly."""
     v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
     cross = np.cross(v1 - v0, v2 - v0)
     area = 0.5 * np.linalg.norm(cross, axis=1)
     normal = cross / (np.linalg.norm(cross, axis=1, keepdims=True) + 1e-30)
-    body_centroid = vertices.mean(axis=0)
+
+    comp = _connected_components(vertices, faces)
+    comp_sum = np.zeros((comp.max() + 1, 3))
+    np.add.at(comp_sum, comp, vertices)
+    comp_centroid = comp_sum / np.bincount(comp)[:, None]
+    ref = comp_centroid[comp[faces[:, 0]]]                 # each face's own-part centroid
+
     tri_centroid = (v0 + v1 + v2) / 3.0
-    outward = np.sum(normal * (tri_centroid - body_centroid), axis=1) < 0
+    outward = np.sum(normal * (tri_centroid - ref), axis=1) < 0
     normal[outward] *= -1.0
     return normal, area
 
