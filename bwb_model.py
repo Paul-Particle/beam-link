@@ -279,8 +279,9 @@ def silhouette_figure(path="out/bwb_silhouette.html"):
         color="lightsteelblue", opacity=0.85, flatshading=True, name="BWB"),
         row=1, col=1)
 
-    # Silhouette vs β for a few azimuths (nose-on, quarter, side-on).
-    for az, label in [(0.0, "α=0° nose-on"), (45.0, "α=45°"), (90.0, "α=90° side-on")]:
+    # Silhouette vs β for a few azimuths (nose-on, quarter, side-on, tail-on).
+    for az, label in [(0.0, "α=0° nose-on"), (45.0, "α=45°"), (90.0, "α=90° side-on"),
+                      (180.0, "α=180° tail-on")]:
         ai = int(np.argmin(np.abs(alpha - az)))
         fig.add_trace(go.Scatter(x=beta, y=table[:, ai], mode="lines",
                                  name=label), row=1, col=2)

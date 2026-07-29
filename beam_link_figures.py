@@ -21,25 +21,29 @@ OUT = "out"
 WEATHER_ORDER = ["clear", "cloudy", "light_rain", "heavy_rain", "storm"]
 WEATHER_LABEL = {"clear": "clear", "cloudy": "cloudy", "light_rain": "light rain",
                  "heavy_rain": "heavy rain", "storm": "storm"}
-PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+PAE_SCENARIOS = ["today", "medium", "flat"]
 
 
 def _relay_pos(station, plane, alt_m=20_000.0):
     return (station[0] * 0.5 + plane[0] * 0.5, 0.0, alt_m)
 
 
-def architectures(station, plane, weather="clear"):
-    """The five cases at a common geometry, as {name: LinkConfig}."""
+def architectures(station, plane, weather="clear", pae_scenario="today"):
+    """The architectures we've weighed, at a common geometry, as {name: LinkConfig}."""
     relay = _relay_pos(station, plane)
-    common = dict(station_pos=station, plane_pos=plane, weather=weather)
+    common = dict(station_pos=station, plane_pos=plane, weather=weather, pae_scenario=pae_scenario)
     return {
         "5.8 GHz direct": bl.LinkConfig(**common, f_emit_plane_ghz=5.8),
         "30 GHz direct": bl.LinkConfig(**common, f_emit_plane_ghz=30.0),
-        "34.8 GHz direct": bl.LinkConfig(**common, f_emit_plane_ghz=34.8),
+        "relay ×3 mult 5.8→17.4": bl.LinkConfig(**common, relay_pos=relay, relay_mode="multiplier",
+                                                f_emit_relay_ghz=5.8, f_relay_plane_ghz=17.4),
+        "relay ×6 mult 5.8→34.8": bl.LinkConfig(**common, relay_pos=relay, relay_mode="multiplier",
+                                                f_emit_relay_ghz=5.8, f_relay_plane_ghz=34.8),
         "relay active 5.8→30": bl.LinkConfig(**common, relay_pos=relay, relay_mode="active",
                                              f_emit_relay_ghz=5.8, f_relay_plane_ghz=30.0),
-        "relay passive 30": bl.LinkConfig(**common, relay_pos=relay, relay_mode="passive",
-                                          f_emit_relay_ghz=30.0),
+        "relay passive 5.8": bl.LinkConfig(**common, relay_pos=relay, relay_mode="passive",
+                                           f_emit_relay_ghz=5.8),
     }
 
 
@@ -89,38 +93,50 @@ def figure_waterfall(elevation_deg=30.0, weather="clear", delivered_mw=10.0,
 
 def figure_frequency(elevation_deg=30.0, delivered_mw=10.0,
                      path=f"{OUT}/beam_link_frequency.html"):
+    """Three panels: (A) efficiency vs freq under the three device-efficiency
+    scenarios — how much of the low-frequency tilt is our PAE assumption vs physics;
+    (B) PURE atmospheric transmittance vs freq per weather (ITU-R only, no device
+    assumptions) — the honest weather picture; (C) emitter diameter vs freq."""
     station, plane = bl.reference_geometry(elevation_deg)
     freqs = np.linspace(5.8, 40.0, 70)
     fig = make_subplots(
-        rows=1, cols=2, horizontal_spacing=0.11,
-        subplot_titles=("End-to-end efficiency vs frequency, by weather",
-                        "Emitter diameter vs frequency (τ=2 design)"))
+        rows=1, cols=3, horizontal_spacing=0.075,
+        subplot_titles=("η vs frequency — 3 device scenarios (clear air)",
+                        "Atmospheric transmittance vs frequency (physics only)",
+                        "Emitter diameter vs frequency (τ=2)"))
+
+    for scen, color in zip(PAE_SCENARIOS, PALETTE):
+        eta = [float(bl.evaluate(bl.LinkConfig(station_pos=station, plane_pos=plane,
+               f_emit_plane_ghz=f, pae_scenario=scen), delivered_mw)["eta_end_to_end"])
+               for f in freqs]
+        fig.add_trace(go.Scatter(x=freqs, y=eta, mode="lines", name=f"PAE: {scen}",
+                                 line=dict(color=color)), row=1, col=1)
 
     for weather, color in zip(["clear", "cloudy", "light_rain", "heavy_rain"], PALETTE):
-        eta = [float(bl.evaluate(bl.LinkConfig(station_pos=station, plane_pos=plane,
-               f_emit_plane_ghz=f, weather=weather), delivered_mw)["eta_end_to_end"])
-               for f in freqs]
-        fig.add_trace(go.Scatter(x=freqs, y=eta, mode="lines", name=WEATHER_LABEL[weather],
-                                 line=dict(color=color)), row=1, col=1)
+        # 'atmos' from evaluate is the pure ITU-R transmittance — no device terms.
+        atmos = [float(bl.evaluate(bl.LinkConfig(station_pos=station, plane_pos=plane,
+                 f_emit_plane_ghz=f, weather=weather), delivered_mw)["atmos"]) for f in freqs]
+        fig.add_trace(go.Scatter(x=freqs, y=atmos, mode="lines", name=WEATHER_LABEL[weather],
+                                 line=dict(color=color, dash="dot")), row=1, col=2)
 
     diam = [float(bl.evaluate(bl.LinkConfig(station_pos=station, plane_pos=plane,
             f_emit_plane_ghz=f), delivered_mw)["emitter_diam_m"]) for f in freqs]
     fig.add_trace(go.Scatter(x=freqs, y=diam, mode="lines", name="emitter Ø",
-                             line=dict(color="#111", width=3), showlegend=False), row=1, col=2)
+                             line=dict(color="#111", width=3), showlegend=False), row=1, col=3)
 
-    for f, lbl_ in [(5.8, "C-band"), (22.0, "H₂O line"), (30.0, "Ka")]:
-        for c in (1, 2):
-            fig.add_vline(x=f, line=dict(color="grey", dash="dot", width=1),
-                          row=1, col=c)
-    fig.update_xaxes(title_text="frequency (GHz)", row=1, col=1)
-    fig.update_xaxes(title_text="frequency (GHz)", row=1, col=2)
-    fig.update_yaxes(title_text="η end-to-end (grid→rectenna DC)", row=1, col=1, rangemode="tozero")
-    fig.update_yaxes(title_text="emitter diameter (m)", type="log", row=1, col=2)
-    fig.update_layout(template="plotly_white", height=520, width=1180,
-                      title=(f"The frequency dial: low f = huge emitter but weatherproof; "
-                             f"high f = tiny emitter but rained out (plane 11 km, "
-                             f"{elevation_deg:.0f}° elevation)"),
-                      legend=dict(orientation="h", y=-0.18))
+    for f in (5.8, 22.0, 30.0):
+        for c in (1, 2, 3):
+            fig.add_vline(x=f, line=dict(color="grey", dash="dot", width=1), row=1, col=c)
+    for c in (1, 2, 3):
+        fig.update_xaxes(title_text="frequency (GHz)", row=1, col=c)
+    fig.update_yaxes(title_text="η end-to-end", row=1, col=1, rangemode="tozero")
+    fig.update_yaxes(title_text="atmospheric transmittance", row=1, col=2, range=[0, 1.02])
+    fig.update_yaxes(title_text="emitter diameter (m)", type="log", row=1, col=3)
+    fig.update_layout(template="plotly_white", height=520, width=1500,
+                      title=(f"Frequency dial (plane 11 km, {elevation_deg:.0f}° elev): the "
+                             f"efficiency tilt to low f is mostly the PAE assumption (A); the real "
+                             f"physics is the weather cliff (B) and the emitter blow-up (C)"),
+                      legend=dict(orientation="h", y=-0.2))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")
     return path
@@ -140,23 +156,28 @@ def figure_geometry(frequency_ghz=30.0, delivered_mw=10.0,
         silh.append(float(s["silhouette_m2"]))
         eta.append(float(s["eta_end_to_end"]))
 
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.12,
+                        specs=[[{"secondary_y": True}, {}]],
+                        subplot_titles=("Emitter grows while plane silhouette shrinks",
+                                        "End-to-end efficiency vs elevation"))
     fig.add_trace(go.Scatter(x=elevs, y=diam, name="emitter Ø (m)",
-                             line=dict(color="#d62728", width=3)), secondary_y=False)
+                             line=dict(color="#d62728", width=3)), row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=elevs, y=silh, name="plane silhouette (m²)",
-                             line=dict(color="#2ca02c", width=3)), secondary_y=True)
-    fig.add_trace(go.Scatter(x=elevs, y=np.array(eta) * 1000, name="η ×1000",
-                             line=dict(color="#1f77b4", width=2, dash="dot")), secondary_y=True)
-    fig.add_vline(x=15.0, line=dict(color="grey", dash="dash"),
-                  annotation_text="15° baseline")
-    fig.update_xaxes(title_text="elevation angle of plane from station (deg)")
-    fig.update_yaxes(title_text="emitter diameter (m)", type="log", secondary_y=False)
-    fig.update_yaxes(title_text="silhouette (m²)  /  η×1000", secondary_y=True, rangemode="tozero")
+                             line=dict(color="#2ca02c", width=3)), row=1, col=1, secondary_y=True)
+    fig.add_trace(go.Scatter(x=elevs, y=100 * np.array(eta), name="η (%)",
+                             line=dict(color="#1f77b4", width=3)), row=1, col=2)
+    fig.add_vline(x=15.0, line=dict(color="grey", dash="dash"), row=1, col=1)
+    fig.add_vline(x=15.0, line=dict(color="grey", dash="dash"), row=1, col=2)
+    fig.update_xaxes(title_text="elevation of plane from station (deg)", row=1, col=1)
+    fig.update_xaxes(title_text="elevation of plane from station (deg)", row=1, col=2)
+    fig.update_yaxes(title_text="emitter diameter (m)", type="log", row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="silhouette (m²)", row=1, col=1, secondary_y=True, rangemode="tozero")
+    fig.update_yaxes(title_text="η end-to-end (%)", row=1, col=2, rangemode="tozero")
     fig.update_layout(
-        template="plotly_white", height=560, width=1000,
+        template="plotly_white", height=520, width=1150,
         title=(f"The low-elevation double penalty at {frequency_ghz:.0f} GHz: as the plane "
                f"sits lower, the emitter must GROW while the plane's aperture SHRINKS"),
-        legend=dict(orientation="h", y=-0.16))
+        legend=dict(orientation="h", y=-0.18))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")
     return path
@@ -326,6 +347,50 @@ def figure_derate_sensitivity(frequency_ghz=30.0, elevation_deg=30.0, delivered_
     return path
 
 
+# --- 8. Spot shaping: silhouette elongation and the emitter shape it implies ---
+
+def figure_spot_shape(path=f"{OUT}/beam_link_spot_shape.html"):
+    """The silhouette is a wide-thin sliver at low elevation, so a round beam wastes
+    most of its power. Panel A: silhouette aspect ratio vs elevation. Panel B: what a
+    round vs a shape-matched (elliptical, phased-array) spot recovers — and the emitter
+    aperture must be elongated PERPENDICULAR to the sliver to paint the matching spot."""
+    import bwb_model as m
+    betas = np.linspace(0.0, 88.0, 23)
+    elevation = 90.0 - betas
+    fig = make_subplots(
+        rows=1, cols=2, horizontal_spacing=0.12,
+        subplot_titles=("Silhouette elongation vs elevation",
+                        "Spot-match: round vs shaped emitter (side aspect)"))
+
+    for az, lbl, color in [(90.0, "side aspect (lateral pass)", "#1f77b4"),
+                           (0.0, "nose aspect (head-on)", "#ff7f0e")]:
+        aspect = [m.silhouette_aspect(b, az)[0] for b in betas]
+        fig.add_trace(go.Scatter(x=elevation, y=aspect, mode="lines", name=lbl,
+                                 line=dict(color=color)), row=1, col=1)
+    fig.update_xaxes(title_text="elevation (deg) — 90=overhead, 0=on the horizon", row=1, col=1)
+    fig.update_yaxes(title_text="silhouette aspect ratio (major/minor)", row=1, col=1, rangemode="tozero")
+
+    aspect_side = np.array([m.silhouette_aspect(b, 90.0)[0] for b in betas])
+    sm_round = bl.spot_match_from_aspect(aspect_side, shaped=False)
+    sm_shaped = bl.spot_match_from_aspect(aspect_side, shaped=True) * np.ones_like(aspect_side)
+    fig.add_trace(go.Scatter(x=elevation, y=sm_round, mode="lines", name="round emitter",
+                             line=dict(color="#d62728")), row=1, col=2)
+    fig.add_trace(go.Scatter(x=elevation, y=sm_shaped, mode="lines",
+                             name="shaped (phased-array) emitter", line=dict(color="#2ca02c")),
+                  row=1, col=2)
+    fig.update_xaxes(title_text="elevation (deg)", row=1, col=2)
+    fig.update_yaxes(title_text="spot-match efficiency", row=1, col=2, range=[0, 1.0])
+    fig.update_layout(
+        template="plotly_white", height=520, width=1150,
+        title=("Spot shaping: at low elevation the silhouette is a wide-thin sliver — a round "
+               "beam couples ~1/aspect, so the emitter must synthesise an elongated spot "
+               "(a phased array can; a fixed aperture is a permanent portrait/landscape choice)"),
+        legend=dict(orientation="h", y=-0.2))
+    os.makedirs(OUT, exist_ok=True)
+    fig.write_html(path, include_plotlyjs="inline")
+    return path
+
+
 def build_all():
     paths = [
         figure_waterfall(),
@@ -335,6 +400,7 @@ def build_all():
         figure_attitude(),
         figure_pass(),
         figure_derate_sensitivity(),
+        figure_spot_shape(),
     ]
     print("wrote:")
     for p in paths:
