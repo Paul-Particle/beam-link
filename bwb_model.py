@@ -165,6 +165,97 @@ def silhouette_aspect(beta_deg, alpha_deg, mesh_kwargs=None):
     return major / max(minor, 1e-6), major, minor
 
 
+# --- Occlusion-aware projection (rasterized silhouette + incidence) -----------
+# The convex identity above OVER-counts a non-convex body (a winglet behind the
+# body, a far wing seen edge-on) because it has no occlusion test. For the honest
+# spot-in-silhouette overlap we rasterize the ACTUAL projection: sample the surface
+# densely, project onto the view plane, and keep — per grid cell — only the sample
+# nearest the emitter (a z-buffer). That gives the true (self-occluded) outline AND
+# the incidence angle of the skin the beam actually reaches, cell by cell.
+
+def surface_samples(mesh_kwargs=None, target_points=120_000, seed=0):
+    """Dense surface point cloud with per-point outward normal and area weight,
+    sampled uniformly over the mesh (points-per-triangle ∝ area). Cached by the
+    caller; this is the geometry the rasterizer projects."""
+    vertices, faces = make_bwb_mesh(**(mesh_kwargs or {}))
+    normals, areas = triangle_normals_areas(vertices, faces)
+    counts = np.maximum(1, np.round(target_points * areas / areas.sum()).astype(int))
+    rng = np.random.default_rng(seed)
+    pts, nrm, wts = [], [], []
+    for tri, n, normal, area in zip(faces, counts, normals, areas):
+        v0, v1, v2 = vertices[tri]
+        r1, r2 = rng.random(n), rng.random(n)
+        su = np.sqrt(r1)                              # uniform barycentric sampling
+        a, b, c = 1.0 - su, su * (1.0 - r2), su * r2
+        pts.append(a[:, None] * v0 + b[:, None] * v1 + c[:, None] * v2)
+        nrm.append(np.broadcast_to(normal, (n, 3)))
+        wts.append(np.full(n, area / n))
+    return np.vstack(pts), np.vstack(nrm), np.concatenate(wts)
+
+
+def _view_basis(look_dir):
+    """Orthonormal (û, v̂, ŵ) with ŵ = look direction (body→emitter)."""
+    w = np.asarray(look_dir, dtype=float)
+    w = w / (np.linalg.norm(w) + 1e-30)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(w[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(ref, w); u /= (np.linalg.norm(u) + 1e-30)
+    v = np.cross(w, u)
+    return u, v, w
+
+
+def rasterize_silhouette(look_dir, samples, sample_normals, n_grid=120):
+    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter).
+
+    Projects the front-facing samples onto the view plane, bins them, and keeps the
+    sample nearest the emitter in each cell (z-buffer). Returns the covered cells'
+    (u, v) centres in metres, their incidence cosine (n̂·ŵ), the physical cell area,
+    and the true occluded silhouette area. All in the view plane, centred on the
+    silhouette centroid so a beam can be laid straight on top."""
+    u_ax, v_ax, w_ax = _view_basis(look_dir)
+    incidence = sample_normals @ w_ax
+    front = incidence > 1e-6                          # skin facing the emitter
+    U = samples[front] @ u_ax
+    V = samples[front] @ v_ax
+    depth = samples[front] @ w_ax                     # larger = nearer the emitter
+    inc = incidence[front]
+    if U.size == 0:
+        return dict(u=np.array([]), v=np.array([]), incidence=np.array([]),
+                    cell_area=0.0, area=0.0, n_grid=n_grid)
+
+    u_lo, u_hi = U.min(), U.max()
+    v_lo, v_hi = V.min(), V.max()
+    span_u = max(u_hi - u_lo, 1e-6)
+    span_v = max(v_hi - v_lo, 1e-6)
+    iu = np.clip(((U - u_lo) / span_u * (n_grid - 1)).astype(int), 0, n_grid - 1)
+    iv = np.clip(((V - v_lo) / span_v * (n_grid - 1)).astype(int), 0, n_grid - 1)
+    cell = iu * n_grid + iv
+
+    # z-buffer: for each occupied cell keep the sample with the greatest depth.
+    order = np.argsort(depth)[::-1]                   # nearest-first
+    cell_sorted, inc_sorted = cell[order], inc[order]
+    uniq_cell, first = np.unique(cell_sorted, return_index=True)
+    inc_cell = inc_sorted[first]
+
+    du, dv = span_u / (n_grid - 1), span_v / (n_grid - 1)
+    cu = u_lo + (uniq_cell // n_grid) * du
+    cv = v_lo + (uniq_cell % n_grid) * dv
+    cell_area = du * dv
+    area = uniq_cell.size * cell_area
+    return dict(u=cu - cu.mean(), v=cv - cv.mean(), incidence=inc_cell,
+                cell_area=cell_area, area=area, n_grid=n_grid)
+
+
+# Cached sample cloud for the default airframe.
+_SAMPLES = None
+
+
+def get_surface_samples(mesh_kwargs=None):
+    global _SAMPLES
+    if _SAMPLES is None or mesh_kwargs is not None:
+        _SAMPLES = surface_samples(mesh_kwargs)
+    return _SAMPLES
+
+
 # --- Lookup table -------------------------------------------------------------
 
 _TABLE_PATH = Path(__file__).with_name("data") / "bwb_silhouette.npz"

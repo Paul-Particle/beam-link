@@ -9,6 +9,7 @@ import numpy as np
 import napkin
 import geo
 import beam_link as bl
+import bwb_model as m
 from bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
 
@@ -213,6 +214,90 @@ def test_pass_profile():
           p["capture"][peak_idx] > 0.95 and np.min(p["capture"]) < 0.3)
 
 
+# --- Rasterized silhouette + 2-D overlap capture ------------------------------
+
+def test_overlap():
+    print("\n[overlap capture — the 2-D beam × silhouette model]")
+
+    # (1) The overlap of a ROUND spot on a uniform round rectenna must reproduce the
+    # Goubau near-field law 1−e^(−τ²) exactly — the new model generalises the old one.
+    def disk_raster(r_r, n=400):
+        g = np.linspace(-r_r, r_r, n)
+        uu, vv = np.meshgrid(g, g)
+        mask = uu ** 2 + vv ** 2 <= r_r ** 2
+        return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
+                    cell_area=(g[1] - g[0]) ** 2, area=int(mask.sum()) * (g[1] - g[0]) ** 2)
+    lam, D, r_t, r_r = napkin.wavelength(30e9), 200e3, 40.0, 15.0
+    tau = napkin.coupling_tau(30e9, D, r_t, r_r)
+    goubau = napkin.collection_efficiency(tau)
+    geom, _, _ = bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False, incidence_floor=1.0)
+    check("round spot on a disk reproduces Goubau 1−e^(−τ²)", abs(geom - goubau) < 5e-3,
+          f"overlap {geom:.4f} vs Goubau {goubau:.4f}")
+
+    # (2) The rasterized (self-occluded) silhouette is SMALLER than the convex identity
+    # side-on at low elevation, where winglets + far wing overlap in projection.
+    verts, faces = make_bwb_mesh()
+    normals, areas = triangle_normals_areas(verts, faces)
+    samples, snorm, _ = m.get_surface_samples()
+    d = direction_from_beta_alpha(85.0, 90.0); d = d / np.linalg.norm(d)
+    convex = float(projected_area(d, normals, areas))
+    raster = m.rasterize_silhouette(d, samples, snorm, n_grid=120)["area"]
+    check("rasterized silhouette removes convex over-count (side, low elev)",
+          raster < 0.85 * convex, f"raster {raster:.0f} < convex {convex:.0f} m²")
+
+    # (3) The incidence penalty EMERGES from geometry: incidence-weighted capture ≈ the
+    # geometric overlap overhead, but is markedly lower at grazing (low) elevation.
+    def caps(beta):
+        dd = direction_from_beta_alpha(beta, 0.0); dd = dd / np.linalg.norm(dd)
+        r = m.rasterize_silhouette(dd, samples, snorm, n_grid=120)
+        return bl.overlap_capture(r, 30.0, lam, 250e3, shaped=False)  # (geom, eff, w0)
+    g_over, e_over, _ = caps(5.0)     # near belly-on (overhead)
+    g_low, e_low, _ = caps(85.0)      # grazing (low elevation)
+    check("incidence penalty ~absent overhead", e_over / g_over > 0.9,
+          f"eff/geom = {e_over/g_over:.2f}")
+    check("incidence penalty bites at low elevation", e_low / g_low < 0.85,
+          f"eff/geom = {e_low/g_low:.2f}")
+
+    # (4) A shaped (phased-array) spot captures ≥ a round spot on an elongated silhouette.
+    dd = direction_from_beta_alpha(80.0, 0.0); dd = dd / np.linalg.norm(dd)
+    r = m.rasterize_silhouette(dd, samples, snorm, n_grid=120)
+    g_round = bl.overlap_capture(r, 20.0, lam, 250e3, shaped=False)[0]
+    g_shaped = bl.overlap_capture(r, 20.0, lam, 250e3, shaped=True)[0]
+    check("shaped spot ≥ round spot on an elongated silhouette", g_shaped >= g_round - 1e-6,
+          f"shaped {g_shaped:.3f} ≥ round {g_round:.3f}")
+
+
+# --- Trajectory-integrated flyby ----------------------------------------------
+
+def test_flyby():
+    print("\n[flyby — trajectory-integrated over a pass]")
+    archs = bl.standard_architectures()
+
+    # Ordering: harmonic ≤ arithmetic mean ≤ peak, always.
+    r = bl.flyby(archs["5.8 direct"], station_spacing_km=200.0)
+    check("harmonic ≤ mean ≤ peak η", r["hmean_eta"] <= r["mean_eta"] + 1e-9 <= r["peak_eta"] + 1e-9,
+          f"h {r['hmean_eta']:.3f} ≤ mean {r['mean_eta']:.3f} ≤ peak {r['peak_eta']:.3f}")
+
+    # The tether (emitter above the weather) is ~weather-independent over the pass.
+    t_clear = bl.flyby({**archs["tether 30 direct"], "weather": "clear"}, station_spacing_km=200.0)["mean_eta"]
+    t_storm = bl.flyby({**archs["tether 30 direct"], "weather": "storm"}, station_spacing_km=200.0)["mean_eta"]
+    check("tether high-f is ~weather-independent", abs(t_clear - t_storm) / t_clear < 0.05,
+          f"clear {t_clear:.3f} vs storm {t_storm:.3f}")
+
+    # In a storm the relay feeds continuously far better than 5.8-direct (whose
+    # low-elevation pass edges rain out) — the relay's value over the FULL flyby.
+    relay = bl.flyby({**archs["relay ×3 mult 5.8→17.4"], "weather": "storm"}, station_spacing_km=200.0)
+    direct = bl.flyby({**archs["5.8 direct"], "weather": "storm"}, station_spacing_km=200.0)
+    check("relay beats 5.8-direct on continuous delivery in storm",
+          relay["hmean_eta"] > direct["hmean_eta"],
+          f"relay hmean {relay['hmean_eta']:.3f} vs direct {direct['hmean_eta']:.3f}")
+
+    # Ground direct-30 rains out somewhere on the pass → cannot feed continuously (∞).
+    g30 = bl.flyby({**archs["30 direct (ground)"], "weather": "storm"}, station_spacing_km=200.0)
+    check("ground direct-30 cannot feed continuously in a storm",
+          not np.isfinite(g30["grid_energy_per_pass_gj"]))
+
+
 if __name__ == "__main__":
     test_silhouette()
     test_atmosphere()
@@ -221,5 +306,7 @@ if __name__ == "__main__":
     test_end_to_end()
     test_vectorized()
     test_pass_profile()
+    test_overlap()
+    test_flyby()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)
