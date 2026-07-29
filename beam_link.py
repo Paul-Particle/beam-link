@@ -235,45 +235,46 @@ def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
 
 
 def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=False,
-                    incidence_floor=0.70, aspect_cap=8.0, return_field=False):
-    """Capture as the 2-D overlap of a focused beam spot with the true (rasterized,
-    self-occluded) silhouette — replacing √(A/π) sizing + τ-capture + a scalar
-    spot_match with one honest integral.
+                    incidence_floor=0.70, aspect_cap=8.0, min_waist_m=0.0, return_field=False):
+    """Capture as the 2-D overlap of a focused beam spot with the true (self-occluded)
+    silhouette — a Monte-Carlo integral over the visible surface samples, replacing
+    √(A/π) sizing + τ-capture + a scalar spot_match.
 
-    The spot is centred on the silhouette centroid. A ROUND emitter paints a round
-    spot; a SHAPED (phased-array) emitter re-shapes it — at FIXED aperture area, i.e.
-    fixed spot etendue w_u·w_v = w0² — into an ellipse aligned to the silhouette's
-    principal axes (spot aspect = silhouette aspect, capped at what an array can
-    realistically synthesise). Returns:
+    Each visible sample covers `proj_area` of the view plane; the beam B(u,v) is power
+    per unit view-plane area (∫B dA = p_total), so intercepted power = Σ B·proj_area.
+    The spot is centred on the silhouette centroid; a ROUND emitter paints a round spot
+    of waist w0, a SHAPED (phased-array) emitter re-forms it at FIXED aperture area
+    (fixed etendue w_u·w_v = w0²) into an ellipse aligned to the silhouette's principal
+    axes. `min_waist_m` DEFOCUSES: the spot is never focused tighter than this (a real
+    emitter spreads the beam rather than over-concentrate it onto a tiny patch — which
+    would spike the power density and make pointing brutal). Returns:
       geom  — fraction of radiated beam power intercepted by the airframe outline
-      eff   — same, weighted by the per-cell incidence response (grazing skin counts
-              less: floor + (1−floor)·cos θ_incidence) — the incidence penalty now
-              EMERGES from the geometry instead of being a scalar knob.
-      w0    — the round-spot waist (m), for reporting/pointing."""
-    u, v, inc = raster["u"], raster["v"], raster["incidence"]
-    cell_area = raster["cell_area"]
-    w0 = focused_spot_waist(wavelength_m, slant_m, emitter_radius_m)
+      eff   — same, weighted by the rectenna incidence response (grazing skin converts
+              less: floor + (1−floor)·cosθ) — emerges from geometry, not a knob.
+      w0    — the (possibly defocused) round-spot waist (m), for pointing/reporting."""
+    u, v, inc, proj = raster["u"], raster["v"], raster["incidence"], raster["proj_area"]
+    w0 = max(float(focused_spot_waist(wavelength_m, slant_m, emitter_radius_m)), float(min_waist_m))
     p_total = 0.5 * np.pi * w0 ** 2                    # ∫∫ exp(−2ρ²/w0²) dA
     if u.size == 0:
-        return 0.0, 0.0, float(w0)
+        empty = dict(u=u, v=v, beam=np.array([]), incidence=inc, proj_area=proj, w0=w0)
+        return (0.0, 0.0, w0, empty) if return_field else (0.0, 0.0, w0)
 
     inc_eff = incidence_floor + (1.0 - incidence_floor) * inc
-    if not shaped:
+    if not shaped or u.size < 3:
         beam = np.exp(-2.0 * (u ** 2 + v ** 2) / w0 ** 2)
     else:
         coords = np.vstack([u, v])
-        cov = np.cov(coords) if u.size > 2 else np.eye(2)
+        cov = np.cov(coords, aweights=np.maximum(proj, 1e-12))
         evals, evecs = np.linalg.eigh(cov)            # ascending: [minor, major]
         aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap)
         w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
-        proj = evecs.T @ coords                        # rows: [along minor, along major]
-        beam = np.exp(-2.0 * (proj[1] ** 2 / w_major ** 2 + proj[0] ** 2 / w_minor ** 2))
-    geom = float(np.sum(beam) * cell_area / p_total)
-    eff = float(np.sum(beam * inc_eff) * cell_area / p_total)
+        pc = evecs.T @ coords                          # rows: [along minor, along major]
+        beam = np.exp(-2.0 * (pc[1] ** 2 / w_major ** 2 + pc[0] ** 2 / w_minor ** 2))
+    geom = min(float(np.sum(beam * proj) / p_total), 1.0)
+    eff = min(float(np.sum(beam * proj * inc_eff) / p_total), 1.0)
     if return_field:
-        return geom, eff, float(w0), dict(u=u, v=v, beam=beam, incidence=inc,
-                                          incidence_eff=inc_eff, w0=float(w0))
-    return geom, eff, float(w0)
+        return geom, eff, w0, dict(u=u, v=v, beam=beam, incidence=inc, proj_area=proj, w0=w0)
+    return geom, eff, w0
 
 
 # --- Device-efficiency scenarios ---------------------------------------------
@@ -411,6 +412,8 @@ class LinkConfig:
     tau_target: float = 2.0
     polarization: str = "circular"
     shaped_spot: bool = True                        # phased-array elliptical spot (vs round aperture)
+    defocus: bool = True                            # spread the spot rather than over-focus onto a tiny patch
+    defocus_fill: float = 0.8                       # min spot waist = defocus_fill × √(A/π)
     spot_match: float = 0.90                        # deprecated: overlap_capture supersedes it
     incidence_floor: float = 0.70                   # rectenna element angular-response floor
     emitter_error_efficiency: float = 0.95
@@ -430,18 +433,18 @@ class LinkConfig:
 _RASTER_CACHE = {}
 
 
-def _cached_raster(beta_deg, alpha_deg, n_grid=120):
+def _cached_raster(beta_deg, alpha_deg, n_grid=150):
     key = (round(float(beta_deg), 1), round(float(alpha_deg), 1), n_grid)
     raster = _RASTER_CACHE.get(key)
     if raster is None:
         look = direction_from_beta_alpha(key[0], key[1])
-        samples, sample_normals, _ = get_surface_samples()
-        raster = rasterize_silhouette(look, samples, sample_normals, n_grid=n_grid)
+        samples, sample_normals, sample_weights = get_surface_samples()
+        raster = rasterize_silhouette(look, samples, sample_normals, sample_weights, n_grid=n_grid)
         _RASTER_CACHE[key] = raster
     return raster
 
 
-def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, n_grid=120):
+def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, n_grid=150):
     """The real receive-side geometry the plane presents to an emitter at `emitter_pos`:
     rasterize the (self-occluded) silhouette toward the emitter and overlap the focused
     beam spot with it. Returns a dict with the true silhouette area, the incidence-
@@ -460,8 +463,12 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, n_grid=120):
     if emitter_diam_m is None:                     # size to τ_target on the equal-area disk
         emitter_diam_m = float(size_emitter_diameter(freq_ghz, slant, r_recv, cfg.tau_target))
     wavelength = napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
+    # Defocus: never focus tighter than ~the silhouette — spreading the beam keeps the
+    # power density sane and the pointing tolerant, at a small capture cost.
+    min_waist = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
-                                        shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor)
+                                        shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
+                                        min_waist_m=min_waist)
     return dict(area=area, r_recv=r_recv, beta=float(beta), roll=float(roll),
                 slant=float(slant), elevation=float(elevation), capture=capture,
                 capture_geom=geom, spot_waist_m=w0, emitter_diam_m=float(emitter_diam_m))

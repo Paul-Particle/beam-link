@@ -233,7 +233,7 @@ def figure_occlusion(path=f"{OUT}/beam_link_occlusion.html"):
     two winglets and the far wing overlap in projection)."""
     verts, faces = m.make_bwb_mesh()
     normals, areas = m.triangle_normals_areas(verts, faces)
-    samples, snorm, _ = m.get_surface_samples()
+    samples, snorm, swt = m.get_surface_samples()
     betas = np.linspace(0.0, 88.0, 23)
     elevation = 90.0 - betas
     fig = go.Figure()
@@ -242,7 +242,7 @@ def figure_occlusion(path=f"{OUT}/beam_link_occlusion.html"):
         for b in betas:
             d = m.direction_from_beta_alpha(b, az); d = d / np.linalg.norm(d)
             convex.append(float(m.projected_area(d, normals, areas)))
-            raster.append(m.rasterize_silhouette(d, samples, snorm, n_grid=120)["area"])
+            raster.append(m.rasterize_silhouette(d, samples, snorm, swt)["area"])
         fig.add_trace(go.Scatter(x=elevation, y=convex, mode="lines", name=f"{lbl} — convex identity",
                                  line=dict(color=color, dash="dot")))
         fig.add_trace(go.Scatter(x=elevation, y=raster, mode="lines", name=f"{lbl} — rasterized (occluded)",
@@ -265,7 +265,7 @@ def figure_occlusion(path=f"{OUT}/beam_link_occlusion.html"):
 def figure_spot_shape(path=f"{OUT}/beam_link_spot_shape.html"):
     """Silhouette elongation vs elevation, and what a shaped vs round emitter recovers —
     computed with the real overlap model (a fixed 25 m aperture at 250 km, 30 GHz)."""
-    samples, snorm, _ = m.get_surface_samples()
+    samples, snorm, swt = m.get_surface_samples()
     betas = np.linspace(0.0, 88.0, 23)
     elevation = 90.0 - betas
     lam = bl.napkin.SPEED_OF_LIGHT / 30e9
@@ -282,7 +282,7 @@ def figure_spot_shape(path=f"{OUT}/beam_link_spot_shape.html"):
     round_cap, shaped_cap = [], []
     for b in betas:
         d = m.direction_from_beta_alpha(b, 90.0); d = d / np.linalg.norm(d)
-        r = m.rasterize_silhouette(d, samples, snorm, n_grid=120)
+        r = m.rasterize_silhouette(d, samples, snorm, swt)
         round_cap.append(bl.overlap_capture(r, 12.5, lam, 250e3, shaped=False, incidence_floor=1.0)[0])
         shaped_cap.append(bl.overlap_capture(r, 12.5, lam, 250e3, shaped=True, incidence_floor=1.0)[0])
     fig.add_trace(go.Scatter(x=elevation, y=round_cap, mode="lines", name="round emitter",

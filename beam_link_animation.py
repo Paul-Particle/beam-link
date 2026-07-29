@@ -72,8 +72,10 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh):
     look = m.direction_from_beta_alpha(float(beta), float(alpha))
     raster = bl._cached_raster(beta, alpha)
     lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
+    r_recv = bl.receiver_radius_from_silhouette(max(raster["area"], 1e-6))
+    min_waist = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
     _, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant,
-                                           shaped=cfg.shaped_spot,
+                                           shaped=cfg.shaped_spot, min_waist_m=min_waist,
                                            incidence_floor=cfg.incidence_floor, return_field=True)
     eta = float(bl.evaluate(cfg, 10.0)["eta_end_to_end"])
 
@@ -90,21 +92,42 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh):
 
 # --- the animation -----------------------------------------------------------
 
+def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
+    """Size a direct/tether emitter to couple well at a FAR (low-elevation) reference
+    geometry, then keep it fixed — so it reaches the plane out near the horizon and
+    merely defocuses overhead (the opposite of over-focusing to a tiny overhead spot).
+    Relay apertures are left as-is (fixed hardware; defocus handles the near field)."""
+    kw = dict(kw)
+    if kw.get("relay_pos") is not None:
+        return kw
+    dr = float(geo.downrange_for_elevation(ref_elev_deg, plane_alt_m))
+    base = {k: v for k, v in kw.items() if k != "emitter_diam_m"}
+    cfg = bl.LinkConfig(plane_pos=(dr, 0.0, plane_alt_m), emitter_diam_m=None, **base)
+    kw["emitter_diam_m"] = float(bl.evaluate(cfg)["emitter_diam_m"])
+    return kw
+
+
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
-                          station_spacing_km=200.0, plane_alt_m=11_000.0, n_frames=31,
-                          grid_n=70, path=f"{OUT}/beam_link_flyby_animation.html"):
+                          plane_alt_m=11_000.0, min_elevation_deg=2.0, n_half=22,
+                          size_ref_elev_deg=8.0, grid_n=70,
+                          path=f"{OUT}/beam_link_flyby_animation.html"):
     archs = bl.standard_architectures(weather=weather)
     if arch_name not in archs:
         raise KeyError(f"{arch_name!r} not in {list(archs)}")
-    kw = archs[arch_name]
+    kw = _size_emitter_far(archs[arch_name], size_ref_elev_deg, plane_alt_m)
 
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
-    coarse_v, coarse_f = m.make_bwb_mesh(n_span=25, n_theta=16)
+    coarse_v, coarse_f = m.make_bwb_mesh(n_span=41, n_theta=26)
     coarse_n, _ = m.triangle_normals_areas(coarse_v, coarse_f)
     coarse_mesh = (coarse_v, coarse_f, coarse_n)
 
-    half = station_spacing_km * 1e3 / 2.0
-    xs = np.linspace(-half, half, n_frames)
+    # Horizon-to-horizon, sampled uniformly in ELEVATION (dense through the angular
+    # collapse, sparse where little changes) — the plane crosses overhead at x=0.
+    e_half = np.linspace(min_elevation_deg, 90.0, n_half)
+    dr_half = np.array([float(geo.downrange_for_elevation(e, plane_alt_m)) for e in e_half])
+    dr = np.unique(np.round(dr_half, 1))
+    xs = np.unique(np.concatenate([-dr[::-1], dr]))
+    n_frames = xs.size
     frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh) for x in xs]
 
     # Common panel-A extent (stable axes across the pass).
@@ -128,106 +151,115 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         beam_grid = _beam_on_grid(field, f["w0"], f["shaped"], gx, gy)
         return inc_grid, beam_grid
 
-    # Static 3-D geometry (ground arc, cruise + stratosphere levels, station/relay).
-    arc_dr = np.linspace(-half, half, 60)
+    # Static 3-D geometry (ground/cruise/stratosphere arcs; the emitter + its base).
+    half = float(xs.max())
+    arc_dr = np.linspace(-half, half, 90)
     ground = np.array([_localize(d, 0, 0, basis) for d in arc_dr]) / 1e3
     cruise = np.array([_localize(d, 0, plane_alt_m, basis) for d in arc_dr]) / 1e3
     strato = np.array([_localize(d, 0, 20_000.0, basis) for d in arc_dr]) / 1e3
-    w = bl.WEATHER[weather]
-    rain_top_km = w["rain_top_m"] / 1e3
-    station_loc = _localize(0, 0, 0, basis) / 1e3
+    rain_top_m = bl.WEATHER[weather]["rain_top_m"]
+    rain = (np.array([_localize(d, 0, rain_top_m, basis) for d in arc_dr]) / 1e3
+            if rain_top_m > 0 else None)
+
     has_relay = kw.get("relay_pos") is not None
-    relay_loc = frames_phys[0]["emitter_loc"] / 1e3 if has_relay else None
+    emit_dr, emit_cr, emit_alt = kw["relay_pos"] if has_relay else kw["station_pos"]
+    base_loc = _localize(emit_dr, emit_cr, 0.0, basis) / 1e3
+    emitter_loc = _localize(emit_dr, emit_cr, emit_alt, basis) / 1e3
+    lofted = emit_alt > 1.0
+    emit_name = "relay" if has_relay else ("tethered emitter" if lofted else "ground emitter")
 
     eta_series = np.array([f["eta"] for f in frames_phys]) * 100
+    BOX = 45.0                                        # fixed half-extent of panel C (m)
 
-    # ---- assemble base figure ----
     fig = make_subplots(
-        rows=2, cols=2, horizontal_spacing=0.08, vertical_spacing=0.10,
+        rows=2, cols=2, horizontal_spacing=0.08, vertical_spacing=0.11,
         specs=[[{"type": "xy"}, {"type": "scene"}], [{"type": "scene"}, {"type": "xy"}]],
         subplot_titles=("A · beam spot over silhouette (fill = incidence)",
-                        "B · geometry on a spherical earth",
+                        "B · geometry on a spherical earth (vertical exaggerated)",
                         "C · BWB facets by beam incidence",
                         "D · end-to-end η along the pass"))
 
     inc0, beam0 = panel_a_grids(frames_phys[0])
-    # trace 0: silhouette incidence heatmap
+    contour_opts = dict(coloring="lines", showlabels=True, start=0.2, end=0.8, size=0.2,
+                        labelfont=dict(size=9, color="#b30000"))
+    # 0: silhouette incidence heatmap  1: beam contour (labelled = fraction of peak)
     fig.add_trace(go.Heatmap(x=gx, y=gy, z=inc0, colorscale="Viridis", zmin=0, zmax=1,
-                             colorbar=dict(title="incid.", len=0.42, y=0.79, x=0.44),
+                             colorbar=dict(title="incidence", len=0.40, y=0.80, x=0.445),
                              hoverinfo="skip"), row=1, col=1)
-    # trace 1: beam contour (lines)
-    fig.add_trace(go.Contour(x=gx, y=gy, z=beam0, showscale=False, colorscale="Hot",
-                             contours=dict(coloring="lines", start=0.1, end=0.9, size=0.2),
-                             line=dict(width=1.5), hoverinfo="skip"), row=1, col=1)
+    fig.add_trace(go.Contour(x=gx, y=gy, z=beam0, showscale=False, colorscale="Reds",
+                             contours=contour_opts, line=dict(width=1.4), hoverinfo="skip"),
+                  row=1, col=1)
 
-    # traces 2-6: static 3-D geometry
+    # 2-4: arcs   5: rain-top layer   6: base station   7: tether/feed   8: emitter
     fig.add_trace(go.Scatter3d(x=ground[:, 0], y=ground[:, 1], z=ground[:, 2], mode="lines",
-                               line=dict(color="#5b4636", width=4), name="ground",
-                               hoverinfo="skip"), row=1, col=2)
+                               line=dict(color="#5b4636", width=4), name="ground", hoverinfo="skip"), row=1, col=2)
     fig.add_trace(go.Scatter3d(x=cruise[:, 0], y=cruise[:, 1], z=cruise[:, 2], mode="lines",
-                               line=dict(color="#9fb6cd", width=1, dash="dot"), name="11 km cruise",
-                               hoverinfo="skip"), row=1, col=2)
+                               line=dict(color="#9fb6cd", width=1, dash="dot"), name="11 km cruise", hoverinfo="skip"), row=1, col=2)
     fig.add_trace(go.Scatter3d(x=strato[:, 0], y=strato[:, 1], z=strato[:, 2], mode="lines",
-                               line=dict(color="#c9c9ff", width=1, dash="dot"), name="20 km",
-                               hoverinfo="skip"), row=1, col=2)
-    fig.add_trace(go.Scatter3d(x=[station_loc[0]], y=[station_loc[1]], z=[station_loc[2]],
-                               mode="markers", marker=dict(size=5, color="#2ca02c", symbol="square"),
-                               name="station", hoverinfo="skip"), row=1, col=2)
-    if has_relay:
-        fig.add_trace(go.Scatter3d(x=[relay_loc[0]], y=[relay_loc[1]], z=[relay_loc[2]],
-                                   mode="markers", marker=dict(size=5, color="#ff7f0e", symbol="diamond"),
-                                   name="relay", hoverinfo="skip"), row=1, col=2)
+                               line=dict(color="#c9c9ff", width=1, dash="dot"), name="20 km", hoverinfo="skip"), row=1, col=2)
+    if rain is not None:
+        fig.add_trace(go.Scatter3d(x=rain[:, 0], y=rain[:, 1], z=rain[:, 2], mode="lines",
+                                   line=dict(color="#4a90d9", width=6), opacity=0.4,
+                                   name=f"rain top ({weather})", hoverinfo="skip"), row=1, col=2)
     else:
-        fig.add_trace(go.Scatter3d(x=[station_loc[0]], y=[station_loc[1]], z=[station_loc[2]],
-                                   mode="markers", marker=dict(size=0.1, opacity=0),
+        fig.add_trace(go.Scatter3d(x=[None], y=[None], z=[None], mode="lines",
                                    showlegend=False, hoverinfo="skip"), row=1, col=2)
+    fig.add_trace(go.Scatter3d(x=[base_loc[0]], y=[base_loc[1]], z=[base_loc[2]], mode="markers",
+                               marker=dict(size=5, color="#2ca02c", symbol="square"),
+                               name="base station", hoverinfo="skip"), row=1, col=2)
+    tether_x = [base_loc[0], emitter_loc[0]] if lofted else [None]
+    tether_y = [base_loc[1], emitter_loc[1]] if lofted else [None]
+    tether_z = [base_loc[2], emitter_loc[2]] if lofted else [None]
+    fig.add_trace(go.Scatter3d(x=tether_x, y=tether_y, z=tether_z, mode="lines",
+                               line=dict(color="#7f7f7f", width=3, dash="dot"),
+                               name="tether / feed", showlegend=lofted, hoverinfo="skip"), row=1, col=2)
+    fig.add_trace(go.Scatter3d(
+        x=[emitter_loc[0]] if lofted else [None], y=[emitter_loc[1]] if lofted else [None],
+        z=[emitter_loc[2]] if lofted else [None], mode="markers",
+        marker=dict(size=6, color="#ff7f0e", symbol="diamond"),
+        name=emit_name, showlegend=lofted, hoverinfo="skip"), row=1, col=2)
 
-    # trace 7: plane marker (animated); trace 8: beam line (animated)
+    # 9: plane marker (anim)  10: beam line (anim)
     p0 = frames_phys[0]["plane_loc"] / 1e3
-    e0 = frames_phys[0]["emitter_loc"] / 1e3
     fig.add_trace(go.Scatter3d(x=[p0[0]], y=[p0[1]], z=[p0[2]], mode="markers",
-                               marker=dict(size=5, color="#d62728"), name="plane",
-                               hoverinfo="skip"), row=1, col=2)
-    fig.add_trace(go.Scatter3d(x=[e0[0], p0[0]], y=[e0[1], p0[1]], z=[e0[2], p0[2]], mode="lines",
-                               line=dict(color="#d62728", width=3), name="beam",
-                               hoverinfo="skip"), row=1, col=2)
+                               marker=dict(size=5, color="#d62728"), name="plane", hoverinfo="skip"), row=1, col=2)
+    fig.add_trace(go.Scatter3d(x=[emitter_loc[0], p0[0]], y=[emitter_loc[1], p0[1]],
+                               z=[emitter_loc[2], p0[2]], mode="lines",
+                               line=dict(color="#d62728", width=3), name="beam", hoverinfo="skip"), row=1, col=2)
 
-    # trace 9: BWB mesh coloured by incidence (animated); trace 10: beam arrow (animated)
+    # 11: BWB mesh by incidence (anim)  12: beam-arrival arrow (anim, fixed length)
     fig.add_trace(go.Mesh3d(x=coarse_v[:, 0], y=coarse_v[:, 1], z=coarse_v[:, 2],
                             i=coarse_f[:, 0], j=coarse_f[:, 1], k=coarse_f[:, 2],
                             intensity=frames_phys[0]["face_incidence"], intensitymode="cell",
-                            colorscale="Viridis", cmin=0, cmax=1, showscale=False,
+                            colorscale="Viridis", cmin=0, cmax=1,
+                            colorbar=dict(title="incidence", len=0.40, y=0.20, x=0.445),
                             flatshading=True, name="BWB", hoverinfo="skip"), row=2, col=1)
     look0 = frames_phys[0]["look"]
-    fig.add_trace(go.Scatter3d(x=[look0[0] * 60, look0[0] * 22], y=[look0[1] * 60, look0[1] * 22],
-                               z=[look0[2] * 60, look0[2] * 22], mode="lines",
-                               line=dict(color="#d62728", width=5), name="beam→",
+    fig.add_trace(go.Scatter3d(x=[look0[0] * 40, look0[0] * 15], y=[look0[1] * 40, look0[1] * 15],
+                               z=[look0[2] * 40, look0[2] * 15], mode="lines",
+                               line=dict(color="#d62728", width=6), name="beam→",
                                showlegend=False, hoverinfo="skip"), row=2, col=1)
 
-    # trace 11: η profile (static); trace 12: current marker (animated)
+    # 13: η profile (static)  14: current marker (anim)
     fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines",
-                             line=dict(color="#1f77b4", width=2), showlegend=False,
-                             hoverinfo="skip"), row=2, col=2)
+                             line=dict(color="#1f77b4", width=2), showlegend=False, hoverinfo="skip"), row=2, col=2)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
-                             marker=dict(size=10, color="#d62728"), showlegend=False,
-                             hoverinfo="skip"), row=2, col=2)
+                             marker=dict(size=10, color="#d62728"), showlegend=False, hoverinfo="skip"), row=2, col=2)
 
-    ANIMATED = [0, 1, 7, 8, 9, 10, 12]
-
+    ANIMATED = [0, 1, 9, 10, 11, 12, 14]
     frames = []
     for k, f in enumerate(frames_phys):
         inc_g, beam_g = panel_a_grids(f)
         p = f["plane_loc"] / 1e3
-        e = f["emitter_loc"] / 1e3
         look = f["look"]
         frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
             go.Heatmap(x=gx, y=gy, z=inc_g),
             go.Contour(x=gx, y=gy, z=beam_g),
             go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
-            go.Scatter3d(x=[e[0], p[0]], y=[e[1], p[1]], z=[e[2], p[2]]),
+            go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
             go.Mesh3d(intensity=f["face_incidence"], intensitymode="cell"),
-            go.Scatter3d(x=[look[0] * 60, look[0] * 22], y=[look[1] * 60, look[1] * 22],
-                         z=[look[2] * 60, look[2] * 22]),
+            go.Scatter3d(x=[look[0] * 40, look[0] * 15], y=[look[1] * 40, look[1] * 15],
+                         z=[look[2] * 40, look[2] * 15]),
             go.Scatter(x=[xs[k] / 1e3], y=[eta_series[k]]),
         ]))
     fig.frames = frames
@@ -236,32 +268,41 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
     fig.update_layout(
-        sliders=[dict(active=0, y=-0.02, x=0.05, len=0.9, currentvalue=dict(
-            prefix="along-track: ", suffix=" km"), steps=steps)],
-        updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.08, xanchor="right",
+        sliders=[dict(active=0, y=-0.04, x=0.05, len=0.9,
+                      currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)],
+        updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.02, xanchor="right",
                           buttons=[dict(label="▶ play", method="animate",
-                                        args=[None, dict(frame=dict(duration=120, redraw=True),
+                                        args=[None, dict(frame=dict(duration=110, redraw=True),
                                                          fromcurrent=True, mode="immediate")]),
                                    dict(label="❚❚ pause", method="animate",
                                         args=[[None], dict(frame=dict(duration=0, redraw=False),
                                                            mode="immediate")])])])
 
-    # panel A square + metres; D axes; 3-D scenes framed to show curvature
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1, row=1, col=1)
     fig.update_yaxes(title_text="v (m)", row=1, col=1)
     fig.update_xaxes(title_text="along-track (km)", row=2, col=2)
     fig.update_yaxes(title_text="η end-to-end (%)", rangemode="tozero", row=2, col=2)
+    # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates
+    # the vertical so the arc is visible over the ±few-hundred-km span (horizontal 1:1).
     fig.update_scenes(dict(xaxis_title="downrange (km)", yaxis_title="cross (km)",
-                           zaxis_title="altitude (km)", aspectmode="manual",
-                           aspectratio=dict(x=3, y=0.5, z=1),
-                           camera=dict(eye=dict(x=0.2, y=-2.4, z=0.6))), row=1, col=2)
-    fig.update_scenes(dict(aspectmode="data",
-                           camera=dict(eye=dict(x=1.4, y=-1.4, z=1.1))), row=2, col=1)
+                           zaxis_title="altitude (km, exaggerated)", aspectmode="manual",
+                           aspectratio=dict(x=4.0, y=0.25, z=1.0),
+                           camera=dict(eye=dict(x=0.1, y=-2.4, z=0.45), up=dict(x=0, y=0, z=1))),
+                      row=1, col=2)
+    # Panel C: FIXED box so it never rescales as the beam arrow swings.
+    fig.update_scenes(dict(xaxis=dict(range=[-BOX, BOX], title="nose (m)"),
+                           yaxis=dict(range=[-BOX, BOX], title="span (m)"),
+                           zaxis=dict(range=[-BOX, BOX], title="vert (m)"),
+                           aspectmode="cube",
+                           camera=dict(eye=dict(x=1.4, y=-1.4, z=1.0))), row=2, col=1)
+    fig.add_annotation(x=0.5, y=1.0, xref="x domain", yref="y domain", row=1, col=1,
+                       text="red contours = beam intensity (fraction of peak)",
+                       showarrow=False, font=dict(size=9, color="#b30000"))
     fig.update_layout(
-        template="plotly_white", height=880, width=1350,
-        title=(f"Flyby animation — {arch_name}, {weather} weather, "
-               f"{station_spacing_km:.0f} km spacing (drag the slider or press play)"),
-        legend=dict(x=0.46, y=0.98, font=dict(size=10)))
+        template="plotly_white", height=900, width=1350,
+        title=(f"Flyby animation — {arch_name}, {weather} weather, horizon-to-horizon "
+               f"(±{half/1e3:.0f} km, dense at low elevation; drag the slider or press play)"),
+        legend=dict(orientation="h", y=1.07, x=0.5, xanchor="center", font=dict(size=10)))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline", auto_play=False)
     return path

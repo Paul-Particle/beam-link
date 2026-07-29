@@ -47,7 +47,7 @@ def _cuboid(center, size):
 
 def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
                   root_thickness_m=6.0, tip_thickness_m=0.4, sweep_m=25.0,
-                  body_fraction=0.25, n_span=61, n_theta=28,
+                  body_fraction=0.25, n_span=71, n_theta=40,
                   winglet_height_m=6.0, winglet_chord_m=14.0, winglet_thickness_m=0.6):
     """A blended-wing-body as a closed lofted lens, optionally with wingtip winglets.
 
@@ -203,14 +203,22 @@ def _view_basis(look_dir):
     return u, v, w
 
 
-def rasterize_silhouette(look_dir, samples, sample_normals, n_grid=120):
-    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter).
+def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
+                         n_grid=150, depth_tol_m=1.0):
+    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter), as a set
+    of VISIBLE surface samples — a Monte-Carlo estimate, not a cell-count.
 
-    Projects the front-facing samples onto the view plane, bins them, and keeps the
-    sample nearest the emitter in each cell (z-buffer). Returns the covered cells'
-    (u, v) centres in metres, their incidence cosine (n̂·ŵ), the physical cell area,
-    and the true occluded silhouette area. All in the view plane, centred on the
-    silhouette centroid so a beam can be laid straight on top."""
+    Each front-facing sample carries its surface-area weight; its projected-area
+    contribution is `weight·(n̂·ŵ)`. A sample is *occluded* (dropped) if another
+    front-facing sample in its view-plane grid cell is nearer the emitter by more than
+    `depth_tol_m` — so a winglet behind the wing, or the far wing behind the body, is
+    removed, while co-located skin at the same depth is kept. The grid is only an
+    occlusion hash, so the returned area/overlap are **grid-independent** (they
+    converge with sample count, unlike counting covered cells × cell area).
+
+    Returns view-plane coords (u, v, metres, centred on the projected-area centroid),
+    per-sample incidence cosine, per-sample projected area `proj_area`, and the total
+    self-occluded silhouette area (= Σ proj_area)."""
     u_ax, v_ax, w_ax = _view_basis(look_dir)
     incidence = sample_normals @ w_ax
     front = incidence > 1e-6                          # skin facing the emitter
@@ -218,31 +226,26 @@ def rasterize_silhouette(look_dir, samples, sample_normals, n_grid=120):
     V = samples[front] @ v_ax
     depth = samples[front] @ w_ax                     # larger = nearer the emitter
     inc = incidence[front]
+    wt = sample_weights[front]
     if U.size == 0:
         return dict(u=np.array([]), v=np.array([]), incidence=np.array([]),
-                    cell_area=0.0, area=0.0, n_grid=n_grid)
+                    proj_area=np.array([]), area=0.0, n_grid=n_grid)
 
-    u_lo, u_hi = U.min(), U.max()
-    v_lo, v_hi = V.min(), V.max()
-    span_u = max(u_hi - u_lo, 1e-6)
-    span_v = max(v_hi - v_lo, 1e-6)
+    u_lo, u_hi, v_lo, v_hi = U.min(), U.max(), V.min(), V.max()
+    span_u, span_v = max(u_hi - u_lo, 1e-6), max(v_hi - v_lo, 1e-6)
     iu = np.clip(((U - u_lo) / span_u * (n_grid - 1)).astype(int), 0, n_grid - 1)
     iv = np.clip(((V - v_lo) / span_v * (n_grid - 1)).astype(int), 0, n_grid - 1)
     cell = iu * n_grid + iv
 
-    # z-buffer: for each occupied cell keep the sample with the greatest depth.
-    order = np.argsort(depth)[::-1]                   # nearest-first
-    cell_sorted, inc_sorted = cell[order], inc[order]
-    uniq_cell, first = np.unique(cell_sorted, return_index=True)
-    inc_cell = inc_sorted[first]
+    cell_max_depth = np.full(n_grid * n_grid, -np.inf)
+    np.maximum.at(cell_max_depth, cell, depth)
+    visible = depth >= cell_max_depth[cell] - depth_tol_m
 
-    du, dv = span_u / (n_grid - 1), span_v / (n_grid - 1)
-    cu = u_lo + (uniq_cell // n_grid) * du
-    cv = v_lo + (uniq_cell % n_grid) * dv
-    cell_area = du * dv
-    area = uniq_cell.size * cell_area
-    return dict(u=cu - cu.mean(), v=cv - cv.mean(), incidence=inc_cell,
-                cell_area=cell_area, area=area, n_grid=n_grid)
+    U, V, inc, proj = U[visible], V[visible], inc[visible], (wt[visible] * inc[visible])
+    cu = np.sum(U * proj) / max(proj.sum(), 1e-12)
+    cv = np.sum(V * proj) / max(proj.sum(), 1e-12)
+    return dict(u=U - cu, v=V - cv, incidence=inc, proj_area=proj,
+                area=float(proj.sum()), n_grid=n_grid)
 
 
 # Cached sample cloud for the default airframe.
