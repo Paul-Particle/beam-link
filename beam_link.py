@@ -208,16 +208,63 @@ def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
                                                      incidence=incidence, polarization=pol)
 
 
+def spot_match_from_aspect(aspect_ratio, shaped=False, fill=0.90):
+    """Physically-grounded spot-match efficiency from the silhouette's elongation.
+
+    A ROUND emitter makes a round spot; to cover an elongated silhouette (major:minor
+    = aspect) it must span the major axis, wasting the corners → overlap ≈ minor/major
+    = 1/aspect (times a soft-edge `fill`). A SHAPE-MATCHED (elliptical) emitter — which
+    a phased array can synthesise and re-orient electronically — recovers to `fill`.
+    This is the honest version of the constant `spot_match` knob."""
+    aspect = np.maximum(aspect_ratio, 1.0)
+    return fill if shaped else fill / aspect
+
+
+# --- Device-efficiency scenarios ---------------------------------------------
+# The DC→RF PAE falls with frequency in TODAY's GaN devices, but much of that gap is
+# market/maturity, not physics — if the concept creates demand for efficient 10-30 GHz
+# amplifiers, it narrows. So treat the PAE(f) slope as a scenario, not a law. Anchors
+# are PAE at (5.8 GHz, 34.8 GHz), #(verify).
+PAE_SCENARIOS = {
+    "today":  (0.65, 0.40),   # current saturated-CW GaN literature
+    "medium": (0.68, 0.55),   # a decade of dedicated high-band development
+    "flat":   (0.65, 0.65),   # device parity across bands — isolates geometry+weather
+}
+
+
+def pae_dc_to_rf(frequency_ghz, scenario="today"):
+    """GaN power-amplifier PAE vs frequency under a named device scenario."""
+    lo, hi = PAE_SCENARIOS[scenario]
+    slope = (hi - lo) / (34.8 - 5.8)
+    return np.clip(lo + slope * (np.asarray(frequency_ghz, dtype=float) - 5.8),
+                   min(lo, hi) - 0.05, 0.9)
+
+
+def eta_grid_to_rf(frequency_ghz, scenario="today", eta_ac_dc=0.98):
+    """Station grid→RF = SiC AC/DC front end (mature ~0.98) × GaN PA PAE(f, scenario)."""
+    return eta_ac_dc * pae_dc_to_rf(frequency_ghz, scenario)
+
+
 def relay_convert_efficiency(f_in_ghz, f_out_ghz, mode="active", reflectarray_reflectivity=0.90,
-                             surface_error_frac=1 / 50):
+                             surface_error_frac=1 / 50, stage_efficiency=0.70,
+                             pae_scenario="today"):
     """Relay conversion efficiency.
-      active  : rectify the incoming RF (RF→DC at f_in) then re-amplify (DC→RF PAE at
-                f_out). The relay runs off its own rectified DC, so only the PA's PAE
-                applies on the re-emit side — NOT the grid AC/DC front-end stage.
-      passive : reflectarray reflectivity × Ruze surface-tolerance loss at f_in; no
-                frequency change (caller must set f_out = f_in)."""
+      active     : rectify the incoming RF (RF→DC at f_in) then re-amplify (DC→RF PAE
+                   at f_out). Runs off its own rectified DC, so only the PA's PAE
+                   applies on re-emit — NOT the grid AC/DC stage.
+      multiplier : a (more-or-less) PASSIVE nonlinear-reactance harmonic multiplier
+                   (Manley-Rowe permits ~100% for an ideal reactance; realized as ×2 /
+                   ×2·×3 stages at `stage_efficiency` each, from napkin.cascade_efficiency)
+                   × an aperture/coupling factor. Up-converts 5.8→n·5.8 with NO
+                   rectify+re-amp cliff. f_out sets the harmonic order.
+      passive    : reflectarray reflectivity × Ruze surface-tolerance loss; no frequency
+                   change (caller must set f_out = f_in)."""
     if mode == "active":
-        return napkin.rectenna_efficiency_band(f_in_ghz) * napkin.pae_dc_to_rf(f_out_ghz)
+        return napkin.rectenna_efficiency_band(f_in_ghz) * pae_dc_to_rf(f_out_ghz, pae_scenario)
+    if mode == "multiplier":
+        order = napkin.multiplier_factor_prime(f_in_ghz, f_out_ghz)
+        chain, _ = napkin.cascade_efficiency(order, stage_efficiency)
+        return reflectarray_reflectivity * chain
     ruze = np.exp(-((4 * np.pi * surface_error_frac) ** 2))
     return reflectarray_reflectivity * ruze
 
@@ -293,9 +340,11 @@ class LinkConfig:
     f_emit_relay_ghz: float = 5.8                  # station→relay (weather-robust up)
     f_relay_plane_ghz: float = 30.0                # relay→plane (small plane aperture)
 
-    relay_mode: str = "active"                     # "active" | "passive"
+    relay_mode: str = "active"                     # "active" | "multiplier" | "passive"
     relay_aperture_diam_m: float = 60.0            # relay receive/transmit aperture
+    relay_stage_efficiency: float = 0.70           # per-stage eff of a multiplier relay
     weather: str = "clear"
+    pae_scenario: str = "today"                    # "today" | "medium" | "flat"
 
     # Emitter aperture: fixed physical diameter (m) if given, else sized to tau_target
     # per geometry. A real station's emitter is FIXED, so capture DROPS at low
@@ -348,7 +397,7 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
         rect, rect_parts = rectenna_derate(f, beta, cfg.polarization, roll,
                                            cfg.spot_match, cfg.incidence_floor)
         point = pointing_efficiency(cfg.pointing_error_m, r_recv)
-        eta_dc_rf = napkin.eta_grid_to_rf_band(f)
+        eta_dc_rf = eta_grid_to_rf(f, cfg.pae_scenario)
 
         stages = dict(
             architecture="direct",
@@ -375,11 +424,13 @@ def evaluate(cfg: LinkConfig, delivered_mw=None):
         h2 = hop(atmos, f2, relay, plane, r_recv, cfg.weather, cfg.tau_target,
                  error_efficiency=cfg.emitter_error_efficiency)
 
-        convert = relay_convert_efficiency(f1, f2, cfg.relay_mode)
+        convert = relay_convert_efficiency(f1, f2, cfg.relay_mode,
+                                           stage_efficiency=cfg.relay_stage_efficiency,
+                                           pae_scenario=cfg.pae_scenario)
         rect, rect_parts = rectenna_derate(f2, beta, cfg.polarization, roll,
                                            cfg.spot_match, cfg.incidence_floor)
         point = pointing_efficiency(cfg.pointing_error_m, r_recv)
-        eta_dc_rf = napkin.eta_grid_to_rf_band(f1)
+        eta_dc_rf = eta_grid_to_rf(f1, cfg.pae_scenario)
 
         stages = dict(
             architecture=f"relay-{cfg.relay_mode}",

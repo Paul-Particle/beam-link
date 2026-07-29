@@ -30,16 +30,34 @@ import numpy as np
 
 # --- Parametric mesh ----------------------------------------------------------
 
+def _cuboid(center, size):
+    """Axis-aligned closed box (8 verts, 12 triangles) — used for winglets/fins.
+    Returned as a thin closed slab so the convex projected-area identity gives its
+    correct |n̂·d|·A projection."""
+    cx, cy, cz = center
+    sx, sy, sz = np.array(size) / 2.0
+    v = np.array([[cx - sx, cy - sy, cz - sz], [cx + sx, cy - sy, cz - sz],
+                  [cx + sx, cy + sy, cz - sz], [cx - sx, cy + sy, cz - sz],
+                  [cx - sx, cy - sy, cz + sz], [cx + sx, cy - sy, cz + sz],
+                  [cx + sx, cy + sy, cz + sz], [cx - sx, cy + sy, cz + sz]])
+    f = np.array([[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6], [0, 4, 5], [0, 5, 1],
+                  [1, 5, 6], [1, 6, 2], [2, 6, 7], [2, 7, 3], [3, 7, 4], [3, 4, 0]])
+    return v, f
+
+
 def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
                   root_thickness_m=6.0, tip_thickness_m=0.4, sweep_m=25.0,
-                  body_fraction=0.25, n_span=61, n_theta=28):
-    """A blended-wing-body as a closed lofted lens.
+                  body_fraction=0.25, n_span=61, n_theta=28,
+                  winglet_height_m=6.0, winglet_chord_m=14.0, winglet_thickness_m=0.6):
+    """A blended-wing-body as a closed lofted lens, optionally with wingtip winglets.
 
     Spanwise the chord and thickness are constant over the centre body
     (`body_fraction` of the half-span) then taper to the tip; the leading edge
     sweeps aft by `sweep_m` from root to tip. Each spanwise station's cross-section
     (in the length–thickness plane) is an ellipse, so the body is a smooth closed
-    surface. Returns (vertices (N,3), faces (M,3) int)."""
+    surface. Vertical winglets at the tips (set `winglet_height_m=0` to omit) present
+    receiving area at low elevation, exactly where the belly silhouette collapses.
+    Returns (vertices (N,3), faces (M,3) int)."""
     half_span = full_span_m / 2.0
     u = np.linspace(-1.0, 1.0, n_span)              # spanwise fraction (−1..1)
     au = np.abs(u)
@@ -52,11 +70,11 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
     psi = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
     cos_psi, sin_psi = np.cos(psi), np.sin(psi)
 
-    # Vertex grid: (n_span, n_theta, 3)
+    # Vertex grid: (n_span, n_theta, 3) in body axes x̂=nose, ŷ=starboard, ẑ=vertical.
     verts = np.empty((n_span, n_theta, 3))
-    verts[..., 0] = x_span[:, None]
-    verts[..., 1] = y_center[:, None] + (chord[:, None] / 2.0) * cos_psi[None, :]
-    verts[..., 2] = (thickness[:, None] / 2.0) * sin_psi[None, :]
+    verts[..., 0] = y_center[:, None] + (chord[:, None] / 2.0) * cos_psi[None, :]   # nose-tail
+    verts[..., 1] = x_span[:, None]                                                 # span
+    verts[..., 2] = (thickness[:, None] / 2.0) * sin_psi[None, :]                   # vertical
 
     vertices = verts.reshape(-1, 3)
 
@@ -80,7 +98,19 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
             a, b = vid(i, j), vid(i, j + 1)
             faces.append((c_idx, a, b) if i == 0 else (c_idx, b, a))
 
-    return vertices, np.asarray(faces, dtype=int)
+    faces = np.asarray(faces, dtype=int)
+
+    # Wingtip winglets: streamwise vertical fins (thin in span, extended chord×height).
+    # They present area to a SIDE aspect at low elevation — where the belly collapses.
+    if winglet_height_m > 0:
+        tip_x = -sweep_m                                   # nose-tail centre of the swept tip
+        for y_tip in (-full_span_m / 2.0, full_span_m / 2.0):
+            wv, wf = _cuboid((tip_x, y_tip, winglet_height_m / 2.0),
+                             (winglet_chord_m, winglet_thickness_m, winglet_height_m))
+            faces = np.vstack([faces, wf + len(vertices)])
+            vertices = np.vstack([vertices, wv])
+
+    return vertices, faces
 
 
 def triangle_normals_areas(vertices, faces):
@@ -115,6 +145,24 @@ def direction_from_beta_alpha(beta_deg, alpha_deg):
     return np.stack([np.sin(b) * np.cos(a),      # nose  (x̂)
                      np.sin(b) * np.sin(a),      # starboard (ŷ)
                      np.cos(b)], axis=-1)         # belly (ẑ)
+
+
+def silhouette_aspect(beta_deg, alpha_deg, mesh_kwargs=None):
+    """Aspect ratio (major/minor extent) of the projected silhouette outline for a
+    beam-arrival direction — the shape-elongation the emitter's spot must match.
+    PCA on the projected vertices; scalar inputs. Returns (aspect, major_m, minor_m)."""
+    verts, _ = make_bwb_mesh(**(mesh_kwargs or {}))
+    d = direction_from_beta_alpha(float(beta_deg), float(alpha_deg))
+    d = d / np.linalg.norm(d)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(d, ref); e1 /= np.linalg.norm(e1)
+    e2 = np.cross(d, e1)
+    pts = np.stack([verts @ e1, verts @ e2], axis=1)
+    pts = pts - pts.mean(0)
+    eigval, eigvec = np.linalg.eigh(np.cov(pts.T))
+    extents = np.ptp(pts @ eigvec, axis=0)
+    minor, major = np.sort(extents)
+    return major / max(minor, 1e-6), major, minor
 
 
 # --- Lookup table -------------------------------------------------------------

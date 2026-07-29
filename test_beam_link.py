@@ -191,8 +191,11 @@ def test_pass_profile():
     left = p["deliverable_mw"][p["alongtrack_km"] < 0]
     right = p["deliverable_mw"][p["alongtrack_km"] > 0][::-1]
     n = min(len(left), len(right))
-    check("pass profile symmetric about overhead",
-          np.allclose(left[-n:], right[:n], rtol=0.02))
+    # Only APPROXIMATELY symmetric: the swept wing + aft winglets make nose-on and
+    # tail-on differ by a few %.
+    asym = np.max(np.abs(left[-n:] - right[:n]) / np.maximum(right[:n], 1e-9))
+    check("pass profile ~symmetric about overhead (swept-wing asymmetry small)",
+          asym < 0.08, f"max fore/aft asymmetry {100*asym:.1f}%")
 
     # A larger emitter (built for a lower reference elevation) widens the window.
     def window_km(ref):
