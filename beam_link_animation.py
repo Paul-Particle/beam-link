@@ -30,6 +30,31 @@ import geo
 
 OUT = "out"
 
+# Custom play button. Plotly's native sequenced animation only redraws Heatmap/Waterfall on
+# the FIRST frame of the sequence (the rest skip the full redraw), so A/E/F freeze during
+# play. This stepper instead fires ONE single-frame `Plotly.animate([k], redraw:true)` per
+# tick — the path that DOES redraw every trace — chained on each animate's promise so it
+# paces to the render and never backs up. The frame count is injected (`{n_frames}`) because
+# `gd.frames` isn't populated yet when this runs; `{plot_id}` is substituted by write_html.
+_PLAYER_JS = """
+var gd = document.getElementById("{plot_id}");
+var N = {n_frames};
+var cur = 0, playing = false, timer = null;
+var cfg = {mode: 'immediate', frame: {duration: 0, redraw: true}, transition: {duration: 0}};
+function step(k) { return Plotly.animate(gd, [String(k)], cfg).then(function(){ cur = k; }); }
+function loop() { if (!playing) return; step((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 20); }); }
+var btn = document.createElement('button');
+btn.textContent = '\\u25B6 play';
+btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;';
+function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
+function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
+btn.onclick = function(){ playing ? pause() : play(); };
+var host = gd.parentNode || gd;
+if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+host.appendChild(btn);
+gd.on('plotly_sliderchange', function(e){ if (e && e.slider) cur = e.slider.active | 0; });
+"""
+
 
 def _box_sum(a, r):
     """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
@@ -455,24 +480,16 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ]))
     fig.frames = frames
 
-    # Uniform frame spacing = uniform time at constant speed. Transition duration MUST be 0:
-    # Heatmap/Waterfall traces can't be tweened, and a non-zero transition skips their
-    # redraw (leaving A/E/F frozen on frame 0) while only the scatter markers move.
-    dt_ms = 70
+    # Slider steps redraw a SINGLE frame (mode immediate, redraw True) — the one path that
+    # reliably redraws Heatmap/Waterfall. Plotly's NATIVE sequenced play only honours redraw
+    # on the first frame of the sequence (subsequent frames skip the full redraw, freezing
+    # A/E/F), so the play button is a custom stepper injected below instead of updatemenus.
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
     fig.update_layout(
-        sliders=[dict(active=0, y=-0.04, x=0.05, len=0.9,
-                      currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)],
-        updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.02, xanchor="right",
-                          buttons=[dict(label="▶ play", method="animate",
-                                        args=[None, dict(frame=dict(duration=dt_ms, redraw=True),
-                                                         transition=dict(duration=0),
-                                                         fromcurrent=True, mode="immediate")]),
-                                   dict(label="❚❚ pause", method="animate",
-                                        args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                                           mode="immediate")])])])
+        sliders=[dict(active=0, y=-0.04, x=0.10, len=0.85,
+                      currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)])
 
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
                      range=[-EXT, EXT], row=1, col=1)
@@ -512,7 +529,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     os.makedirs(OUT, exist_ok=True)
-    fig.write_html(path, include_plotlyjs="inline", auto_play=False)
+    fig.write_html(path, include_plotlyjs="inline", auto_play=False,
+                   post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
     return path
 
 
