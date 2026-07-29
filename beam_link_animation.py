@@ -57,6 +57,43 @@ def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     return beam.reshape(uu.shape)
 
 
+_SIL_EXTENT = None
+
+
+def max_silhouette_extent():
+    """Largest half-extent (m) of the plane's silhouette over a full β/α sweep — a
+    property of the airframe, so the SAME fixed value can frame panel A across every run,
+    making silhouettes directly comparable. Cached."""
+    global _SIL_EXTENT
+    if _SIL_EXTENT is None:
+        samples, snorm, swt = m.get_surface_samples()
+        e = 0.0
+        for beta in range(0, 91, 10):
+            for alpha in range(0, 181, 30):
+                d = m.direction_from_beta_alpha(beta, alpha); d = d / np.linalg.norm(d)
+                r = m.rasterize_silhouette(d, samples, snorm, swt)
+                if r["u"].size:
+                    e = max(e, float(np.abs(r["u"]).max()), float(np.abs(r["v"]).max()))
+        _SIL_EXTENT = e
+    return _SIL_EXTENT
+
+
+def _beam_channel(distance_norm, radial, slant_m, max_slant_m, emitter_radius_m, w0, order):
+    """Intensity of the CONVERGING beam over a side view: y = along-beam distance (fraction
+    of the pass's max slant), x = radial offset. The spot tapers from the emitter aperture
+    (radius r_t at the emitter) to the focused waist w0 at the plane (distance = slant), so
+    the beam is an hourglass narrowing onto the aircraft. Intensity ∝ 1/w(s)² (brightens as
+    it focuses); NaN beyond the plane (no beam past the focus)."""
+    C = bl.supergaussian_area_factor(order)
+    dd, rr = np.meshgrid(distance_norm, radial, indexing="ij")   # (n_dist, n_radial)
+    s = dd * max_slant_m
+    frac = np.clip(s / max(slant_m, 1e-6), 0.0, 1.0)
+    w = emitter_radius_m + (w0 - emitter_radius_m) * frac
+    inten = np.exp(-2.0 * (rr ** 2 / w ** 2) ** order) / (np.pi * w ** 2 * C)
+    inten[s > slant_m] = np.nan                          # nothing past the plane
+    return inten
+
+
 def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
                    lateral_offset_m=0.0, delivered_mw=10.0):
     """Everything one frame needs, for one plane position of one architecture."""
@@ -89,6 +126,20 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
                                              profile_order=order, return_field=True)
     wf = bl.waterfall(s)                              # [(stage label, efficiency), ...]
 
+    # Orient panel A so the aircraft's DORSAL direction (−ẑ body = "up") points up in the
+    # view — otherwise the view basis is arbitrary and the (small, dorsal) winglets can
+    # project downward, disagreeing with panel C. Rotate the silhouette coords in-plane;
+    # the beam is re-derived from them downstream, so it rotates consistently.
+    u_ax, v_ax, _ = m._view_basis(look)
+    up_u, up_v = float(np.array([0, 0, -1.0]) @ u_ax), float(np.array([0, 0, -1.0]) @ v_ax)
+    if np.hypot(up_u, up_v) > 1e-3 and field["u"].size:
+        phi = np.pi / 2.0 - np.arctan2(up_v, up_u)
+        cph, sph = np.cos(phi), np.sin(phi)
+        U, V = field["u"], field["v"]
+        field = dict(field, u=cph * U - sph * V, v=sph * U + cph * V)
+    sil_radial_m = (float(np.abs(np.concatenate([field["u"], field["v"]])).max())
+                    if field["u"].size else 0.0)
+
     verts, faces, normals = coarse_mesh
     face_incidence = np.clip(normals @ look, 0.0, 1.0)
 
@@ -96,6 +147,7 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     emitter_loc = _localize(emitter[0], emitter[1], emitter[2], basis)
     return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=order,
                 geom=geom, eff=eff, eta=eta, elevation=float(elevation), slant_km=slant / 1e3,
+                slant_m=float(slant), emitter_radius_m=float(diam / 2.0), sil_radial_m=sil_radial_m,
                 beta=float(beta), area=raster["area"], look=look, face_incidence=face_incidence,
                 plane_loc=plane_loc, emitter_loc=emitter_loc,
                 wf_labels=[lbl for lbl, _ in wf], wf_values=[v for _, v in wf])
@@ -120,8 +172,8 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
-                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=180,
-                          path=f"{OUT}/beam_link_flyby_animation.html"):
+                          n_frames=81, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
+                          scatter_n=4000, path=f"{OUT}/beam_link_flyby_animation.html"):
     archs = bl.standard_architectures(weather=weather)
     if arch_name not in archs:
         raise KeyError(f"{arch_name!r} not in {list(archs)}")
@@ -141,46 +193,37 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh,
                                   lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
 
-    def frame_extent(f):
-        """Half-width of panel A for THIS frame: enough to show the beam's 0.2-of-peak
-        contour AND the whole silhouette. PER-FRAME (not a shared max) — otherwise the
-        far-out frames' huge defocused waist sets a giant fixed window and every overhead
-        frame collapses to an invisible central dot (the 'panel A empty' bug)."""
-        sil = (np.abs(np.concatenate([f["field"]["u"], f["field"]["v"]])).max()
-               if f["field"]["u"].size else 0.0)
-        return max(1.3 * f["w0"], sil) * 1.15
+    # FIXED panel-A window = the airframe's max silhouette extent (same every frame AND
+    # every run, so silhouettes compare directly). 1:1 aspect via scaleanchor below.
+    EXT = max_silhouette_extent() * 1.08
+    gx = np.linspace(-EXT, EXT, grid_n)
+    gy = np.linspace(-EXT, EXT, grid_n)
 
-    def panel_a_grids(f):
-        """Silhouette incidence (NaN outside) + the beam's ENCIRCLED-ENERGY field, on a
-        per-frame grid. The encircled field at a cell = the fraction of total beam energy
-        carried by all cells at least as bright — so contours of it at 0.1…0.9 are rings
-        enclosing that fraction of the delivered energy (centre ≈ 0, spilling out to 1).
-        Returns the grid axes so the frame can rescale."""
-        ext = frame_extent(f)
-        gx = np.linspace(-ext, ext, grid_n)
-        gy = np.linspace(-ext, ext, grid_n)
-        field = f["field"]
-        inc_grid = np.full((grid_n, grid_n), np.nan)
-        if field["u"].size:
-            iu = np.clip(np.searchsorted(gx, field["u"]) - 1, 0, grid_n - 1)
-            iv = np.clip(np.searchsorted(gy, field["v"]) - 1, 0, grid_n - 1)
-            acc = np.zeros((grid_n, grid_n)); cnt = np.zeros((grid_n, grid_n))
-            np.add.at(acc, (iv, iu), field["incidence"])
-            np.add.at(cnt, (iv, iu), 1.0)
-            covered = cnt > 0
-            inc_grid[covered] = acc[covered] / cnt[covered]
-        beam_grid = _beam_on_grid(field, f["w0"], f["shaped"], gx, gy,
+    def encircled_grid(f):
+        """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
+        of total beam energy carried by all cells at least as bright — so contours at
+        0.1…0.9 are rings enclosing that fraction of the delivered energy (centre ≈ 0,
+        spilling out to 1). (The silhouette itself is drawn as a high-detail sample scatter,
+        not a binned grid — finer, and far smaller in the HTML.)"""
+        beam_grid = _beam_on_grid(f["field"], f["w0"], f["shaped"], gx, gy,
                                   profile_order=f["profile_order"])
-        # Encircled-energy transform: for each cell, cumulative energy of all brighter-or-
-        # equal cells / total. Monotonic in intensity, so it re-labels the contour rings by
-        # enclosed energy fraction instead of fraction-of-peak intensity.
         flat = beam_grid.ravel()
         order = np.argsort(flat)[::-1]
         csum = np.cumsum(flat[order]) / max(flat.sum(), 1e-30)
         encircled = np.empty_like(flat)
         encircled[order] = csum
-        encircled_grid = encircled.reshape(beam_grid.shape)
-        return inc_grid, encircled_grid, gx, gy, ext
+        return encircled.reshape(beam_grid.shape)
+
+    def sub_field(f):
+        """Down-sampled silhouette samples (u, v, incidence) for the panel-A scatter —
+        the raster carries tens of thousands of samples; a few thousand render identically
+        and keep the HTML small."""
+        fld = f["field"]
+        n = fld["u"].size
+        if n <= scatter_n:
+            return fld["u"], fld["v"], fld["incidence"]
+        idx = np.linspace(0, n - 1, scatter_n).astype(int)
+        return fld["u"][idx], fld["v"][idx], fld["incidence"][idx]
 
     # Static 3-D geometry (ground/cruise/stratosphere arcs; the emitter + its base).
     half = float(xs.max())
@@ -202,31 +245,50 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     eta_series = np.array([f["eta"] for f in frames_phys]) * 100
     capture_series = np.array([f["geom"] for f in frames_phys]) * 100   # intensity-weighted overlap
     wf_labels = frames_phys[0]["wf_labels"]
+    wf_mat = np.array([f["wf_values"] for f in frames_phys])            # (n_frames, n_stages)
+    stage_cum = np.cumprod(wf_mat, axis=1)                              # cumulative product per stage
+    # Cumulative delivered energy over the pass ("eat everything": emitter at a fixed grid
+    # power sized to hit delivered_mw at the best point; plane banks grid·η each instant).
+    peak = max(eta_series.max() / 100.0, 1e-9)
+    dt_s = (xs[1] - xs[0]) / 250.0                                       # 250 m/s cruise
+    deliverable_mw = (delivered_mw / peak) * (eta_series / 100.0)
+    cum_gj = np.cumsum(deliverable_mw * dt_s) / 1e3                      # MW·s = MJ → GJ
+    # Panel F (beam channel) axes.
+    slant_series = np.array([f["slant_m"] for f in frames_phys])
+    max_slant = float(slant_series.max())
+    R_max = max(max(f["emitter_radius_m"], f["w0"], f["sil_radial_m"]) for f in frames_phys) * 1.1
+    dist_norm = np.linspace(0.0, 1.0, 110)
+    radial = np.linspace(-R_max, R_max, 90)
+    r_t0 = frames_phys[0]["emitter_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
+    stage_colors = ["#4c78a8", "#f58518", "#54a24b", "#e45756", "#72b7b2", "#b279a2", "#9d755d"]
 
     fig = make_subplots(
-        rows=2, cols=3, horizontal_spacing=0.07, vertical_spacing=0.11,
-        column_widths=[0.30, 0.34, 0.36],
-        specs=[[{"type": "xy"}, {"type": "scene"}, {"type": "xy", "rowspan": 2}],
-               [{"type": "scene"}, {"type": "xy"}, None]],
-        subplot_titles=("A · beam spot over silhouette (fill = incidence)",
+        rows=2, cols=3, horizontal_spacing=0.115, vertical_spacing=0.15,
+        specs=[[{"type": "xy"}, {"type": "scene"}, {"type": "scene"}],
+               [{"secondary_y": True}, {"type": "xy"}, {"type": "xy"}]],
+        subplot_titles=("A · beam spot over silhouette (dots = incidence)",
                         "B · geometry on a spherical earth (vertical exaggerated)",
-                        "E · loss waterfall (stage efficiency)",
                         "C · BWB facets by beam incidence",
-                        "D · overlap capture & end-to-end η along the pass"))
+                        "D · capture, η & cumulative energy along the pass",
+                        "E · cumulative efficiency after each stage",
+                        "F · beam channel emitter→plane (radial exaggerated)"))
 
-    inc0, encl0, gx0, gy0, ext0 = panel_a_grids(frames_phys[0])
+    # ---- Panel A: silhouette sample scatter (incidence) + encircled-energy contour ------
+    su0, sv0, si0 = sub_field(frames_phys[0])
+    i_scatA = len(fig.data)
+    fig.add_trace(go.Scattergl(x=su0, y=sv0, mode="markers",
+                               marker=dict(size=3, color=si0, colorscale="Viridis",
+                                           cmin=0, cmax=1, showscale=False),
+                               showlegend=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=9, color="#b30000"))
-    # 0: silhouette incidence heatmap  1: encircled-energy contour (rings by enclosed %)
-    fig.add_trace(go.Heatmap(x=gx0, y=gy0, z=inc0, colorscale="Viridis", zmin=0, zmax=1,
-                             colorbar=dict(title="incidence", len=0.40, y=0.80, x=0.28),
+    i_contA = len(fig.data)
+    fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
+                             colorscale="Reds", contours=contour_opts, line=dict(width=1.3),
                              hoverinfo="skip"), row=1, col=1)
-    fig.add_trace(go.Contour(x=gx0, y=gy0, z=encl0, showscale=False, colorscale="Reds",
-                             contours=contour_opts, line=dict(width=1.4), hoverinfo="skip"),
-                  row=1, col=1)
 
-    # 2-4: arcs   5: rain-top layer   6: base station   7: tether/feed   8: emitter
+    # ---- Panel B (3-D geometry): arcs, emitter/base, plane + beam ----------------------
     fig.add_trace(go.Scatter3d(x=ground[:, 0], y=ground[:, 1], z=ground[:, 2], mode="lines",
                                line=dict(color="#5b4636", width=4), name="ground", hoverinfo="skip"), row=1, col=2)
     fig.add_trace(go.Scatter3d(x=cruise[:, 0], y=cruise[:, 1], z=cruise[:, 2], mode="lines",
@@ -254,69 +316,112 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         z=[emitter_loc[2]] if lofted else [None], mode="markers",
         marker=dict(size=6, color="#ff7f0e", symbol="diamond"),
         name=emit_name, showlegend=lofted, hoverinfo="skip"), row=1, col=2)
-
-    # 9: plane marker (anim)  10: beam line (anim)
     p0 = frames_phys[0]["plane_loc"] / 1e3
+    i_plane = len(fig.data)
     fig.add_trace(go.Scatter3d(x=[p0[0]], y=[p0[1]], z=[p0[2]], mode="markers",
                                marker=dict(size=5, color="#d62728"), name="plane", hoverinfo="skip"), row=1, col=2)
+    i_beam = len(fig.data)
     fig.add_trace(go.Scatter3d(x=[emitter_loc[0], p0[0]], y=[emitter_loc[1], p0[1]],
                                z=[emitter_loc[2], p0[2]], mode="lines",
                                line=dict(color="#d62728", width=3), name="beam", hoverinfo="skip"), row=1, col=2)
 
-    # 11: BWB mesh by incidence (anim)  12: beam-arrival arrow (anim, fixed length).
-    # Body frame is z-DOWN (belly at +z); negate z so panel C displays vertically the way
-    # you'd expect (belly at the bottom, a ground emitter's beam arriving from below).
+    # ---- Panel C (3-D BWB by incidence): z negated (body frame is z-DOWN, belly at +z) --
+    i_mesh = len(fig.data)
     fig.add_trace(go.Mesh3d(x=coarse_v[:, 0], y=coarse_v[:, 1], z=-coarse_v[:, 2],
                             i=coarse_f[:, 0], j=coarse_f[:, 1], k=coarse_f[:, 2],
                             intensity=frames_phys[0]["face_incidence"], intensitymode="cell",
-                            colorscale="Viridis", cmin=0, cmax=1,
-                            colorbar=dict(title="incidence", len=0.40, y=0.20, x=0.28),
-                            flatshading=True, name="BWB", hoverinfo="skip"), row=2, col=1)
+                            colorscale="Viridis", cmin=0, cmax=1, showscale=False,
+                            flatshading=True, name="BWB", hoverinfo="skip"), row=1, col=3)
     look0 = frames_phys[0]["look"]
+    i_arrow = len(fig.data)
     fig.add_trace(go.Scatter3d(x=[look0[0] * 40, look0[0] * 15], y=[look0[1] * 40, look0[1] * 15],
                                z=[-look0[2] * 40, -look0[2] * 15], mode="lines",
                                line=dict(color="#d62728", width=6), name="beam→",
-                               showlegend=False, hoverinfo="skip"), row=2, col=1)
+                               showlegend=False, hoverinfo="skip"), row=1, col=3)
 
-    # 13: η profile (static)  14: overlap-capture profile (static)  15/16: markers (anim)
+    # ---- Panel D (row2,col1): capture, η (left %) + cumulative energy (right GJ) --------
     fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name="η end-to-end (%)",
-                             line=dict(color="#1f77b4", width=2), hoverinfo="skip"), row=2, col=2)
+                             line=dict(color="#1f77b4", width=2), hoverinfo="skip"),
+                  row=2, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=xs / 1e3, y=capture_series, mode="lines", name="overlap capture (%)",
-                             line=dict(color="#2ca02c", width=2, dash="dot"), hoverinfo="skip"), row=2, col=2)
+                             line=dict(color="#2ca02c", width=2, dash="dot"), hoverinfo="skip"),
+                  row=2, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=cum_gj, mode="lines", name="cumulative energy (GJ)",
+                             line=dict(color="#ff7f0e", width=2), hoverinfo="skip"),
+                  row=2, col=1, secondary_y=True)
+    i_eta_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
-                             marker=dict(size=9, color="#1f77b4"), showlegend=False, hoverinfo="skip"), row=2, col=2)
+                             marker=dict(size=9, color="#1f77b4"), showlegend=False, hoverinfo="skip"),
+                  row=2, col=1, secondary_y=False)
+    i_cap_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[capture_series[0]], mode="markers",
-                             marker=dict(size=9, color="#2ca02c"), showlegend=False, hoverinfo="skip"), row=2, col=2)
+                             marker=dict(size=9, color="#2ca02c"), showlegend=False, hoverinfo="skip"),
+                  row=2, col=1, secondary_y=False)
+    i_cum_m = len(fig.data)
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cum_gj[0]], mode="markers",
+                             marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
+                  row=2, col=1, secondary_y=True)
 
-    # 17: loss waterfall (anim) — per-stage efficiency, the chain that multiplies to η.
-    wf0 = frames_phys[0]["wf_values"]
-    fig.add_trace(go.Bar(x=wf0, y=wf_labels, orientation="h", marker_color="#8c564b",
-                         text=[f"{v:.2f}" for v in wf0], textposition="auto",
-                         showlegend=False, hoverinfo="skip"), row=1, col=3)
+    # ---- Panel E (row2,col2): cumulative efficiency after each stage (stacked curves).
+    # Labelled inline at overhead (not in the legend, which would crowd B/D).
+    mid = n_frames // 2
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=np.ones_like(xs), mode="lines",
+                             line=dict(color="#bbbbbb", width=1, dash="dot"),
+                             showlegend=False, hoverinfo="skip"), row=2, col=2)
+    for si, lbl in enumerate(wf_labels):
+        col = stage_colors[si % len(stage_colors)]
+        fig.add_trace(go.Scatter(x=xs / 1e3, y=stage_cum[:, si], mode="lines",
+                                 line=dict(color=col, width=2),
+                                 showlegend=False, hoverinfo="skip"), row=2, col=2)
+        fig.add_annotation(x=0.0, y=stage_cum[mid, si], text=f"×{lbl}", xanchor="center",
+                           yanchor="bottom", showarrow=False, font=dict(size=8, color=col),
+                           row=2, col=2)
+    i_e_marker = len(fig.data)
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3, xs[0] / 1e3], y=[0.0, 1.02], mode="lines",
+                             line=dict(color="#888", width=1, dash="dot"),
+                             showlegend=False, hoverinfo="skip"), row=2, col=2)
 
-    ANIMATED = [0, 1, 9, 10, 11, 12, 15, 16, 17]
+    # ---- Panel F (row2,col3): converging beam channel; white emitter line + plane slice -
+    i_fheat = len(fig.data)
+    fig.add_trace(go.Heatmap(x=radial, y=dist_norm,
+                             z=_beam_channel(dist_norm, radial, slant_series[0], max_slant, r_t0,
+                                             frames_phys[0]["w0"], frames_phys[0]["profile_order"]),
+                             colorscale="Inferno", showscale=False, hoverinfo="skip"), row=2, col=3)
+    fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",
+                             line=dict(color="white", width=5), name="emitter aperture",
+                             showlegend=False, hoverinfo="skip"), row=2, col=3)
+    sil0 = frames_phys[0]["sil_radial_m"]
+    i_fplane = len(fig.data)
+    fig.add_trace(go.Scatter(x=[-sil0, sil0], y=[slant_series[0] / max_slant] * 2, mode="lines",
+                             line=dict(color="#00e5ff", width=4), name="plane",
+                             showlegend=False, hoverinfo="skip"), row=2, col=3)
+
+    ANIMATED = [i_scatA, i_contA, i_plane, i_beam, i_mesh, i_arrow,
+                i_eta_m, i_cap_m, i_cum_m, i_e_marker, i_fheat, i_fplane]
     frames = []
     for k, f in enumerate(frames_phys):
-        inc_g, encl_g, gxk, gyk, extk = panel_a_grids(f)
         p = f["plane_loc"] / 1e3
         look = f["look"]
-        wfv = f["wf_values"]
-        # Rescale panel A to this frame's extent (the beam waist shrinks ~40× overhead vs
-        # near the horizon) so the spot/silhouette stay legible the whole pass.
-        frames.append(go.Frame(name=str(k), traces=ANIMATED,
-            layout=go.Layout(xaxis=dict(range=[-extk, extk]), yaxis=dict(range=[-extk, extk])),
-            data=[
-                go.Heatmap(x=gxk, y=gyk, z=inc_g),
-                go.Contour(x=gxk, y=gyk, z=encl_g),
-                go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
-                go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
-                go.Mesh3d(intensity=f["face_incidence"], intensitymode="cell"),
-                go.Scatter3d(x=[look[0] * 40, look[0] * 15], y=[look[1] * 40, look[1] * 15],
-                             z=[-look[2] * 40, -look[2] * 15]),
-                go.Scatter(x=[xs[k] / 1e3], y=[eta_series[k]]),
-                go.Scatter(x=[xs[k] / 1e3], y=[capture_series[k]]),
-                go.Bar(x=wfv, text=[f"{v:.2f}" for v in wfv]),
-            ]))
+        su, sv, sinc = sub_field(f)
+        cur = xs[k] / 1e3
+        beamF = _beam_channel(dist_norm, radial, f["slant_m"], max_slant,
+                              f["emitter_radius_m"], f["w0"], f["profile_order"])
+        yy = f["slant_m"] / max_slant
+        frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
+            go.Scattergl(x=su, y=sv, marker=dict(color=sinc)),
+            go.Contour(x=gx, y=gy, z=encircled_grid(f)),
+            go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
+            go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
+            go.Mesh3d(intensity=f["face_incidence"], intensitymode="cell"),
+            go.Scatter3d(x=[look[0] * 40, look[0] * 15], y=[look[1] * 40, look[1] * 15],
+                         z=[-look[2] * 40, -look[2] * 15]),
+            go.Scatter(x=[cur], y=[eta_series[k]]),
+            go.Scatter(x=[cur], y=[capture_series[k]]),
+            go.Scatter(x=[cur], y=[cum_gj[k]]),
+            go.Scatter(x=[cur, cur], y=[0.0, 1.02]),
+            go.Heatmap(z=beamF),
+            go.Scatter(x=[-f["sil_radial_m"], f["sil_radial_m"]], y=[yy, yy]),
+        ]))
     fig.frames = frames
 
     # Uniform frame spacing = uniform time at constant speed; a short transition tweens
@@ -338,35 +443,37 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                                            mode="immediate")])])])
 
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
-                     range=[-ext0, ext0], row=1, col=1)
-    fig.update_yaxes(title_text="v (m)", range=[-ext0, ext0], row=1, col=1)
+                     range=[-EXT, EXT], row=1, col=1)
+    fig.update_yaxes(title_text="v (m)", range=[-EXT, EXT], row=1, col=1)
+    fig.update_xaxes(title_text="along-track (km)", row=2, col=1)
+    fig.update_yaxes(title_text="capture / η (%)", rangemode="tozero", secondary_y=False, row=2, col=1)
+    fig.update_yaxes(title_text="cumulative energy (GJ)", rangemode="tozero", secondary_y=True, row=2, col=1)
     fig.update_xaxes(title_text="along-track (km)", row=2, col=2)
-    fig.update_yaxes(title_text="capture / η (%)", rangemode="tozero", row=2, col=2)
-    # Panel E: stage efficiencies (the multiplicative chain). Fixed x so bars are comparable.
-    fig.update_xaxes(title_text="stage efficiency (×)", range=[0, 1.05], row=1, col=3)
-    fig.update_yaxes(autorange="reversed", row=1, col=3)
-    # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates
-    # the vertical so the arc is visible over the ±few-hundred-km span (horizontal 1:1).
+    fig.update_yaxes(title_text="cumulative efficiency (×)", range=[0, 1.05], row=2, col=2)
+    fig.update_xaxes(title_text="radial offset (m)", row=2, col=3)
+    fig.update_yaxes(title_text="distance emitter→plane (norm.)", range=[0, 1], row=2, col=3)
+    # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates the
+    # vertical so the arc is visible. Camera pulled back so the axes/labels are in view.
     fig.update_scenes(dict(xaxis_title="downrange (km)", yaxis_title="cross (km)",
                            zaxis_title="altitude (km, exaggerated)", aspectmode="manual",
                            aspectratio=dict(x=4.0, y=0.25, z=1.0),
-                           camera=dict(eye=dict(x=0.1, y=-2.4, z=0.45), up=dict(x=0, y=0, z=1))),
+                           camera=dict(eye=dict(x=0.15, y=-3.7, z=0.72), up=dict(x=0, y=0, z=1))),
                       row=1, col=2)
     # Panel C: FIXED box so it never rescales as the beam arrow swings.
     fig.update_scenes(dict(xaxis=dict(range=[-BOX, BOX], title="nose (m)"),
                            yaxis=dict(range=[-BOX, BOX], title="span (m)"),
-                           zaxis=dict(range=[-BOX, BOX], title="vert (m)"),
+                           zaxis=dict(range=[-BOX, BOX], title="vert (m, up)"),
                            aspectmode="cube",
-                           camera=dict(eye=dict(x=1.4, y=-1.4, z=1.0))), row=2, col=1)
+                           camera=dict(eye=dict(x=1.7, y=-1.7, z=1.2))), row=1, col=3)
     fig.add_annotation(x=0.5, y=1.0, xref="x domain", yref="y domain", row=1, col=1,
                        text="red contours = enclosed beam-energy fraction (centre→edge)",
                        showarrow=False, font=dict(size=9, color="#b30000"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     fig.update_layout(
-        template="plotly_white", height=900, width=1650,
+        template="plotly_white", height=940, width=1680,
         title=(f"Flyby animation — {arch_name}, {weather} weather, {pass_kind}, "
                f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
-        legend=dict(orientation="h", y=1.07, x=0.5, xanchor="center", font=dict(size=10)))
+        legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline", auto_play=False)
     return path
