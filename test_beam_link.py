@@ -184,11 +184,19 @@ def test_vectorized():
 
 def test_pass_profile():
     print("\n[pass profile / fixed emitter]")
-    # A fixed emitter delivers most overhead and falls off both ways symmetrically.
+    # A fixed emitter delivers most overhead and falls off both ways. Defocus + the
+    # density cap + the adaptive profile flatten the top into a PLATEAU over the best part
+    # of the pass (stable delivery), so the exact argmax wanders within it — assert a
+    # central plateau, not a razor peak.
     p = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=60.0)
     peak_idx = int(np.argmax(p["deliverable_mw"]))
-    check("peak delivery is overhead (x≈0)", abs(p["alongtrack_km"][peak_idx]) < 2.0,
+    overhead_idx = int(np.argmin(np.abs(p["alongtrack_km"])))
+    dmax = p["deliverable_mw"].max()
+    check("peak delivery is in the central plateau", abs(p["alongtrack_km"][peak_idx]) < 10.0,
           f"peak at {p['alongtrack_km'][peak_idx]:.1f} km")
+    check("overhead is on the plateau (within 3% of peak)",
+          p["deliverable_mw"][overhead_idx] > 0.97 * dmax,
+          f"overhead {p['deliverable_mw'][overhead_idx]/dmax:.3f} of peak")
     left = p["deliverable_mw"][p["alongtrack_km"] < 0]
     right = p["deliverable_mw"][p["alongtrack_km"] > 0][::-1]
     n = min(len(left), len(right))
@@ -363,6 +371,29 @@ def test_flattop():
           f"gauss {w_g:.1f} m vs flat {w_f:.1f} m")
 
 
+def test_adaptive_profile():
+    print("\n[adaptive spot profile — flat-top when contained, Gaussian when overspilling]")
+    st, relay = (0, 0, 0), (0, 0, 20e3)
+    base = dict(station_pos=st, relay_pos=relay, relay_mode="multiplier", f_emit_relay_ghz=5.8,
+                f_relay_plane_ghz=17.4, relay_aperture_diam_m=40)
+    # Overhead: the density cap forces the spot wide but it still fits the plane → the array
+    # flattens the top (higher order) to shrink it under the cap and spill less.
+    over = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 10.0)
+    check("overhead (contained, density-limited) → flat-top engaged", over["beam_profile_order"] > 1.0,
+          f"order {over['beam_profile_order']:.0f}")
+    # Far out: the spot overspills the foreshortened sliver → a peaked Gaussian delivers
+    # more to the small target, so the array stays Gaussian.
+    dr = float(bl.geo.downrange_for_elevation(3.0, 11e3))
+    far = bl.evaluate(bl.LinkConfig(plane_pos=(dr, 0, 11e3), **base), 10.0)
+    check("far out (overspilling) → stays Gaussian", far["beam_profile_order"] == 1.0,
+          f"order {far['beam_profile_order']:.0f}")
+    # Turning adaptation off pins the configured order.
+    fixed = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), adaptive_profile=False,
+                                      beam_profile_order=1.0, **base), 10.0)
+    check("adaptive off pins the order", fixed["beam_profile_order"] == 1.0,
+          f"order {fixed['beam_profile_order']:.0f}")
+
+
 def test_energy_balance():
     print("\n[flyby energy balance — plane banks everything]")
     archs = bl.standard_architectures(weather="clear")
@@ -387,6 +418,7 @@ if __name__ == "__main__":
     test_flyby()
     test_pointing_density()
     test_flattop()
+    test_adaptive_profile()
     test_energy_balance()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)

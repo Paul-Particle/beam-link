@@ -75,30 +75,25 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     look = m.direction_from_beta_alpha(float(beta), float(alpha))
     raster = bl._cached_raster(beta, alpha)
     lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
-    r_recv = bl.receiver_radius_from_silhouette(max(raster["area"], 1e-6))
-    conv = float(bl.napkin.rectenna_efficiency_band(freq))
-    pol = float(bl.polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))
-    # Same physics as evaluate(): defocus floor, then the power-density cap, then fold
-    # the pointing error into the overlap — so panel A matches the η in panel D.
-    defocus = cfg.defocus_fill * r_recv if cfg.defocus else 0.0
-    cap0, _, w_nom = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
-                                        min_waist_m=defocus, incidence_floor=cfg.incidence_floor,
-                                        profile_order=cfg.beam_profile_order)
-    w_dens = bl._density_min_waist(delivered_mw, cap0, conv * pol, cfg.max_power_density_w_m2,
-                                   cfg.beam_profile_order)
-    _, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
-                                           min_waist_m=max(defocus, w_dens),
-                                           pointing_offset_m=cfg.pointing_error_m,
-                                           incidence_floor=cfg.incidence_floor,
-                                           profile_order=cfg.beam_profile_order, return_field=True)
-    eta = float(bl.evaluate(cfg, delivered_mw)["eta_end_to_end"])
+    # The engine is the single source of truth: it chooses the spot's SIZE (waist), SHAPE
+    # (elliptical, in overlap_capture) and PROFILE (Gaussian/flat-top, adaptively) and
+    # enforces the density cap. Read the winning waist + order back and re-form the SAME
+    # spot here (with pointing) purely to draw panel A — so the picture matches panel D's η.
+    s = bl.evaluate(cfg, delivered_mw)
+    eta = float(s["eta_end_to_end"])
+    w0 = float(s["spot_waist_m"])
+    order = float(s["beam_profile_order"])
+    _, eff, _, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
+                                          min_waist_m=w0, pointing_offset_m=cfg.pointing_error_m,
+                                          incidence_floor=cfg.incidence_floor,
+                                          profile_order=order, return_field=True)
 
     verts, faces, normals = coarse_mesh
     face_incidence = np.clip(normals @ look, 0.0, 1.0)
 
     plane_loc = _localize(x_along_m, lateral_offset_m, plane_alt_m, basis)
     emitter_loc = _localize(emitter[0], emitter[1], emitter[2], basis)
-    return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=cfg.beam_profile_order,
+    return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=order,
                 eff=eff, eta=eta, elevation=float(elevation), slant_km=slant / 1e3, beta=float(beta),
                 area=raster["area"], look=look, face_incidence=face_incidence,
                 plane_loc=plane_loc, emitter_loc=emitter_loc)

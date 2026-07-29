@@ -451,7 +451,13 @@ class LinkConfig:
     incidence_floor: float = 0.90
     # Super-Gaussian order of the emitted spot: 1 = Gaussian, >1 = flat top (lower peak
     # for the same footprint → eases the W/m² cap without spilling more). #(verify)
+    # Used directly when adaptive_profile is off; otherwise it's the Gaussian fallback.
     beam_profile_order: float = 1.0
+    # Like the spot's size and elliptical shape, the radial profile is a phased-array knob:
+    # pick it per geometry (try each order, keep whichever delivers more under the density
+    # cap — flat top for a contained spot, peaked Gaussian when it overspills). #(verify)
+    adaptive_profile: bool = True
+    profile_orders: tuple = (1.0, 3.0)              # candidate orders when adaptive_profile
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
     # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
@@ -485,7 +491,8 @@ def _cached_raster(beta_deg, alpha_deg, n_grid=150):
     return raster
 
 
-def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_waist_m=0.0, n_grid=150):
+def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_waist_m=0.0,
+                  profile_order=None, n_grid=150):
     """The real receive-side geometry the plane presents to an emitter at `emitter_pos`:
     rasterize the (self-occluded) silhouette toward the emitter and overlap the focused
     beam spot with it. Returns a dict with the true silhouette area, the incidence-
@@ -507,14 +514,16 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_wai
     # Defocus: never focus tighter than ~the silhouette (keeps the power density sane);
     # `extra_min_waist_m` is the power-density cap, applied by the caller once the power
     # level is known.
+    order = cfg.beam_profile_order if profile_order is None else float(profile_order)
     min_waist = max(cfg.defocus_fill * r_recv if cfg.defocus else 0.0, extra_min_waist_m)
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
                                         shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
                                         min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m,
-                                        profile_order=cfg.beam_profile_order)
+                                        profile_order=order)
     return dict(area=area, r_recv=r_recv, beta=float(beta), roll=float(roll),
                 slant=float(slant), elevation=float(elevation), capture=capture,
-                capture_geom=geom, spot_waist_m=w0, emitter_diam_m=float(emitter_diam_m))
+                capture_geom=geom, spot_waist_m=w0, profile_order=order,
+                emitter_diam_m=float(emitter_diam_m))
 
 
 def _density_min_waist(delivered_mw, capture, rect_total, cap_w_m2, profile_order=1.0):
@@ -536,6 +545,30 @@ def _peak_density(delivered_mw, capture, rect_total, w0, profile_order=1.0):
     return p_spot_w / (np.pi * w0 ** 2 * supergaussian_area_factor(profile_order))
 
 
+def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total):
+    """Pick the beam's radial PROFILE (Gaussian vs flat-top) per geometry and enforce the
+    W/m² cap, returning the winning `plane_capture` dict. Like the spot's SIZE (waist,
+    already ranged over slant/defocus/density) and SHAPE (elliptical, already aligned to
+    the silhouette), the profile is a phased-array degree of freedom — so let the array
+    try each candidate order and keep whichever DELIVERS MORE under the density cap. This
+    is self-correcting: a flat top wins a contained, density-limited spot (lower peak → it
+    can shrink under the cap → less spill), while a peaked Gaussian wins when the spot
+    overspills the airframe (it concentrates more power on the small target)."""
+    orders = cfg.profile_orders if cfg.adaptive_profile else (cfg.beam_profile_order,)
+    best = None
+    for order in orders:
+        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, profile_order=order)
+        # Spread the spot if the peak incident density is over the cap (for THIS profile).
+        w_req = _density_min_waist(delivered_mw, pc["capture"], rect_total,
+                                   cfg.max_power_density_w_m2, order)
+        if w_req > pc["spot_waist_m"]:
+            pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                               extra_min_waist_m=w_req, profile_order=order)
+        if best is None or pc["capture"] > best["capture"]:
+            best = pc
+    return best
+
+
 def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
     """End-to-end evaluation for ONE plane position (scalar geometry)."""
     atmos = get_atmosphere()
@@ -546,13 +579,10 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         # ---- direct emitter → plane (emitter at station_pos; lofted for the tether case) ----
         f = cfg.f_emit_plane_ghz
         conv = float(napkin.rectenna_efficiency_band(f))
-        pc = plane_capture(cfg, station, f, cfg.emitter_diam_m)
-        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
-        # Power-density cap: spread the spot if the peak incident density is too high.
-        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol,
-                                   cfg.max_power_density_w_m2, cfg.beam_profile_order)
-        if w_req > pc["spot_waist_m"]:
-            pc = plane_capture(cfg, station, f, cfg.emitter_diam_m, extra_min_waist_m=w_req)
+        pc0 = plane_capture(cfg, station, f, cfg.emitter_diam_m)
+        pol = float(polarization_efficiency(cfg.polarization, pc0["roll"]))
+        # Choose the spot profile per geometry and enforce the W/m² cap.
+        pc = _capture_with_caps(cfg, station, f, cfg.emitter_diam_m, delivered_mw, conv * pol)
         a, b = _to_ecef(station), _to_ecef(plane)
         blocked = bool(geo.horizon_blocked(a, b, 64))
         atmos_t = float(napkin.db_to_fraction(atmos.path_loss_db(f, a, b, cfg.weather))) * (0.0 if blocked else 1.0)
@@ -566,8 +596,9 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             rectenna_rf_to_dc=conv, polarization=pol,
             rectenna_total=conv * pol, silhouette_m2=pc["area"],
             receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], spot_waist_m=pc["spot_waist_m"],
+            beam_profile_order=pc["profile_order"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
-                                            pc["spot_waist_m"], cfg.beam_profile_order),
+                                            pc["spot_waist_m"], pc["profile_order"]),
             emitter_diam_m=pc["emitter_diam_m"], slant_km=pc["slant"] / 1e3,
             elevation_deg=pc["elevation"], blocked=blocked)
 
@@ -584,12 +615,9 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         # down-leg: relay → plane uses the real silhouette overlap; the emitting
         # aperture is the relay's own (fixed) transmit array.
         conv = float(napkin.rectenna_efficiency_band(f2))
-        pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m)
-        pol = float(polarization_efficiency(cfg.polarization, pc["roll"]))
-        w_req = _density_min_waist(delivered_mw, pc["capture"], conv * pol,
-                                   cfg.max_power_density_w_m2, cfg.beam_profile_order)
-        if w_req > pc["spot_waist_m"]:
-            pc = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m, extra_min_waist_m=w_req)
+        pc0 = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m)
+        pol = float(polarization_efficiency(cfg.polarization, pc0["roll"]))
+        pc = _capture_with_caps(cfg, relay, f2, cfg.relay_aperture_diam_m, delivered_mw, conv * pol)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
         blocked2 = bool(geo.horizon_blocked(a2, b2, 64))
         atmos_dn = float(napkin.db_to_fraction(atmos.path_loss_db(f2, a2, b2, cfg.weather))) * (0.0 if blocked2 else 1.0)
@@ -610,9 +638,10 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             rectenna_rf_to_dc=conv, polarization=pol, rectenna_total=conv * pol,
             capture=pc["capture"], atmos=atmos_dn,
             silhouette_m2=pc["area"], receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"],
-            spot_waist_m=pc["spot_waist_m"], emitter_diam_m=pc["emitter_diam_m"],
+            spot_waist_m=pc["spot_waist_m"], beam_profile_order=pc["profile_order"],
+            emitter_diam_m=pc["emitter_diam_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
-                                            pc["spot_waist_m"], cfg.beam_profile_order),
+                                            pc["spot_waist_m"], pc["profile_order"]),
             emitter_diam_up_m=float(h1.emitter_diam_m),
             slant_up_km=h1.slant_m / 1e3, slant_down_km=pc["slant"] / 1e3,
             elevation_up_deg=float(h1.elevation_deg), elevation_down_deg=pc["elevation"],
