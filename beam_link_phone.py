@@ -287,13 +287,14 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
 
 
 def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
-                      L_min_km=11.0, L_max_km=213.0, n_frames=25, grid_dist=90,
-                      grid_radial=90, R_m=230.0, write=True, path=f"{OUT}/focus_phone.html"):
+                      L_min_km=11.0, L_max_km=213.0, n_frames=21, grid_dist=64,
+                      grid_radial=64, R_m=230.0, write=True, path=f"{OUT}/focus_phone.html"):
     """Pure FOCUSING sweep (no plane, no atmosphere): a circular array vs an elliptical array
     of the same aperture area, focusing from as close as possible to as far as possible. The
     focus is drawn at its TRUE distance from the emitter (vertical axis in km, NOT normalised),
     so the focal spot visibly travels up-range as you sweep — from overhead at cruise altitude
-    (11 km) to the 2° horizon (213 km). The beam is drawn only up to the focus.
+    (11 km) to the 2° horizon (213 km). The beam converges to the focus and then diverges again
+    past it (the field behind the focus is shown, not masked).
 
     The focal-spot waist grows linearly with range, w ∝ λ·L / (aperture extent in that axis) —
     so a fixed aperture cannot hold a tight spot at long range: once the waist bar is wider than
@@ -317,13 +318,18 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
         return float(bl.focused_spot_waist(lam, L, r))
 
     def seg(ap, waist, L):
-        return [(float(ap), float(waist), float(L), 1.0)]
+        # converge aperture→waist over 0..L, then diverge past the focus to the top of the panel
+        # with the same cone slope — so the field BEHIND the focus is shown, not masked.
+        slope = (ap - waist) / max(L, 1e-9)
+        w_top = waist + slope * (Lmax_m - L)
+        return [(float(ap), float(waist), float(L), 1.0),
+                (float(waist), float(w_top), float(Lmax_m - L), 1.0)]
 
     def chan(ap, waist, L):
-        return anim._beam_channel(dist_norm, radial, seg(ap, waist, L), Lmax_m, L, leg_norms=None).astype(np.float32)
+        return anim._beam_channel(dist_norm, radial, seg(ap, waist, L), Lmax_m, Lmax_m, leg_norms=None).astype(np.float32)
 
     def enc(ap, waist, L):
-        return anim._channel_encircled(dist_norm, radial, seg(ap, waist, L), Lmax_m, L).astype(np.float32)
+        return anim._channel_encircled(dist_norm, radial, seg(ap, waist, L), Lmax_m, Lmax_m).astype(np.float32)
 
     # per-case (aperture semi-axis, waist-at-focus as a function of L)
     cases = [("circular array · major-axis cut", r, lambda L: w0(L), "#f2b134"),
