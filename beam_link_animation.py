@@ -258,18 +258,25 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
-                          grid_nA=200, emitter_diam_m=None, write=True,
+                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, write=True,
                           path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
 
-    `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct → `emitter_diam_m`, relay →
-    `relay_aperture_diam_m`) and bypasses the far-reference auto-sizing — so emitter size can
-    be swept as the single variable. `grid_nA` is the panel-A silhouette-grid resolution
-    (lower it for lighter embedded figures)."""
-    archs = bl.standard_architectures(weather=weather)
-    if arch_name not in archs:
-        raise KeyError(f"{arch_name!r} not in {list(archs)}")
-    kw = dict(archs[arch_name])
+    `arch_name` selects a named case from `standard_architectures`; pass `arch_kwargs`
+    (a LinkConfig kwarg dict, `plane_pos` omitted) instead to animate an architecture not
+    in that catalogue (e.g. a passive same-frequency relay), with `arch_name` used only as
+    the display label. `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct →
+    `emitter_diam_m`, relay → `relay_aperture_diam_m`) and bypasses the far-reference
+    auto-sizing — so emitter size can be swept as the single variable. `grid_nA` is the
+    panel-A silhouette-grid resolution (lower it for lighter embedded figures)."""
+    if arch_kwargs is None:
+        archs = bl.standard_architectures(weather=weather)
+        if arch_name not in archs:
+            raise KeyError(f"{arch_name!r} not in {list(archs)}")
+        kw = dict(archs[arch_name])
+    else:
+        kw = dict(arch_kwargs)
+        kw["weather"] = weather                       # the weather arg governs (arcs + physics)
     if emitter_diam_m is not None:
         if kw.get("relay_pos") is not None:
             kw["relay_aperture_diam_m"] = float(emitter_diam_m)
