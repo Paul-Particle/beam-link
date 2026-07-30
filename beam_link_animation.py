@@ -299,13 +299,24 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh,
                                   lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
 
-    # FIXED panel-A window = the airframe's max silhouette extent (same every frame AND
-    # every run, so silhouettes compare directly). 1:1 aspect via scaleanchor below.
-    EXT = max_silhouette_extent() * 1.08
-    gx = np.linspace(-EXT, EXT, grid_n)              # contour grid (smooth beam)
-    gy = np.linspace(-EXT, EXT, grid_n)
-    gxA = np.linspace(-EXT, EXT, grid_nA)            # fine grid for the silhouette heatmap
-    gyA = np.linspace(-EXT, EXT, grid_nA)
+    # Panel-A window: cover BOTH the self-occluded silhouette AND the (possibly elongated)
+    # beam spot across the whole pass, so the encircled-energy contours are never clipped
+    # at the frame edge. Use a WIDE window (separate horizontal/vertical half-extents) so
+    # the plot fills its full-width row instead of letterboxing to a small central square;
+    # scaleanchor below keeps it 1:1, so the spot shape is not distorted. The elliptical
+    # spot's major axis reaches ≈3.0·w0 at the 0.9 encircled ring (w_major = w0·√aspect,
+    # aspect capped at 8), so size the horizontal extent to clear that.
+    def _fld_ext(axis):
+        return max((float(np.abs(f["field"][axis]).max()) if f["field"][axis].size else 0.0)
+                   for f in frames_phys)
+    max_w0 = max(f["w0"] for f in frames_phys)
+    EXT_H = max(_fld_ext("u"), 3.2 * max_w0) * 1.1
+    EXT_V = max(_fld_ext("v"), 1.7 * max_w0) * 1.1
+    EXT_V = max(EXT_V, EXT_H / 2.2)                  # cap aspect so 1:1 mostly fills the wide row
+    gx = np.linspace(-EXT_H, EXT_H, grid_n)          # contour grid (smooth beam)
+    gy = np.linspace(-EXT_V, EXT_V, grid_n)
+    gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the silhouette heatmap
+    gyA = np.linspace(-EXT_V, EXT_V, grid_nA)
 
     def encircled_grid(f):
         """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
@@ -330,8 +341,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         fld = f["field"]
         if fld["u"].size == 0:
             return np.full((grid_nA, grid_nA), np.nan)
-        iu = np.clip(((fld["u"] + EXT) / (2 * EXT) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
-        iv = np.clip(((fld["v"] + EXT) / (2 * EXT) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
+        iu = np.clip(((fld["u"] + EXT_H) / (2 * EXT_H) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
+        iv = np.clip(((fld["v"] + EXT_V) / (2 * EXT_V) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
         cell = iv * grid_nA + iu                       # z[row=v, col=u]
         ssum = np.zeros(grid_nA * grid_nA); cnt = np.zeros(grid_nA * grid_nA)
         np.add.at(ssum, cell, fld["incidence"]); np.add.at(cnt, cell, 1.0)
@@ -421,10 +432,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                         labelfont=dict(size=9, color="#c8ffe6"))
     i_contA = len(fig.data)
     # Bright mint-green: reads cleanly over Plasma (which has no green), unlike the old red.
+    # Toned down (opacity) so the beam overlay sits lightly over the silhouette fill.
     fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
                              colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
-                             contours=contour_opts, line=dict(width=1.3),
+                             contours=contour_opts, line=dict(width=1.1), opacity=0.45,
                              hoverinfo="skip"), row=1, col=1)
+    # Live capture % in the corner of panel A — the beam fraction the silhouette intercepts.
+    i_capA = len(fig.data)
+    fig.add_trace(go.Scatter(x=[-EXT_H * 0.94], y=[EXT_V * 0.82], mode="text",
+                             text=[f"{capture_series[0]:.0f}% captured"], textposition="middle right",
+                             textfont=dict(size=16, color="#ffffff"), cliponaxis=False,
+                             showlegend=False, hoverinfo="skip"), row=1, col=1)
 
     # ---- Panel B (1,2) (3-D geometry): arcs, emitter/base, plane + beam -----------------
     fig.add_trace(go.Scatter3d(x=ground[:, 0], y=ground[:, 1], z=ground[:, 2], mode="lines",
@@ -531,7 +549,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              line=dict(color="#00e5ff", width=4), name="plane",
                              showlegend=False, hoverinfo="skip"), row=4, col=2)
 
-    ANIMATED = [i_incA, i_contA, i_plane, i_beam, i_wf, i_mesh, i_arrow,
+    ANIMATED = [i_incA, i_contA, i_capA, i_plane, i_beam, i_wf, i_mesh, i_arrow,
                 i_eta_m, i_cap_m, i_cum_m, i_fheat, i_fplane]
     frames = []
     for k, f in enumerate(frames_phys):
@@ -542,6 +560,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
             go.Heatmap(z=incidence_grid(f)),
             go.Contour(x=gx, y=gy, z=encircled_grid(f)),
+            go.Scatter(text=[f"{capture_series[k]:.0f}% captured"]),
             go.Scatter3d(x=[p[0]], y=[p[1]], z=[p[2]]),
             go.Scatter3d(x=[emitter_loc[0], p[0]], y=[emitter_loc[1], p[1]], z=[emitter_loc[2], p[2]]),
             go.Waterfall(y=waterfall_y(k)),
@@ -568,8 +587,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                       currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)])
 
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
-                     range=[-EXT, EXT], row=1, col=1)
-    fig.update_yaxes(title_text="v (m)", range=[-EXT, EXT], row=1, col=1)
+                     range=[-EXT_H, EXT_H], row=1, col=1)
+    fig.update_yaxes(title_text="v (m)", range=[-EXT_V, EXT_V], row=1, col=1)
     fig.update_yaxes(title_text="efficiency (×)", range=[0, 1.05], row=4, col=1)
     fig.update_xaxes(tickangle=-40, tickfont=dict(size=8), row=4, col=1)
     # Panel D: FIXED ranges (x, both y) so nothing re-autoranges as the markers move —
@@ -587,7 +606,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_scenes(dict(xaxis_title="downrange (km)", yaxis_title="cross (km)",
                            zaxis_title="altitude (km, exaggerated)", aspectmode="manual",
                            aspectratio=dict(x=2.0, y=0.35, z=0.9),
-                           camera=dict(eye=dict(x=0.05, y=-2.05, z=0.5), up=dict(x=0, y=0, z=1))),
+                           camera=dict(eye=dict(x=0.05, y=-1.3, z=0.42), up=dict(x=0, y=0, z=1))),
                       row=2, col=1)
     # Panel C: FIXED box so it never rescales as the beam arrow swings.
     fig.update_scenes(dict(xaxis=dict(range=[-BOX, BOX], title="nose (m)"),
@@ -601,7 +620,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
-        template="plotly_dark", height=2100, width=1520,
+        template="plotly_dark", height=2100, width=1140,
         title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
                f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
