@@ -30,6 +30,47 @@ import geo
 
 OUT = "out"
 
+# Play button: a custom sequential stepper. Plotly's native sequenced play only redraws
+# Heatmap/Waterfall on the FIRST frame (the rest freeze), and `Plotly.animate([k],redraw)`
+# tears down + re-renders both WebGL 3-D scenes each tick → flicker. So this advances ONE
+# frame per tick with `Plotly.restyle` on just the animated traces (in-place, in order, no
+# teardown), which still redraws the heatmaps/waterfall. `{n_frames}` is injected (gd.frames
+# isn't populated when this runs); `{plot_id}` is substituted by write_html.
+_PLAYER_JS = """
+var gd = document.getElementById("{plot_id}");
+var N = {n_frames};
+var cur = 0, playing = false, timer = null;
+function frameByName(k) {
+  var frs = (gd._transitionData && gd._transitionData._frames) || gd.frames || [];
+  for (var i = 0; i < frs.length; i++) { if (frs[i] && frs[i].name === String(k)) return frs[i]; }
+  return null;
+}
+function applyFrame(k) {
+  var fr = frameByName(k);
+  if (!fr) return Promise.resolve();
+  var proms = [];
+  for (var j = 0; j < fr.data.length; j++) {
+    var d = fr.data[j], tr = fr.traces ? fr.traces[j] : j, upd = {};
+    for (var key in d) { if (d.hasOwnProperty(key) && key !== 'type') { upd[key] = [d[key]]; } }
+    proms.push(Plotly.restyle(gd, upd, [tr]));
+  }
+  cur = k;
+  return Promise.all(proms);
+}
+function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 8); }); }
+var btn = document.createElement('button');
+btn.textContent = '\\u25B6 play';
+btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
+function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
+function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
+btn.onclick = function(){ playing ? pause() : play(); };
+var host = gd.parentNode || gd;
+if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+host.appendChild(btn);
+gd.on('plotly_sliderchange', function(e){ if (e && e.slider) cur = e.slider.active | 0; });
+"""
+
+
 def _box_sum(a, r):
     """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
     box filter used to fill the gaps between Monte-Carlo silhouette samples."""
@@ -71,31 +112,60 @@ def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     return beam.reshape(uu.shape)
 
 
-def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_m):
+def _leg_peak_intensity(segments):
+    """Peak on-axis intensity of each leg = 1/(π·w_min²·C), reached at its narrowest waist.
+    Used to normalise the beam channel to the PASS peak (per leg) instead of per frame."""
+    return [1.0 / (np.pi * min(w_start, w_end) ** 2 * bl.supergaussian_area_factor(order))
+            for (w_start, w_end, seg_len, order) in segments]
+
+
+def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_m, leg_norms=None):
     """Intensity of the CONVERGING beam over a side view: y = along-PATH distance (fraction
     of the longest total path over the pass), x = radial offset. `segments` is a list of
     (w_start, w_end, length_m, order) legs laid end to end along y — one leg for a direct
     link, TWO for a relay (ground→relay up-leg, then relay→plane down-leg). Each leg tapers
-    linearly from its emitting aperture to its focal waist; intensity ∝ 1/w(s)² is normalised
-    PER LEG so both the wide, faint up-leg and the focused, bright down-leg stay visible.
-    NaN beyond the current plane position (no beam past the focus)."""
+    linearly from its emitting aperture to its focal waist; intensity ∝ 1/w(s)².
+    `leg_norms` (per-leg divisor) normalises each leg to the PASS's peak intensity so the
+    beam visibly brightens/dims through the pass; without it each leg self-normalises to its
+    own frame max. NaN beyond the current plane position (no beam past the focus)."""
     dd, rr = np.meshgrid(distance_norm, radial, indexing="ij")   # (n_dist, n_radial)
     s = dd * total_shown_m
     z = np.full(s.shape, np.nan)
     cum = 0.0
-    for w_start, w_end, seg_len, order in segments:
+    for li, (w_start, w_end, seg_len, order) in enumerate(segments):
         in_seg = (s >= cum) & (s < cum + seg_len) & (s <= current_total_m)
         if seg_len > 0 and np.any(in_seg):
             frac = np.clip((s - cum) / seg_len, 0.0, 1.0)
             w = w_start + (w_end - w_start) * frac
             C = bl.supergaussian_area_factor(order)
             inten = np.where(in_seg, np.exp(-2.0 * (rr ** 2 / w ** 2) ** order) / (np.pi * w ** 2 * C), np.nan)
-            mx = np.nanmax(inten)
-            if mx and mx > 0:
-                inten = inten / mx
+            norm = leg_norms[li] if leg_norms is not None else np.nanmax(inten)
+            if norm and norm > 0:
+                inten = np.clip(inten / norm, 0.0, 1.0)
             z = np.where(in_seg, inten, z)
         cum += seg_len
     return z
+
+
+_SIL_EXTENT = None
+
+
+def max_silhouette_extent():
+    """Largest silhouette half-extent (m) over a full β/α sweep — an airframe property, so the
+    SAME fixed value frames panel A across every run (identical scale, comparable silhouettes).
+    Cached."""
+    global _SIL_EXTENT
+    if _SIL_EXTENT is None:
+        samples, snorm, swt = m.get_surface_samples()
+        e = 0.0
+        for beta in range(0, 91, 10):
+            for alpha in range(0, 181, 30):
+                d = m.direction_from_beta_alpha(beta, alpha); d = d / np.linalg.norm(d)
+                r = m.rasterize_silhouette(d, samples, snorm, swt)
+                if r["u"].size:
+                    e = max(e, float(np.abs(r["u"]).max()), float(np.abs(r["v"]).max()))
+        _SIL_EXTENT = e
+    return _SIL_EXTENT
 
 
 def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
@@ -236,20 +306,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     frames_phys = [_frame_physics(kw, x, plane_alt_m, basis, coarse_mesh,
                                   lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
 
-    # Panel-A window: cover BOTH the self-occluded silhouette AND the (possibly elongated)
-    # beam spot across the whole pass, so the encircled-energy contours are never clipped
-    # at the frame edge. Use a WIDE window (separate horizontal/vertical half-extents) so
-    # the plot fills its full-width row instead of letterboxing to a small central square;
-    # scaleanchor below keeps it 1:1, so the spot shape is not distorted. The elliptical
-    # spot's major axis reaches ≈3.0·w0 at the 0.9 encircled ring (w_major = w0·√aspect,
-    # aspect capped at 8), so size the horizontal extent to clear that.
-    def _fld_ext(axis):
-        return max((float(np.abs(f["field"][axis]).max()) if f["field"][axis].size else 0.0)
-                   for f in frames_phys)
-    max_w0 = max(f["w0"] for f in frames_phys)
-    EXT_H = max(_fld_ext("u"), 3.2 * max_w0) * 1.1
-    EXT_V = max(_fld_ext("v"), 1.7 * max_w0) * 1.1
-    EXT_V = max(EXT_V, EXT_H / 2.2)                  # cap aspect so 1:1 mostly fills the wide row
+    # Panel-A window: a FIXED zoom, IDENTICAL in every figure (so silhouettes compare at one
+    # scale), sized so the airframe's largest silhouette dimension fills ~ZOOM_FILL of the
+    # panel's long (horizontal) axis. Wide window (aspect PANEL_A_ASPECT) matched to the wide
+    # panel so it fills the row; scaleanchor below keeps it 1:1, so the spot is undistorted.
+    # A heavily defocused beam can exceed this window and clip at the edges — the silhouette
+    # framing is the priority.
+    ZOOM_FILL = 0.75
+    PANEL_A_ASPECT = 2.0                             # panel A width:height (spans both columns)
+    EXT_H = max_silhouette_extent() / ZOOM_FILL
+    EXT_V = EXT_H / PANEL_A_ASPECT
+    box_r = max(2, round(grid_nA / 75))              # smoothing radius scales with resolution
     gx = np.linspace(-EXT_H, EXT_H, grid_n)          # contour grid (smooth beam)
     gy = np.linspace(-EXT_V, EXT_V, grid_n)
     gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the silhouette heatmap
@@ -283,8 +350,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         cell = iv * grid_nA + iu                       # z[row=v, col=u]
         ssum = np.zeros(grid_nA * grid_nA); cnt = np.zeros(grid_nA * grid_nA)
         np.add.at(ssum, cell, fld["incidence"]); np.add.at(cnt, cell, 1.0)
-        ss = _box_sum(ssum.reshape(grid_nA, grid_nA), 2)
-        cc = _box_sum(cnt.reshape(grid_nA, grid_nA), 2)
+        ss = _box_sum(ssum.reshape(grid_nA, grid_nA), box_r)
+        cc = _box_sum(cnt.reshape(grid_nA, grid_nA), box_r)
         z = np.where(cc > 0.5, ss / np.maximum(cc, 1e-9), np.nan)
         return z.astype(np.float32)                   # float32 halves the base64 payload
 
@@ -327,9 +394,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     relay_m0 = frames_phys[0]["chan_relay_m"]
     relay_r0 = frames_phys[0]["chan_relay_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
+    # Normalise the beam channel to the PASS's peak intensity, PER LEG — so the beam visibly
+    # brightens toward closest approach and dims at the edges, instead of every frame self-
+    # normalising to full brightness. Per leg keeps the faint wide up-leg of a relay visible.
+    chan_leg_norms = np.max([_leg_peak_intensity(f["chan_segments"]) for f in frames_phys], axis=0)
 
     def channel(f):
-        return _beam_channel(dist_norm, radial, f["chan_segments"], max_total, f["chan_total"]).astype(np.float32)
+        return _beam_channel(dist_norm, radial, f["chan_segments"], max_total, f["chan_total"],
+                             leg_norms=chan_leg_norms).astype(np.float32)
 
     # Panel E is an efficiency WATERFALL of the current instant (cascade of blocks from
     # 1.0 down through each stage's loss to η) — most stages are constant along the pass,
@@ -512,10 +584,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ]))
     fig.frames = frames
 
-    # The pass is scrubbed with the slider. Each step animates to a SINGLE frame (mode
-    # immediate, redraw True) — the one path that reliably redraws Heatmap/Waterfall (Plotly's
-    # native sequenced *play* only honours redraw on the first frame, freezing A/E/F), which
-    # is why there is no auto-play control: dragging the slider is the reliable way to view it.
+    # Slider steps animate to a SINGLE frame (mode immediate, redraw True) — the one path that
+    # reliably redraws Heatmap/Waterfall. Plotly's native sequenced *play* only honours redraw
+    # on the first frame (freezing A/E/F), so the ▶ play button is the custom sequential
+    # stepper injected via post_script instead of updatemenus.
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
@@ -559,11 +631,12 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_layout(
         template="plotly_dark", height=2100, width=1140,
         title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
-               f"horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — drag the slider to scrub the pass)"),
+               f"horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — drag the slider or press ▶ play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
-        fig.write_html(path, include_plotlyjs="inline", auto_play=False)
+        fig.write_html(path, include_plotlyjs="inline", auto_play=False,
+                       post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
     return fig
 
 
