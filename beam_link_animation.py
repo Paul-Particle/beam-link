@@ -123,27 +123,6 @@ def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     return beam.reshape(uu.shape)
 
 
-_SIL_EXTENT = None
-
-
-def max_silhouette_extent():
-    """Largest half-extent (m) of the plane's silhouette over a full β/α sweep — a
-    property of the airframe, so the SAME fixed value can frame panel A across every run,
-    making silhouettes directly comparable. Cached."""
-    global _SIL_EXTENT
-    if _SIL_EXTENT is None:
-        samples, snorm, swt = m.get_surface_samples()
-        e = 0.0
-        for beta in range(0, 91, 10):
-            for alpha in range(0, 181, 30):
-                d = m.direction_from_beta_alpha(beta, alpha); d = d / np.linalg.norm(d)
-                r = m.rasterize_silhouette(d, samples, snorm, swt)
-                if r["u"].size:
-                    e = max(e, float(np.abs(r["u"]).max()), float(np.abs(r["v"]).max()))
-        _SIL_EXTENT = e
-    return _SIL_EXTENT
-
-
 def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_m):
     """Intensity of the CONVERGING beam over a side view: y = along-PATH distance (fraction
     of the longest total path over the pass), x = radial offset. `segments` is a list of
