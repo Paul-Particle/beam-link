@@ -62,7 +62,7 @@ function applyFrame(k) {
 function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 8); }); }
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
-btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
+btn.style.cssText = 'position:absolute;left:6px;top:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
 function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
 function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
 btn.onclick = function(){ playing ? pause() : play(); };
@@ -732,7 +732,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
-    slider = dict(active=0, y=-0.04, x=0.10, len=0.85,
+    # Slider at the TOP (in the top margin, just under the title) alongside the ▶ play button,
+    # so the controls are reachable without scrolling to the bottom of this very tall figure.
+    slider = dict(active=0, y=1.0, yanchor="bottom", x=0.13, len=0.80,
                   currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)
     fig.update_layout(sliders=[slider])
 
@@ -781,10 +783,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
-        template="plotly_dark", height=2500, width=1140,
-        title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
-               f"horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — drag the slider or press ▶ play)"),
-        legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
+        template="plotly_dark", height=2560, width=1140, margin=dict(t=210, l=60, r=30, b=60),
+        title=dict(text=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, "
+                         f"{pass_kind}, horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — "
+                         f"press ▶ play or drag the slider above)"), y=0.995, yanchor="top"),
+        legend=dict(orientation="h", y=1.085, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
         # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): plotly's native

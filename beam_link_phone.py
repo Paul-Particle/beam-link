@@ -97,18 +97,19 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
-    fig.update_layout(sliders=[dict(active=0, y=-0.03, x=0.08, len=0.86,
-                                    currentvalue=dict(prefix="along-track: ", suffix=" km"),
+    # Slider at the TOP (in the top margin) beside the ▶ play button, so on a phone the
+    # controls are reachable without scrolling past both panels.
+    fig.update_layout(sliders=[dict(active=0, y=1.0, yanchor="bottom", x=0.14, len=0.80,
+                                    currentvalue=dict(prefix="", suffix=" km"),
                                     steps=steps)])
     for row in (1, 2):
         fig.update_xaxes(title_text="radial offset (m)", range=[-R, R], row=row, col=1)
         fig.update_yaxes(title_text="emitter → plane", range=[0, 1], row=row, col=1)
-    fig.update_layout(template="plotly_dark", height=1120, width=520,
-                      margin=dict(l=52, r=16, t=54, b=48),
-                      title=dict(text=f"Beam channel — {arch_name}, {emitter_diam_m:.0f} m emitter, "
-                                      f"{weather}, {lateral_offset_km:.0f} km pass<br>"
-                                      "<sub>plane height = slant/max-slant · green = enclosed-energy "
-                                      "fraction · cyan = plane surface</sub>", font=dict(size=13)))
+    fig.update_layout(template="plotly_dark", height=1120, width=260,
+                      margin=dict(l=44, r=12, t=104, b=44),
+                      title=dict(text=f"Beam channel<br><sub>{arch_name}, {emitter_diam_m:.0f} m, "
+                                      f"{lateral_offset_km:.0f} km pass · green = enclosed energy · "
+                                      f"cyan = plane</sub>", y=0.995, yanchor="top", font=dict(size=12)))
     if write:
         import os
         os.makedirs(OUT, exist_ok=True)
