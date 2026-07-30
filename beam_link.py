@@ -34,6 +34,7 @@ from math import gamma
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 import napkin
 import geo
@@ -439,8 +440,6 @@ class LinkConfig:
     tau_target: float = 2.0
     polarization: str = "circular"
     shaped_spot: bool = True                        # phased-array elliptical spot (vs round aperture)
-    defocus: bool = True                            # spread the spot rather than over-focus onto a tiny patch
-    defocus_fill: float = 0.8                       # min spot waist = defocus_fill × √(A/π)
     spot_match: float = 0.90                        # deprecated: overlap_capture supersedes it
     # Rectenna element angular-response floor: the conversion still standing at grazing
     # incidence (eff = floor + (1−floor)·cosθ). 0.90 assumes a PHASED-ARRAY / CONFORMAL
@@ -454,10 +453,11 @@ class LinkConfig:
     # Used directly when adaptive_profile is off; otherwise it's the Gaussian fallback.
     beam_profile_order: float = 1.0
     # Like the spot's size and elliptical shape, the radial profile is a phased-array knob:
-    # pick it per geometry (try each order, keep whichever delivers more under the density
-    # cap — flat top for a contained spot, peaked Gaussian when it overspills). #(verify)
+    # pick it per geometry to maximise capture under the density cap — a continuous order in
+    # [1, profile_order_max] (flat top for a contained spot, peaked Gaussian when it
+    # overspills), optimised rather than snapped to a discrete set. #(verify)
     adaptive_profile: bool = True
-    profile_orders: tuple = (1.0, 2.0, 3.0, 4.0)    # candidate orders when adaptive_profile
+    profile_order_max: float = 4.0                  # upper bound of the optimised order range
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
     # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
@@ -511,11 +511,12 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_wai
     if emitter_diam_m is None:                     # size to τ_target on the equal-area disk
         emitter_diam_m = float(size_emitter_diameter(freq_ghz, slant, r_recv, cfg.tau_target))
     wavelength = napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
-    # Defocus: never focus tighter than ~the silhouette (keeps the power density sane);
-    # `extra_min_waist_m` is the power-density cap, applied by the caller once the power
-    # level is known.
+    # The spot focuses to the diffraction limit (overlap_capture's focused_spot_waist) and is
+    # defocused ONLY as much as the power-density cap requires — `extra_min_waist_m`, applied
+    # by the caller once the power level is known. (There is no separate silhouette-sized
+    # defocus floor: spreading beyond the cap would just spill power for no density benefit.)
     order = cfg.beam_profile_order if profile_order is None else float(profile_order)
-    min_waist = max(cfg.defocus_fill * r_recv if cfg.defocus else 0.0, extra_min_waist_m)
+    min_waist = extra_min_waist_m
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
                                         shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
                                         min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m,
@@ -545,28 +546,45 @@ def _peak_density(delivered_mw, capture, rect_total, w0, profile_order=1.0):
     return p_spot_w / (np.pi * w0 ** 2 * supergaussian_area_factor(profile_order))
 
 
+def _capture_for_order(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total, order):
+    """`plane_capture` at a given super-Gaussian order, defocused as much as the density cap
+    requires for THAT order (a flatter top has a lower peak, so it can stay under the cap in
+    a smaller footprint → less spill)."""
+    pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, profile_order=order)
+    w_req = _density_min_waist(delivered_mw, pc["capture"], rect_total,
+                               cfg.max_power_density_w_m2, order)
+    if w_req > pc["spot_waist_m"]:
+        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                           extra_min_waist_m=w_req, profile_order=order)
+    return pc
+
+
 def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total):
-    """Pick the beam's radial PROFILE (Gaussian vs flat-top) per geometry and enforce the
-    W/m² cap, returning the winning `plane_capture` dict. Like the spot's SIZE (waist,
-    already ranged over slant/defocus/density) and SHAPE (elliptical, already aligned to
-    the silhouette), the profile is a phased-array degree of freedom — so let the array
-    try each candidate order and keep whichever DELIVERS MORE under the density cap. This
-    is self-correcting: a flat top wins a contained, density-limited spot (lower peak → it
-    can shrink under the cap → less spill), while a peaked Gaussian wins when the spot
-    overspills the airframe (it concentrates more power on the small target)."""
-    orders = cfg.profile_orders if cfg.adaptive_profile else (cfg.beam_profile_order,)
-    best = None
-    for order in orders:
-        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, profile_order=order)
-        # Spread the spot if the peak incident density is over the cap (for THIS profile).
-        w_req = _density_min_waist(delivered_mw, pc["capture"], rect_total,
-                                   cfg.max_power_density_w_m2, order)
-        if w_req > pc["spot_waist_m"]:
-            pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
-                               extra_min_waist_m=w_req, profile_order=order)
-        if best is None or pc["capture"] > best["capture"]:
-            best = pc
-    return best
+    """Pick the beam's radial PROFILE (Gaussian ↔ flat-top) per geometry and enforce the
+    W/m² cap, returning the winning `plane_capture` dict. Like the spot's SIZE (waist, ranged
+    over slant/density) and SHAPE (elliptical, aligned to the silhouette), the profile is a
+    continuous phased-array degree of freedom — so optimise the super-Gaussian order over
+    [1, profile_order_max] for maximum capture under the cap, rather than snapping to a
+    discrete set. This is self-correcting: a flat top wins a contained, density-limited spot
+    (lower peak → it shrinks under the cap → less spill), while a peaked Gaussian wins when
+    the spot overspills the airframe (it concentrates more power on the small target)."""
+    if not cfg.adaptive_profile:
+        return _capture_for_order(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                                  delivered_mw, rect_total, cfg.beam_profile_order)
+
+    def neg_capture(order):
+        return -_capture_for_order(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                                   delivered_mw, rect_total, float(order))["capture"]
+
+    res = minimize_scalar(neg_capture, bounds=(1.0, cfg.profile_order_max),
+                          method="bounded", options=dict(xatol=1e-2))
+    # The optimum can sit at either bound (Gaussian when overspilling, max flat-top when
+    # tightly contained); guard the interior result against the endpoints so we never return
+    # an interior local max that a bound beats.
+    candidates = [1.0, cfg.profile_order_max, float(res.x)]
+    best_order = min(candidates, key=neg_capture)
+    return _capture_for_order(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                              delivered_mw, rect_total, best_order)
 
 
 def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):

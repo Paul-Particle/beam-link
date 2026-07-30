@@ -59,10 +59,13 @@ def _edge_raster(freq_ghz, min_elev_deg):
 def size_apertures(freq_ghz, min_elev_deg):
     """Round τ≈2 design diameter, and the smaller SHAPED (elliptical) diameter that matches
     its capture. Capture-vs-aperture is unimodal (over-large aperture → tiny over-focused
-    spot), so we anchor on the round τ≈2 design (with the engine's defocus floor, consistent
-    with flyby) and scan DOWN for the smallest shaped D that still matches its capture."""
+    spot), so we anchor on the round τ≈2 design and scan DOWN for the smallest shaped D that
+    still matches its capture. NOTE: this uses a fixed silhouette-sized min_waist purely as a
+    STABLE sizing reference; it is no longer the engine's waist rule (the engine now focuses
+    to the diffraction limit and defocuses only for the density cap) — the aperture sizing
+    here needs its own reconciliation pass against the updated engine. #(verify)"""
     raster, slant, lam, r_recv = _edge_raster(freq_ghz, min_elev_deg)
-    min_waist = 0.8 * r_recv                                  # engine defocus default
+    min_waist = 0.8 * r_recv                                  # sizing reference only (see note)
     D_round = n.emitter_diameter_m(freq_ghz, slant / 1e3, r_recv)
     eff_round = bl.overlap_capture(raster, D_round / 2.0, lam, slant, shaped=False,
                                    min_waist_m=min_waist, incidence_floor=0.90)[1]

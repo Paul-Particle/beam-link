@@ -103,7 +103,7 @@ def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     n = float(profile_order)
     uu, vv = np.meshgrid(gx, gy)
     if not shaped or field["u"].size < 3:
-        return np.exp(-2.0 * ((uu ** 2 + vv ** 2) / w0 ** 2) ** n)
+        return np.exp(-2.0 * ((uu ** 2 + vv ** 2) / w0 ** 2) ** n), w0, w0
     coords = np.vstack([field["u"], field["v"]])
     evals, evecs = np.linalg.eigh(np.cov(coords))
     aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, 8.0)
@@ -111,14 +111,7 @@ def _beam_on_grid(field, w0, shaped, gx, gy, profile_order=1.0):
     flat = np.vstack([uu.ravel(), vv.ravel()])
     proj = evecs.T @ flat                       # rows: [along minor, along major]
     beam = np.exp(-2.0 * (proj[1] ** 2 / w_major ** 2 + proj[0] ** 2 / w_minor ** 2) ** n)
-    return beam.reshape(uu.shape)
-
-
-def _leg_peak_intensity(segments):
-    """Peak on-axis intensity of each leg = 1/(π·w_min²·C), reached at its narrowest waist.
-    Used to normalise the beam channel to the PASS peak (per leg) instead of per frame."""
-    return [1.0 / (np.pi * min(w_start, w_end) ** 2 * bl.supergaussian_area_factor(order))
-            for (w_start, w_end, seg_len, order) in segments]
+    return beam.reshape(uu.shape), w_major, w_minor
 
 
 def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_m, leg_norms=None):
@@ -147,6 +140,66 @@ def _beam_channel(distance_norm, radial, segments, total_shown_m, current_total_
             z = np.where(in_seg, inten, z)
         cum += seg_len
     return z
+
+
+def _channel_encircled(distance_norm, radial, segments, total_shown_m, current_total_m):
+    """The beam's radial ENCIRCLED-ENERGY fraction over the same side-view grid as
+    `_beam_channel`: at each (along-path, radial) cell, the fraction of that cross-section's
+    total power enclosed within radius |radial|. For a circular super-Gaussian of order n and
+    waist w it depends only on (r/w): frac(r) = ∫₀^{(r/w)²} e^(−2t^n) dt / C(n) (C from
+    supergaussian_area_factor). Contours at 0.1…0.9 draw the same enclosed-energy rings as
+    panel A, here as a funnel converging to the waist — so where the plane slice cuts the
+    funnel shows directly how much of the beam lands on the airframe vs spills past it."""
+    dd, rr = np.meshgrid(distance_norm, radial, indexing="ij")
+    s = dd * total_shown_m
+    z = np.full(s.shape, np.nan)
+    cum = 0.0
+    for (w_start, w_end, seg_len, order) in segments:
+        in_seg = (s >= cum) & (s < cum + seg_len) & (s <= current_total_m)
+        if seg_len > 0 and np.any(in_seg):
+            frac = np.clip((s - cum) / seg_len, 0.0, 1.0)
+            w = w_start + (w_end - w_start) * frac
+            u2 = (rr / np.maximum(w, 1e-9)) ** 2                  # (r/w)²
+            tg = np.linspace(0.0, float(np.nanmax(u2[in_seg])) + 1e-6, 512)
+            integrand = np.exp(-2.0 * tg ** order)
+            cdf = np.concatenate([[0.0], np.cumsum(0.5 * (integrand[1:] + integrand[:-1]) * np.diff(tg))])
+            enc = np.interp(u2, tg, cdf) / bl.supergaussian_area_factor(order)
+            z = np.where(in_seg, np.clip(enc, 0.0, 1.0), z)
+        cum += seg_len
+    return z
+
+
+def _emitter_phase(ae, be, d_vec, aperture_R, lam, normal_up):
+    """Wrapped per-element FOCUSING phase (rad, −π…π) across the emitter face, viewed FACE-ON.
+    To land the beam on the plane the array phase-conjugates the free-space path from each
+    element to the focal point (the plane): φ_full(p) = −(2π/λ)(|d − p| − |d|), which is a
+    linear STEERING ramp (aim toward the plane's bearing) plus a quadratic FOCUSING curvature.
+    On a flat ground aperture the steering ramp is thousands of cycles wide at 5.8 GHz for a
+    low, off-boresight plane — unresolvable and visually just moiré — so we remove it (subtract
+    p·d̂) and show only the focusing residual: a Fresnel zone-plate that tightens (more rings)
+    as the focus nears. That is the part that shows HOW the beam is focused. (A gimballed relay
+    already faces the plane, so its steering term is ~0 and nothing is removed.) NaN outside
+    the circular aperture."""
+    A, B = np.meshgrid(ae, be, indexing="ij")
+    inside = A ** 2 + B ** 2 <= aperture_R ** 2
+    if normal_up:                                        # face normal = world +z; axes = x, y
+        px, py, pz = A, B, np.zeros_like(A)
+    else:                                                # face normal = toward the plane
+        n = d_vec / max(np.linalg.norm(d_vec), 1e-9)
+        a_ax = np.cross(n, [0.0, 0.0, 1.0])
+        a_norm = np.linalg.norm(a_ax)
+        a_ax = a_ax / a_norm if a_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+        b_ax = np.cross(n, a_ax)
+        px = A * a_ax[0] + B * b_ax[0]
+        py = A * a_ax[1] + B * b_ax[1]
+        pz = A * a_ax[2] + B * b_ax[2]
+    D = float(np.linalg.norm(d_vec))
+    d_hat = d_vec / max(D, 1e-9)
+    dist = np.sqrt((d_vec[0] - px) ** 2 + (d_vec[1] - py) ** 2 + (d_vec[2] - pz) ** 2)
+    p_dot_dhat = px * d_hat[0] + py * d_hat[1] + pz * d_hat[2]   # linear steering term
+    phi = -(2.0 * np.pi / lam) * ((dist - D) + p_dot_dhat)       # steering removed → focusing
+    phi = (phi + np.pi) % (2.0 * np.pi) - np.pi                   # wrap to (−π, π]
+    return np.where(inside, phi, np.nan).astype(np.float32)
 
 
 _SIL_EXTENT = None
@@ -219,19 +272,38 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     verts, faces, normals = coarse_mesh
     face_incidence = np.clip(normals @ look, 0.0, 1.0)
 
+    # Beam ellipticity (shaped spot): the spot spans w_major along the silhouette's LONG axis
+    # and w_minor along its SHORT axis, at fixed etendue (w_major·w_minor = w0²). Panels F/F₂
+    # show the two orthogonal channel cuts; a round beam has w_major = w_minor = w0.
+    if cfg.shaped_spot and field["u"].size >= 3:
+        coords = np.vstack([field["u"], field["v"]])
+        ev, evec = np.linalg.eigh(np.cov(coords))
+        aspect = float(np.clip(np.sqrt(max(ev[1], 1e-12) / max(ev[0], 1e-12)), 1.0, 8.0))
+        proj = evec.T @ coords                           # rows: [along minor, along major]
+        sil_minor_m = float(np.abs(proj[0]).max())
+        sil_major_m = float(np.abs(proj[1]).max())
+    else:
+        aspect = 1.0
+        sil_major_m = sil_minor_m = sil_radial_m
+    w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
+
     # Panel-F beam-channel legs (end-to-end along the path). Relay = a ground→relay up-leg
     # (its ground aperture auto-sized to match the relay at that range) followed by the
-    # focused relay→plane down-leg; direct = a single ground→plane leg.
+    # focused relay→plane down-leg; direct = a single ground→plane leg. Two cuts (major/minor)
+    # differ only in the focal waist of the down-leg.
     if cfg.relay_pos is not None:
         station = np.asarray(cfg.station_pos, float)
         L1 = float(bl.geometry(station, np.asarray(cfg.relay_pos, float))[0])   # ground→relay
         r_relay = cfg.relay_aperture_diam_m / 2.0
         r_up = bl.size_emitter_diameter(cfg.f_emit_relay_ghz, L1, r_relay, cfg.tau_target) / 2.0
-        chan_segments = [(float(r_up), r_relay, L1, 1.0), (r_relay, w0, float(slant), order)]
+        up_leg = (float(r_up), r_relay, L1, 1.0)
+        chan_segments_major = [up_leg, (r_relay, w_major, float(slant), order)]
+        chan_segments_minor = [up_leg, (r_relay, w_minor, float(slant), order)]
         chan_total = L1 + float(slant)
         chan_relay_m, chan_relay_radius_m, chan_emit_radius_m = L1, r_relay, float(r_up)
     else:
-        chan_segments = [(float(diam / 2.0), w0, float(slant), order)]
+        chan_segments_major = [(float(diam / 2.0), w_major, float(slant), order)]
+        chan_segments_minor = [(float(diam / 2.0), w_minor, float(slant), order)]
         chan_total = float(slant)
         chan_relay_m, chan_relay_radius_m, chan_emit_radius_m = None, None, float(diam / 2.0)
 
@@ -240,10 +312,15 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     return dict(field=field, w0=w0, shaped=cfg.shaped_spot, profile_order=order,
                 geom=geom, eff=eff, eta=eta, elevation=float(elevation), slant_km=slant / 1e3,
                 slant_m=float(slant), emitter_radius_m=float(diam / 2.0), sil_radial_m=sil_radial_m,
-                chan_segments=chan_segments, chan_total=chan_total, chan_relay_m=chan_relay_m,
+                chan_segments_major=chan_segments_major, chan_segments_minor=chan_segments_minor,
+                chan_total=chan_total, chan_relay_m=chan_relay_m,
                 chan_relay_radius_m=chan_relay_radius_m, chan_emit_radius_m=chan_emit_radius_m,
+                w_major=w_major, w_minor=w_minor,
+                sil_major_m=sil_major_m, sil_minor_m=sil_minor_m,
                 beta=float(beta), area=raster["area"], look=look, face_incidence=face_incidence,
                 plane_loc=plane_loc, emitter_loc=emitter_loc,
+                phase_d=(np.asarray(plane, float) - emitter), phase_R=float(diam / 2.0),
+                phase_lam=lam, phase_normal_up=(cfg.relay_pos is None),
                 wf_labels=[lbl for lbl, _ in wf], wf_values=[v for _, v in wf])
 
 
@@ -326,14 +403,18 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     def encircled_grid(f):
         """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
-        of total beam energy carried by all cells at least as bright — so contours at
-        0.1…0.9 are rings enclosing that fraction of the delivered energy (centre ≈ 0,
-        spilling out to 1). Drawn as an SVG contour over the silhouette heatmap."""
-        beam_grid = _beam_on_grid(f["field"], f["w0"], f["shaped"], gx, gy,
-                                  profile_order=f["profile_order"])
+        of the beam's TOTAL energy carried by all cells at least as bright — so contours at
+        0.1…0.9 are rings enclosing that fraction of the radiated beam (centre ≈ 0). The
+        normalisation is the ANALYTIC total (π·w_major·w_minor·C(n)), NOT the in-window sum —
+        so when the beam overspills the panel window the outer rings correctly fail to appear
+        (the beam is shown as uncontained), matching the low capture number."""
+        beam_grid, w_maj, w_min = _beam_on_grid(f["field"], f["w0"], f["shaped"], gx, gy,
+                                                 profile_order=f["profile_order"])
         flat = beam_grid.ravel()
         order = np.argsort(flat)[::-1]
-        csum = np.cumsum(flat[order]) / max(flat.sum(), 1e-30)
+        dcell = (gx[1] - gx[0]) * (gy[1] - gy[0])
+        total = np.pi * w_maj * w_min * bl.supergaussian_area_factor(f["profile_order"])
+        csum = np.clip(np.cumsum(flat[order]) * dcell / max(total, 1e-30), 0.0, 1.0)
         encircled = np.empty_like(flat)
         encircled[order] = csum
         return encircled.reshape(beam_grid.shape).astype(np.float32)
@@ -385,25 +466,40 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     dt_s = (xs[1] - xs[0]) / 250.0                                       # 250 m/s cruise
     deliverable_mw = (delivered_mw / peak) * (eta_series / 100.0)
     cum_gj = np.cumsum(deliverable_mw * dt_s) / 1e3                      # MW·s = MJ → GJ
-    # Panel F (beam channel) axes — y spans the whole path (relay = up-leg + down-leg), so
-    # normalise to the longest total path over the pass; the relay node sits at a fixed y.
-    max_total = max(f["chan_total"] for f in frames_phys)
-    R_max = max(max(f["chan_emit_radius_m"], f["chan_relay_radius_m"] or 0.0, f["w0"], f["sil_radial_m"])
-                for f in frames_phys) * 1.1
+    # Panel F/F₂ (beam channel) axes — y is normalised PER FRAME to that frame's own
+    # emitter→plane path, so the funnel always fills the panel (emitter at 0, plane at 1) and
+    # its convergence stays legible at every slant (a fixed longest-path scale squashed the
+    # short-slant, closest-approach frames — the important ones — into a thin strip).
+    # Radial extent anchored to the EMITTER aperture and the silhouette (both bounded), NOT to
+    # the beam waist: far out the defocused elliptical major waist is hundreds of m, which would
+    # shrink the emitter and all near-field detail to a blob. A beam wider than this window
+    # simply fills the panel with no contours — the correct read for a badly overspilling beam.
+    r_emit = max(f["chan_emit_radius_m"] for f in frames_phys)
+    r_sil = max(f["sil_major_m"] for f in frames_phys)
+    R_max = 1.4 * max(r_emit, r_sil)
     dist_norm = np.linspace(0.0, 1.0, 96)
     radial = np.linspace(-R_max, R_max, 76)
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
-    relay_m0 = frames_phys[0]["chan_relay_m"]
-    relay_r0 = frames_phys[0]["chan_relay_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
-    # Normalise the beam channel to the PASS's peak intensity, PER LEG — so the beam visibly
-    # brightens toward closest approach and dims at the edges, instead of every frame self-
-    # normalising to full brightness. Per leg keeps the faint wide up-leg of a relay visible.
-    chan_leg_norms = np.max([_leg_peak_intensity(f["chan_segments"]) for f in frames_phys], axis=0)
 
-    def channel(f):
-        return _beam_channel(dist_norm, radial, f["chan_segments"], max_total, f["chan_total"],
-                             leg_norms=chan_leg_norms).astype(np.float32)
+    # Each frame self-normalises the channel intensity to its own peak, so the beam shape is
+    # always visible (the pass-peak scale left all but the closest frames dark blue). The
+    # encircled-energy contours are absolute fractions, so brightness normalisation is moot
+    # for reading "how much lands on the plane".
+    def channel(f, seg_key):
+        return _beam_channel(dist_norm, radial, f[seg_key], f["chan_total"], f["chan_total"],
+                             leg_norms=None).astype(np.float32)
+
+    def channel_enc(f, seg_key):
+        return _channel_encircled(dist_norm, radial, f[seg_key], f["chan_total"],
+                                  f["chan_total"]).astype(np.float32)
+
+    # Panel G: the emitter face at the SAME radial scale as panels F/F₂ (±R_max), coloured by
+    # the per-element FOCUSING phase taper (Fresnel zone rings; steering ramp removed).
+    ae = np.linspace(-R_max, R_max, 141)
+    def emit_phase(f):
+        return _emitter_phase(ae, ae, f["phase_d"], f["phase_R"], f["phase_lam"],
+                              f["phase_normal_up"])
 
     # Panel E is an efficiency WATERFALL of the current instant (cascade of blocks from
     # 1.0 down through each stage's loss to η) — most stages are constant along the pass,
@@ -421,18 +517,21 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # silhouette; the horizon-to-horizon arc). The remaining four sit below as a 2×2 grid,
     # each larger than in the old 2×3 packing: C | D on one row, E | F on the next.
     fig = make_subplots(
-        rows=4, cols=2, horizontal_spacing=0.09, vertical_spacing=0.06,
-        row_heights=[0.28, 0.27, 0.225, 0.225],
+        rows=5, cols=2, horizontal_spacing=0.09, vertical_spacing=0.055,
+        row_heights=[0.22, 0.21, 0.175, 0.175, 0.22],
         specs=[[{"type": "xy", "colspan": 2}, None],
                [{"type": "scene", "colspan": 2}, None],
                [{"type": "scene"}, {"secondary_y": True}],
+               [{"type": "xy"}, {"type": "xy"}],
                [{"type": "xy"}, {"type": "xy"}]],
         subplot_titles=("A · beam spot over silhouette (fill = incidence)",
                         "B · geometry on a spherical earth (vertical exaggerated)",
                         "C · BWB facets by beam incidence",
                         "D · capture, η & cumulative energy along the pass",
                         "E · efficiency waterfall (this instant)",
-                        "F · beam channel emitter→plane (radial exaggerated)"))
+                        "F · beam channel — major-axis cut (above the emitter)",
+                        "F₂ · beam channel — minor-axis cut (beside the emitter)",
+                        "G · emitter focusing phase (steering removed, face-on)"))
 
     # ---- Panel A (1,1): incidence heatmap (filled outline) + encircled-energy contour ---
     i_incA = len(fig.data)
@@ -539,35 +638,44 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
                   row=3, col=2, secondary_y=True)
 
-    # ---- Panel F (2,3): converging beam channel; emitter + (relay) apertures + plane slice
-    i_fheat = len(fig.data)
-    fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel(frames_phys[0]),
-                             colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
-                             showscale=False, hoverinfo="skip"), row=4, col=2)
-    fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",
-                             line=dict(color="white", width=5), name="emitter aperture",
-                             showlegend=False, hoverinfo="skip"), row=4, col=2)
-    if relay_m0 is not None:                          # relay node between the two legs
-        yr = relay_m0 / max_total
-        fig.add_trace(go.Scatter(x=[-relay_r0, relay_r0], y=[yr, yr], mode="lines",
-                                 line=dict(color="#ffd24a", width=5), name="relay aperture",
-                                 showlegend=False, hoverinfo="skip"), row=4, col=2)
-        fig.add_annotation(x=0.0, y=yr, row=4, col=2, text="relay", showarrow=False,
-                           yshift=8, font=dict(size=9, color="#ffd24a"))
-    sil0 = frames_phys[0]["sil_radial_m"]
-    i_fplane = len(fig.data)
-    fig.add_trace(go.Scatter(x=[-sil0, sil0], y=[frames_phys[0]["chan_total"] / max_total] * 2, mode="lines",
-                             line=dict(color="#00e5ff", width=4), name="plane",
-                             showlegend=False, hoverinfo="skip"), row=4, col=2)
+    # ---- Panels F / F₂: the two orthogonal beam-channel cuts (converging funnel; emitter
+    # aperture at the base, plane slice at the top). y is per-frame (emitter 0 → plane 1).
+    def add_channel_panel(seg_key, row, col):
+        heat_i = len(fig.data)
+        fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel(frames_phys[0], seg_key),
+                                 colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
+                                 showscale=False, hoverinfo="skip"), row=row, col=col)
+        cont_i = len(fig.data)
+        fig.add_trace(go.Contour(x=radial, y=dist_norm, z=channel_enc(frames_phys[0], seg_key),
+                                 showscale=False, colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
+                                 contours=contour_opts, line=dict(width=1.0), opacity=0.45,
+                                 hoverinfo="skip"), row=row, col=col)
+        fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",   # emitter aperture
+                                 line=dict(color="white", width=5), showlegend=False,
+                                 hoverinfo="skip"), row=row, col=col)
+        plane_i = len(fig.data)
+        fig.add_trace(go.Scatter(x=[-1.0, 1.0], y=[1.0, 1.0], mode="lines",     # plane slice (y=1)
+                                 line=dict(color="#00e5ff", width=4), showlegend=False,
+                                 hoverinfo="skip"), row=row, col=col)
+        return heat_i, cont_i, plane_i
+
+    i_fheat, i_fcont, i_fplane = add_channel_panel("chan_segments_major", 4, 2)     # above emitter
+    i_f2heat, i_f2cont, i_f2plane = add_channel_panel("chan_segments_minor", 5, 1)  # beside emitter
+
+    # ---- Panel G (5,2): emitter face, per-element focusing phase (cyclic colour) -----------
+    i_gphase = len(fig.data)
+    fig.add_trace(go.Heatmap(x=ae, y=ae, z=emit_phase(frames_phys[0]),
+                             colorscale="Phase", zmin=-np.pi, zmax=np.pi, zauto=False,
+                             showscale=False, hoverinfo="skip"), row=5, col=2)
 
     ANIMATED = [i_incA, i_contA, i_capA, i_plane, i_beam, i_wf, i_mesh, i_arrow,
-                i_eta_m, i_cap_m, i_cum_m, i_fheat, i_fplane]
+                i_eta_m, i_cap_m, i_cum_m, i_fheat, i_fcont, i_fplane,
+                i_f2heat, i_f2cont, i_f2plane, i_gphase]
     frames = []
     for k, f in enumerate(frames_phys):
         p = f["plane_loc"] / 1e3
         look = f["look"]
         cur = xs[k] / 1e3
-        yy = f["chan_total"] / max_total
         frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
             go.Heatmap(z=incidence_grid(f)),
             go.Contour(x=gx, y=gy, z=encircled_grid(f)),
@@ -581,8 +689,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             go.Scatter(x=[cur], y=[eta_series[k]]),
             go.Scatter(x=[cur], y=[capture_series[k]]),
             go.Scatter(x=[cur], y=[cum_gj[k]]),
-            go.Heatmap(z=channel(f)),
-            go.Scatter(x=[-f["sil_radial_m"], f["sil_radial_m"]], y=[yy, yy]),
+            go.Heatmap(z=channel(f, "chan_segments_major")),
+            go.Contour(x=radial, y=dist_norm, z=channel_enc(f, "chan_segments_major")),
+            go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[1.0, 1.0]),
+            go.Heatmap(z=channel(f, "chan_segments_minor")),
+            go.Contour(x=radial, y=dist_norm, z=channel_enc(f, "chan_segments_minor")),
+            go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[1.0, 1.0]),
+            go.Heatmap(z=emit_phase(f)),
         ]))
     fig.frames = frames
 
@@ -609,8 +722,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_yaxes(title_text="capture / η (%)", range=[0, d_left], secondary_y=False, row=3, col=2)
     fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
                      secondary_y=True, row=3, col=2)
+    # Panels F (above emitter) & F₂ (beside emitter): same radial scale as the emitter face.
     fig.update_xaxes(title_text="radial offset (m)", range=[-R_max, R_max], row=4, col=2)
-    fig.update_yaxes(title_text="distance emitter→plane (norm.)", range=[0, 1], row=4, col=2)
+    fig.update_yaxes(title_text="emitter→plane (norm.)", range=[0, 1], row=4, col=2)
+    fig.update_xaxes(title_text="radial offset (m)", range=[-R_max, R_max], row=5, col=1)
+    fig.update_yaxes(title_text="emitter→plane (norm.)", range=[0, 1], row=5, col=1)
+    # Panel G: same radial (x) scale as F/F₂, 1:1 so the aperture reads as a round disk.
+    # scaleanchor must reference THIS subplot's own x-axis (its id, e.g. "x9"), not "x" (=x1).
+    g_xaxis = fig.data[i_gphase].xaxis                    # "x", "x2", … for panel G's x-axis
+    fig.update_xaxes(title_text="aperture x (m)", range=[-R_max, R_max], row=5, col=2)
+    fig.update_yaxes(title_text="aperture y (m)", range=[-R_max, R_max], scaleanchor=g_xaxis,
+                     scaleratio=1, row=5, col=2)
     # Panel B: the model curvature is real (physics uses it); the DISPLAY exaggerates the
     # vertical so the arc is visible. Narrower box (less extreme x aspect) + closer camera
     # so the arc fills the viewport without clipping the axis labels.
@@ -631,7 +753,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
-        template="plotly_dark", height=2100, width=1140,
+        template="plotly_dark", height=2500, width=1140,
         title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
                f"horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — drag the slider or press ▶ play)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))

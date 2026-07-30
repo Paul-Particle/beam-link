@@ -316,7 +316,7 @@ def test_pointing_density():
     st, pl, relay = (0, 0, 0), (0, 0, 11e3), (0, 0, 20e3)
     base = dict(station_pos=st, plane_pos=pl, relay_pos=relay, relay_mode="multiplier",
                 f_emit_relay_ghz=5.8, f_relay_plane_ghz=17.4, relay_aperture_diam_m=40,
-                defocus=False, max_power_density_w_m2=None)
+                max_power_density_w_m2=None)
     # A tiny spot well inside a huge rectenna loses ~nothing to a 2 m pointing error —
     # the old exp(−2(δ/w)²) point-target factor wrongly tanked this.
     e0 = bl.evaluate(bl.LinkConfig(**base, pointing_error_m=0.0), 10.0)["eta_end_to_end"]
@@ -327,14 +327,14 @@ def test_pointing_density():
     # The power density is actually held under the cap (spot spread as needed).
     s = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, relay_pos=relay,
                     relay_mode="multiplier", f_emit_relay_ghz=5.8, f_relay_plane_ghz=17.4,
-                    relay_aperture_diam_m=40, defocus=False), 10.0)
+                    relay_aperture_diam_m=40), 10.0)
     check("incident power density held under the 25 W/cm² cap",
           s["power_density_w_m2"] <= 2.5e5 * 1.02, f"{s['power_density_w_m2']/1e4:.1f} W/cm²")
     # More delivered power → the cap forces a larger spot (lower peak-power geometry).
     lo = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=5.8,
-                     emitter_diam_m=78.0, defocus=False), 1.0)["spot_waist_m"]
+                     emitter_diam_m=78.0), 1.0)["spot_waist_m"]
     hi = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=5.8,
-                     emitter_diam_m=78.0, defocus=False), 40.0)["spot_waist_m"]
+                     emitter_diam_m=78.0), 40.0)["spot_waist_m"]
     check("higher delivered power → larger enforced spot", hi >= lo,
           f"1 MW → {lo:.1f} m, 40 MW → {hi:.1f} m")
 
@@ -372,26 +372,34 @@ def test_flattop():
 
 
 def test_adaptive_profile():
-    print("\n[adaptive spot profile — flat-top when contained, Gaussian when overspilling]")
+    print("\n[adaptive spot profile — flat-top when a capped spot would spill, else Gaussian]")
     st, relay = (0, 0, 0), (0, 0, 20e3)
     base = dict(station_pos=st, relay_pos=relay, relay_mode="multiplier", f_emit_relay_ghz=5.8,
                 f_relay_plane_ghz=17.4, relay_aperture_diam_m=40)
-    # Overhead: the density cap forces the spot wide but it still fits the plane → the array
-    # flattens the top (higher order) to shrink it under the cap and spill less.
-    over = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 10.0)
-    check("overhead (contained, density-limited) → flat-top engaged", over["beam_profile_order"] > 1.0,
-          f"order {over['beam_profile_order']:.0f}")
+    # High delivered power overhead: the density cap forces the spot wide enough that a plain
+    # Gaussian would spill past the plane → the array flattens the top (higher order) to fit
+    # the same power under the cap in a smaller footprint, spilling less. The order is
+    # optimised continuously in [1, profile_order_max], so expect an interior/upper value.
+    hot = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 40.0)
+    check("capped-and-spilling spot → flat-top engaged", hot["beam_profile_order"] > 1.0,
+          f"order {hot['beam_profile_order']:.2f}")
+    # Moderate power overhead: the cap-limited spot still fits the plane, so no flat-top is
+    # needed — the optimiser keeps a near-Gaussian. (Under the OLD silhouette-sized defocus
+    # floor this spot was forced wide and spilled, wrongly engaging a flat-top.)
+    warm = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 10.0)
+    check("contained capped spot → stays ~Gaussian", warm["beam_profile_order"] < 1.5,
+          f"order {warm['beam_profile_order']:.2f}")
     # Far out: the spot overspills the foreshortened sliver → a peaked Gaussian delivers
-    # more to the small target, so the array stays Gaussian.
+    # more to the small target, so the array stays Gaussian (the lower bound).
     dr = float(bl.geo.downrange_for_elevation(3.0, 11e3))
     far = bl.evaluate(bl.LinkConfig(plane_pos=(dr, 0, 11e3), **base), 10.0)
     check("far out (overspilling) → stays Gaussian", far["beam_profile_order"] == 1.0,
-          f"order {far['beam_profile_order']:.0f}")
+          f"order {far['beam_profile_order']:.2f}")
     # Turning adaptation off pins the configured order.
     fixed = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), adaptive_profile=False,
                                       beam_profile_order=1.0, **base), 10.0)
     check("adaptive off pins the order", fixed["beam_profile_order"] == 1.0,
-          f"order {fixed['beam_profile_order']:.0f}")
+          f"order {fixed['beam_profile_order']:.2f}")
 
 
 def test_energy_balance():
