@@ -275,17 +275,21 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
 
     # Beam ellipticity (shaped spot): the spot spans w_major along the silhouette's LONG axis
     # and w_minor along its SHORT axis, at fixed etendue (w_major·w_minor = w0²). Panels F/F₂
-    # show the two orthogonal channel cuts; a round beam has w_major = w_minor = w0.
-    if cfg.shaped_spot and field["u"].size >= 3:
+    # show the two orthogonal channel cuts; a round beam has w_major = w_minor = w0. The
+    # silhouette's TRUE major/minor extents are computed regardless of the spot shape (so a
+    # ROUND-emitter figure still shows the beam over the elongated outline); only the SPOT
+    # aspect is gated on shaped_spot (round → aspect 1).
+    if field["u"].size >= 3:
         coords = np.vstack([field["u"], field["v"]])
         ev, evec = np.linalg.eigh(np.cov(coords))
-        aspect = float(np.clip(np.sqrt(max(ev[1], 1e-12) / max(ev[0], 1e-12)), 1.0, 8.0))
         proj = evec.T @ coords                           # rows: [along minor, along major]
         sil_minor_m = float(np.abs(proj[0]).max())
         sil_major_m = float(np.abs(proj[1]).max())
+        sil_aspect = float(np.clip(np.sqrt(max(ev[1], 1e-12) / max(ev[0], 1e-12)), 1.0, 8.0))
     else:
-        aspect = 1.0
         sil_major_m = sil_minor_m = sil_radial_m
+        sil_aspect = 1.0
+    aspect = sil_aspect if cfg.shaped_spot else 1.0
     w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
 
     # Panel-F beam-channel legs (end-to-end along the path). Relay = a ground→relay up-leg
