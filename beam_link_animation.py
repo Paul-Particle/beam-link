@@ -265,7 +265,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
-                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
+                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, native_play=False,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
 
@@ -591,9 +591,26 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
-    fig.update_layout(
-        sliders=[dict(active=0, y=-0.04, x=0.10, len=0.85,
-                      currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)])
+    slider = dict(active=0, y=-0.04, x=0.10, len=0.85,
+                  currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)
+    layout_controls = dict(sliders=[slider])
+    if native_play:
+        # Plotly's OWN play/pause (updatemenus) — the standard sequenced animation. redraw=True
+        # forces the heatmaps/waterfall to repaint each frame (else they freeze); the cost is
+        # that plotly rebuilds the whole figure per frame, which can flicker the 3-D scenes.
+        layout_controls["updatemenus"] = [dict(
+            type="buttons", direction="left", showactive=False, x=0.10, y=-0.11, xanchor="left",
+            pad=dict(t=0, r=6),
+            buttons=[
+                dict(label="▶ play", method="animate",
+                     args=[None, dict(mode="immediate", fromcurrent=True,
+                                      frame=dict(duration=40, redraw=True),
+                                      transition=dict(duration=0))]),
+                dict(label="⏸ pause", method="animate",
+                     args=[[None], dict(mode="immediate",
+                                        frame=dict(duration=0, redraw=False),
+                                        transition=dict(duration=0))])])]
+    fig.update_layout(**layout_controls)
 
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
                      range=[-EXT_H, EXT_H], row=1, col=1)
@@ -635,8 +652,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
-        fig.write_html(path, include_plotlyjs="inline", auto_play=False,
-                       post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
+        # Custom stepper button only when NOT using plotly's native play (avoid two buttons).
+        post = None if native_play else _PLAYER_JS.replace("{n_frames}", str(n_frames))
+        fig.write_html(path, include_plotlyjs="inline", auto_play=False, post_script=post)
     return fig
 
 
