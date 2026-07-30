@@ -286,6 +286,136 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     return fig
 
 
+def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
+                      L_min_km=3.0, L_max_km=250.0, n_frames=25, grid_dist=70,
+                      grid_radial=90, R_m=230.0, write=True, path=f"{OUT}/focus_phone.html"):
+    """Pure FOCUSING sweep (no plane, no atmosphere): a circular array vs an elliptical array
+    of the same aperture area, focusing from as close as possible to as far as possible.
+
+    The focal-spot waist grows linearly with focal range, w ∝ λ·L / (aperture extent in that
+    axis) — so a fixed aperture cannot hold a tight spot at long range: past L ≈ π·r²/(√2·λ)
+    the 'focus' waist exceeds the aperture itself (the beam diverges — the dashed line marks the
+    aperture radius). The circle focuses the same in both axes; the ellipse focuses TIGHTER in
+    its long-aperture (minor-spot) axis and looser in the other, holding focus to longer range
+    on one axis at the cost of the other. Four cuts {circle, ellipse} × {major, minor} plus the
+    waist-vs-range curves. Slider = focal range.
+
+    Run:  uv run python beam_link_phone.py   → out/focus_phone.html"""
+    lam = bl.napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
+    r = emitter_diam_m / 2.0
+    A = float(fixed_aspect)
+    ap_maj, ap_min = r / np.sqrt(A), r * np.sqrt(A)     # aperture semi-axis feeding major/minor cut
+    Ls = np.geomspace(L_min_km * 1e3, L_max_km * 1e3, n_frames)
+    dist = np.linspace(0.0, 1.0, grid_dist)
+    radial = np.linspace(-R_m, R_m, grid_radial)
+
+    def w0(L):
+        return float(bl.focused_spot_waist(lam, L, r))
+
+    def seg(ap, waist, L):
+        return [(float(ap), float(waist), float(L), 1.0)]
+
+    def chan(ap, waist, L):
+        return anim._beam_channel(dist, radial, seg(ap, waist, L), L, L, leg_norms=None).astype(np.float32)
+
+    def enc(ap, waist, L):
+        return anim._channel_encircled(dist, radial, seg(ap, waist, L), L, L).astype(np.float32)
+
+    # per-case (aperture semi-axis, waist-at-focus as a function of L)
+    cases = [("circular array · major-axis cut", r, lambda L: w0(L), "#f2b134"),
+             ("circular array · minor-axis cut", r, lambda L: w0(L), "#f2b134"),
+             (f"elliptical array ({A:.1f}:1) · major-axis cut", ap_maj, lambda L: w0(L) * np.sqrt(A), "#00e5ff"),
+             (f"elliptical array ({A:.1f}:1) · minor-axis cut", ap_min, lambda L: w0(L) / np.sqrt(A), "#00e5ff")]
+
+    contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
+                        labelfont=dict(size=7, color="#c8ffe6"))
+    fig = make_subplots(rows=5, cols=1, vertical_spacing=0.05,
+                        row_heights=[0.21, 0.21, 0.21, 0.21, 0.16],
+                        subplot_titles=tuple(c[0] for c in cases) + ("focal-spot waist vs focal range",))
+
+    L0 = Ls[0]
+    cut_idx = []
+    for row, (_, ap, wfn, color) in enumerate(cases, start=1):
+        heat_i = len(fig.data)
+        fig.add_trace(go.Heatmap(x=radial, y=dist, z=chan(ap, wfn(L0), L0), colorscale="Plasma",
+                                 zmin=0, zmax=1, zauto=False, zsmooth="fast", showscale=False,
+                                 hoverinfo="skip"), row=row, col=1)
+        cont_i = len(fig.data)
+        fig.add_trace(go.Contour(x=radial, y=dist, z=enc(ap, wfn(L0), L0), showscale=False,
+                                 colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
+                                 contours=contour_opts, line=dict(width=1.0), opacity=0.5,
+                                 hoverinfo="skip"), row=row, col=1)
+        fig.add_trace(go.Scatter(x=[-ap, ap], y=[0.0, 0.0], mode="lines",
+                                 line=dict(color="white", width=5), showlegend=False,
+                                 hoverinfo="skip"), row=row, col=1)                 # aperture (fixed)
+        bar_i = len(fig.data)
+        w = wfn(L0)
+        fig.add_trace(go.Scatter(x=[-w, w], y=[1.0, 1.0], mode="lines",
+                                 line=dict(color=color, width=4), showlegend=False,
+                                 hoverinfo="skip"), row=row, col=1)                 # focal waist (grows)
+        cut_idx.append((heat_i, cont_i, bar_i, ap, wfn))
+
+    # ---- waist-vs-range curves (row 5) ----
+    Lkm = Ls / 1e3
+    w0s = np.array([w0(L) for L in Ls])
+    fig.add_trace(go.Scatter(x=[Lkm[0], Lkm[-1]], y=[r, r], mode="lines", name="aperture radius",
+                             line=dict(color="#888888", width=1.2, dash="dot"), hoverinfo="skip"), row=5, col=1)
+    fig.add_trace(go.Scatter(x=Lkm, y=w0s * np.sqrt(A), mode="lines", name="ellipse major",
+                             line=dict(color="#00e5ff", width=2, dash="dash"), hoverinfo="skip"), row=5, col=1)
+    fig.add_trace(go.Scatter(x=Lkm, y=w0s, mode="lines", name="circle",
+                             line=dict(color="#f2b134", width=2.5), hoverinfo="skip"), row=5, col=1)
+    fig.add_trace(go.Scatter(x=Lkm, y=w0s / np.sqrt(A), mode="lines", name="ellipse minor",
+                             line=dict(color="#00e5ff", width=2.5), hoverinfo="skip"), row=5, col=1)
+    m_maj = len(fig.data); fig.add_trace(go.Scatter(x=[Lkm[0]], y=[w0s[0] * np.sqrt(A)], mode="markers",
+                             marker=dict(size=7, color="#00e5ff"), showlegend=False, hoverinfo="skip"), row=5, col=1)
+    m_cir = len(fig.data); fig.add_trace(go.Scatter(x=[Lkm[0]], y=[w0s[0]], mode="markers",
+                             marker=dict(size=7, color="#f2b134"), showlegend=False, hoverinfo="skip"), row=5, col=1)
+    m_min = len(fig.data); fig.add_trace(go.Scatter(x=[Lkm[0]], y=[w0s[0] / np.sqrt(A)], mode="markers",
+                             marker=dict(size=7, color="#00e5ff"), showlegend=False, hoverinfo="skip"), row=5, col=1)
+
+    animated = [i for (h, c, b, _, _) in cut_idx for i in (h, c, b)] + [m_maj, m_cir, m_min]
+    frames = []
+    for k in range(n_frames):
+        L = Ls[k]
+        data = []
+        for (h, c, b, ap, wfn) in cut_idx:
+            w = wfn(L)
+            data += [go.Heatmap(z=chan(ap, w, L)),
+                     go.Contour(x=radial, y=dist, z=enc(ap, w, L)),
+                     go.Scatter(x=[-w, w], y=[1.0, 1.0])]
+        data += [go.Scatter(x=[Lkm[k]], y=[w0s[k] * np.sqrt(A)]),
+                 go.Scatter(x=[Lkm[k]], y=[w0s[k]]),
+                 go.Scatter(x=[Lkm[k]], y=[w0s[k] / np.sqrt(A)])]
+        frames.append(go.Frame(name=str(k), traces=animated, data=data))
+    fig.frames = frames
+
+    steps = [dict(method="animate", label=f"{Ls[k]/1e3:.0f}",
+                  args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                                       transition=dict(duration=0))]) for k in range(n_frames)]
+    fig.update_layout(sliders=[dict(active=0, y=1.0, yanchor="bottom", x=0.14, len=0.78,
+                                    currentvalue=dict(prefix="focal range: ", suffix=" km"), steps=steps)])
+    for row in (1, 2, 3, 4):
+        fig.update_xaxes(title_text="radial (m)", range=[-R_m, R_m], row=row, col=1)
+        fig.update_yaxes(title_text="emitter → focus", range=[0, 1.03], row=row, col=1)
+    fig.update_xaxes(title_text="focal range (km)", type="log", row=5, col=1)
+    fig.update_yaxes(title_text="waist (m)", type="log", row=5, col=1)
+    fig.update_layout(template="plotly_dark", height=1560, width=300,
+                      margin=dict(l=48, r=12, t=120, b=44),
+                      legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center", font=dict(size=8)),
+                      title=dict(text=(f"Focusing: circle vs ellipse<br><sub>same area · {emitter_diam_m:.0f} m equiv "
+                                       f"({2*ap_min:.0f}×{2*ap_maj:.0f} m ellipse) · white=aperture · "
+                                       f"bar=focal waist · waist ∝ range</sub>"),
+                                 y=0.992, yanchor="top", font=dict(size=12)))
+    if write:
+        import os
+        os.makedirs(OUT, exist_ok=True)
+        post = anim._PLAYER_JS.replace("{n_frames}", str(n_frames))
+        fig.write_html(path, include_plotlyjs="inline", full_html=False, auto_play=False, post_script=post)
+    return fig
+
+
 if __name__ == "__main__":
     build_phone_comparison()
     print("wrote", f"{OUT}/flyby_phone.html")
+    build_phone_focus()
+    print("wrote", f"{OUT}/focus_phone.html")
