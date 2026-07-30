@@ -40,7 +40,8 @@ OUT = "out"
 _PLAYER_JS = """
 var gd = document.getElementById("{plot_id}");
 var N = {n_frames};
-var cur = 0, playing = false, timer = null;
+var FPS = {play_fps};                 // pass-frames shown per wall-clock second
+var cur = 0, playing = false, raf = null, busy = false, startTs = null, startFrame = 0;
 function frameByName(k) {
   var frs = (gd._transitionData && gd._transitionData._frames) || gd.frames || [];
   for (var i = 0; i < frs.length; i++) { if (frs[i] && frs[i].name === String(k)) return frs[i]; }
@@ -58,17 +59,26 @@ function applyFrame(k) {
   cur = k;
   return Promise.all(proms);
 }
-function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 8); }); }
+// Wall-clock playback: the frame shown is chosen from elapsed time, not incremented one per
+// tick — so if a frame is slow to draw the loop SKIPS ahead and motion stays real-time and
+// smooth instead of stuttering in slow-motion. `busy` prevents overlapping restyles.
+function loop(ts) {
+  if (!playing) return;
+  if (startTs === null) { startTs = ts; startFrame = cur; }
+  var target = (startFrame + Math.round((ts - startTs) / 1000 * FPS)) % N;
+  if (target !== cur && !busy) { busy = true; applyFrame(target).then(function(){ busy = false; }); }
+  raf = requestAnimationFrame(loop);
+}
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
 btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
-function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
-function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
+function play() { if (playing) return; playing = true; startTs = null; btn.textContent = '\\u275A\\u275A pause'; raf = requestAnimationFrame(loop); }
+function pause() { playing = false; if (raf) cancelAnimationFrame(raf); btn.textContent = '\\u25B6 play'; }
 btn.onclick = function(){ playing ? pause() : play(); };
 var host = gd.parentNode || gd;
 if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
 host.appendChild(btn);
-gd.on('plotly_sliderchange', function(e){ if (e && e.slider) cur = e.slider.active | 0; });
+gd.on('plotly_sliderchange', function(e){ if (e && e.slider) { cur = e.slider.active | 0; startTs = null; } });
 """
 
 
@@ -258,8 +268,8 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
-                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, write=True,
-                          path=f"{OUT}/beam_link_flyby_animation.html"):
+                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, play_fps=24,
+                          write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
 
     `arch_name` selects a named case from `standard_architectures`; pass `arch_kwargs`
@@ -426,7 +436,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # ---- Panel A (1,1): incidence heatmap (filled outline) + encircled-energy contour ---
     i_incA = len(fig.data)
     fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
-                             colorscale="Plasma", zmin=0, zmax=1, zauto=False,
+                             colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
                              showscale=False, hoverinfo="skip"), row=1, col=1)
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=9, color="#c8ffe6"))
@@ -531,7 +541,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # ---- Panel F (2,3): converging beam channel; emitter + (relay) apertures + plane slice
     i_fheat = len(fig.data)
     fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel(frames_phys[0]),
-                             colorscale="Plasma", zmin=0, zmax=1, zauto=False,
+                             colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
                              showscale=False, hoverinfo="skip"), row=4, col=2)
     fig.add_trace(go.Scatter(x=[-r_t0, r_t0], y=[0.0, 0.0], mode="lines",
                              line=dict(color="white", width=5), name="emitter aperture",
@@ -627,7 +637,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     if write:
         os.makedirs(OUT, exist_ok=True)
         fig.write_html(path, include_plotlyjs="inline", auto_play=False,
-                       post_script=_PLAYER_JS.replace("{n_frames}", str(n_frames)))
+                       post_script=(_PLAYER_JS.replace("{n_frames}", str(n_frames))
+                                    .replace("{play_fps}", str(play_fps))))
     return fig
 
 
