@@ -16,7 +16,9 @@ The point is to spot inconsistencies at a glance (does the silhouette collapse a
 edges? does the spot overspill? does the far wing go dark at grazing incidence? does
 the plane track the curve?) far faster than from tables.
 
-Run:  uv run python beam_link_animation.py   → out/beam_link_flyby_animation.html
+Run:  uv run python beam_link_animation.py   → out/flyby.html
+(the single reference case — see the __main__ block; call build_flyby_animation() directly
+for other architectures, apertures, weathers or pass geometries.)
 """
 import os
 
@@ -265,7 +267,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
-                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, native_play=False,
+                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
 
@@ -593,24 +595,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                        transition=dict(duration=0))]) for k in range(n_frames)]
     slider = dict(active=0, y=-0.04, x=0.10, len=0.85,
                   currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)
-    layout_controls = dict(sliders=[slider])
-    if native_play:
-        # Plotly's OWN play/pause (updatemenus) — the standard sequenced animation. redraw=True
-        # forces the heatmaps/waterfall to repaint each frame (else they freeze); the cost is
-        # that plotly rebuilds the whole figure per frame, which can flicker the 3-D scenes.
-        layout_controls["updatemenus"] = [dict(
-            type="buttons", direction="left", showactive=False, x=0.10, y=-0.11, xanchor="left",
-            pad=dict(t=0, r=6),
-            buttons=[
-                dict(label="▶ play", method="animate",
-                     args=[None, dict(mode="immediate", fromcurrent=True,
-                                      frame=dict(duration=40, redraw=True),
-                                      transition=dict(duration=0))]),
-                dict(label="⏸ pause", method="animate",
-                     args=[[None], dict(mode="immediate",
-                                        frame=dict(duration=0, redraw=False),
-                                        transition=dict(duration=0))])])]
-    fig.update_layout(**layout_controls)
+    fig.update_layout(sliders=[slider])
 
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
                      range=[-EXT_H, EXT_H], row=1, col=1)
@@ -652,29 +637,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
-        # Custom stepper button only when NOT using plotly's native play (avoid two buttons).
-        post = None if native_play else _PLAYER_JS.replace("{n_frames}", str(n_frames))
+        # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): plotly's native
+        # sequenced play only honours redraw on the first frame, freezing panels A/E/F.
+        post = _PLAYER_JS.replace("{n_frames}", str(n_frames))
         fig.write_html(path, include_plotlyjs="inline", auto_play=False, post_script=post)
     return fig
 
 
-# Relay vs direct at a common, meaningful emitter aperture (100 m everywhere), normal weather,
-# lateral pass — the head-to-head with the emitter no longer confounding the comparison.
-STUDY_WEATHER = "clear"
-STUDY_LATERAL_KM = 60.0
-EMITTER_M = 100.0
-DIRECT_ARCH = "5.8 direct"
-RELAY_ARCH = "relay ×3 mult 5.8→17.4"
-
-# (label, arch_name, emitter_diam_m, tag).
-STUDY_CASES = [
-    ("Relay ×3 — 100 m aperture", RELAY_ARCH, EMITTER_M, "relay_100m"),
-    ("5.8 direct — 100 m emitter", DIRECT_ARCH, EMITTER_M, "direct_100m"),
-]
-
-
+# The single reference case: 5.8 GHz weatherproof low band straight from a 100 m ground
+# emitter, clear air, a close 5 km lateral pass (the plane crossing near-overhead rather than
+# dead-on, so the geometry stays legible). Drag the slider or press ▶ play to scrub the pass.
 if __name__ == "__main__":
-    for _label, arch, diam, tag in STUDY_CASES:
-        build_flyby_animation(arch_name=arch, weather=STUDY_WEATHER, lateral_offset_km=STUDY_LATERAL_KM,
-                              emitter_diam_m=diam, path=f"{OUT}/beam_link_flyby_animation_{tag}.html")
-        print("wrote", f"{OUT}/beam_link_flyby_animation_{tag}.html")
+    build_flyby_animation(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
+                          emitter_diam_m=100.0, path=f"{OUT}/flyby.html")
+    print("wrote", f"{OUT}/flyby.html")
