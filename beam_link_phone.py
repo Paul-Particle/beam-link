@@ -287,26 +287,30 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
 
 
 def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
-                      L_min_km=3.0, L_max_km=250.0, n_frames=25, grid_dist=70,
+                      L_min_km=11.0, L_max_km=213.0, n_frames=25, grid_dist=90,
                       grid_radial=90, R_m=230.0, write=True, path=f"{OUT}/focus_phone.html"):
     """Pure FOCUSING sweep (no plane, no atmosphere): a circular array vs an elliptical array
-    of the same aperture area, focusing from as close as possible to as far as possible.
+    of the same aperture area, focusing from as close as possible to as far as possible. The
+    focus is drawn at its TRUE distance from the emitter (vertical axis in km, NOT normalised),
+    so the focal spot visibly travels up-range as you sweep — from overhead at cruise altitude
+    (11 km) to the 2° horizon (213 km). The beam is drawn only up to the focus.
 
-    The focal-spot waist grows linearly with focal range, w ∝ λ·L / (aperture extent in that
-    axis) — so a fixed aperture cannot hold a tight spot at long range: past L ≈ π·r²/(√2·λ)
-    the 'focus' waist exceeds the aperture itself (the beam diverges — the dashed line marks the
-    aperture radius). The circle focuses the same in both axes; the ellipse focuses TIGHTER in
-    its long-aperture (minor-spot) axis and looser in the other, holding focus to longer range
-    on one axis at the cost of the other. Four cuts {circle, ellipse} × {major, minor} plus the
-    waist-vs-range curves. Slider = focal range.
+    The focal-spot waist grows linearly with range, w ∝ λ·L / (aperture extent in that axis) —
+    so a fixed aperture cannot hold a tight spot at long range: once the waist bar is wider than
+    the white aperture bar the beam is diverging, not focusing. The circle focuses the same in
+    both axes; the ellipse focuses TIGHTER in its long-aperture (minor-spot) axis and looser in
+    the other, holding focus to longer range on one axis at the cost of the other. Four cuts
+    {circle, ellipse} × {major, minor} plus the waist-vs-range curves. Slider = focus distance.
 
     Run:  uv run python beam_link_phone.py   → out/focus_phone.html"""
     lam = bl.napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
     r = emitter_diam_m / 2.0
     A = float(fixed_aspect)
     ap_maj, ap_min = r / np.sqrt(A), r * np.sqrt(A)     # aperture semi-axis feeding major/minor cut
-    Ls = np.geomspace(L_min_km * 1e3, L_max_km * 1e3, n_frames)
-    dist = np.linspace(0.0, 1.0, grid_dist)
+    Ls = np.linspace(L_min_km * 1e3, L_max_km * 1e3, n_frames)
+    Lmax_m = L_max_km * 1e3
+    dist_norm = np.linspace(0.0, 1.0, grid_dist)
+    y_km = dist_norm * L_max_km                          # vertical axis = actual distance (km)
     radial = np.linspace(-R_m, R_m, grid_radial)
 
     def w0(L):
@@ -316,10 +320,10 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
         return [(float(ap), float(waist), float(L), 1.0)]
 
     def chan(ap, waist, L):
-        return anim._beam_channel(dist, radial, seg(ap, waist, L), L, L, leg_norms=None).astype(np.float32)
+        return anim._beam_channel(dist_norm, radial, seg(ap, waist, L), Lmax_m, L, leg_norms=None).astype(np.float32)
 
     def enc(ap, waist, L):
-        return anim._channel_encircled(dist, radial, seg(ap, waist, L), L, L).astype(np.float32)
+        return anim._channel_encircled(dist_norm, radial, seg(ap, waist, L), Lmax_m, L).astype(np.float32)
 
     # per-case (aperture semi-axis, waist-at-focus as a function of L)
     cases = [("circular array · major-axis cut", r, lambda L: w0(L), "#f2b134"),
@@ -337,11 +341,11 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
     cut_idx = []
     for row, (_, ap, wfn, color) in enumerate(cases, start=1):
         heat_i = len(fig.data)
-        fig.add_trace(go.Heatmap(x=radial, y=dist, z=chan(ap, wfn(L0), L0), colorscale="Plasma",
+        fig.add_trace(go.Heatmap(x=radial, y=y_km, z=chan(ap, wfn(L0), L0), colorscale="Plasma",
                                  zmin=0, zmax=1, zauto=False, zsmooth="fast", showscale=False,
                                  hoverinfo="skip"), row=row, col=1)
         cont_i = len(fig.data)
-        fig.add_trace(go.Contour(x=radial, y=dist, z=enc(ap, wfn(L0), L0), showscale=False,
+        fig.add_trace(go.Contour(x=radial, y=y_km, z=enc(ap, wfn(L0), L0), showscale=False,
                                  colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
                                  contours=contour_opts, line=dict(width=1.0), opacity=0.5,
                                  hoverinfo="skip"), row=row, col=1)
@@ -350,9 +354,9 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
                                  hoverinfo="skip"), row=row, col=1)                 # aperture (fixed)
         bar_i = len(fig.data)
         w = wfn(L0)
-        fig.add_trace(go.Scatter(x=[-w, w], y=[1.0, 1.0], mode="lines",
+        fig.add_trace(go.Scatter(x=[-w, w], y=[L0 / 1e3, L0 / 1e3], mode="lines",
                                  line=dict(color=color, width=4), showlegend=False,
-                                 hoverinfo="skip"), row=row, col=1)                 # focal waist (grows)
+                                 hoverinfo="skip"), row=row, col=1)                 # focal spot (travels)
         cut_idx.append((heat_i, cont_i, bar_i, ap, wfn))
 
     # ---- waist-vs-range curves (row 5) ----
@@ -381,8 +385,8 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
         for (h, c, b, ap, wfn) in cut_idx:
             w = wfn(L)
             data += [go.Heatmap(z=chan(ap, w, L)),
-                     go.Contour(x=radial, y=dist, z=enc(ap, w, L)),
-                     go.Scatter(x=[-w, w], y=[1.0, 1.0])]
+                     go.Contour(x=radial, y=y_km, z=enc(ap, w, L)),
+                     go.Scatter(x=[-w, w], y=[L / 1e3, L / 1e3])]
         data += [go.Scatter(x=[Lkm[k]], y=[w0s[k] * np.sqrt(A)]),
                  go.Scatter(x=[Lkm[k]], y=[w0s[k]]),
                  go.Scatter(x=[Lkm[k]], y=[w0s[k] / np.sqrt(A)])]
@@ -393,10 +397,10 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
     fig.update_layout(sliders=[dict(active=0, y=1.0, yanchor="bottom", x=0.14, len=0.78,
-                                    currentvalue=dict(prefix="focal range: ", suffix=" km"), steps=steps)])
+                                    currentvalue=dict(prefix="focus at: ", suffix=" km"), steps=steps)])
     for row in (1, 2, 3, 4):
         fig.update_xaxes(title_text="radial (m)", range=[-R_m, R_m], row=row, col=1)
-        fig.update_yaxes(title_text="emitter → focus", range=[0, 1.03], row=row, col=1)
+        fig.update_yaxes(title_text="distance from emitter (km)", range=[0, L_max_km * 1.02], row=row, col=1)
     fig.update_xaxes(title_text="focal range (km)", type="log", row=5, col=1)
     fig.update_yaxes(title_text="waist (m)", type="log", row=5, col=1)
     fig.update_layout(template="plotly_dark", height=1560, width=300,
@@ -404,7 +408,7 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
                       legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center", font=dict(size=8)),
                       title=dict(text=(f"Focusing: circle vs ellipse<br><sub>same area · {emitter_diam_m:.0f} m equiv "
                                        f"({2*ap_min:.0f}×{2*ap_maj:.0f} m ellipse) · white=aperture · "
-                                       f"bar=focal waist · waist ∝ range</sub>"),
+                                       f"bar=focal spot at its true range · waist ∝ range</sub>"),
                                  y=0.992, yanchor="top", font=dict(size=12)))
     if write:
         import os
