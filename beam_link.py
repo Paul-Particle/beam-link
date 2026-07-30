@@ -248,7 +248,8 @@ def supergaussian_area_factor(profile_order):
 
 def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=False,
                     incidence_floor=0.90, aspect_cap=8.0, min_waist_m=0.0,
-                    pointing_offset_m=0.0, profile_order=1.0, return_field=False):
+                    pointing_offset_m=0.0, profile_order=1.0, fixed_aspect=None,
+                    return_field=False):
     """Capture as the 2-D overlap of a focused beam spot with the true (self-occluded)
     silhouette — a Monte-Carlo integral over the visible surface samples, replacing
     √(A/π) sizing + τ-capture + a scalar spot_match.
@@ -294,7 +295,12 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     if not shaped or u.size < 3:
         beam = np.exp(-2.0 * ((su ** 2 + sv ** 2) / w0 ** 2) ** n)
     else:
-        aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap)
+        # `fixed_aspect` → a FIXED elliptical emitter (built once), aligned to the silhouette
+        # axes but NOT reshaped per geometry; else the adaptive aspect = silhouette elongation.
+        if fixed_aspect is not None:
+            aspect = max(float(fixed_aspect), 1.0)
+        else:
+            aspect = np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap)
         w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
         pc = evecs.T @ np.vstack([su, sv])             # rows: [along minor, along major]
         beam = np.exp(-2.0 * (pc[1] ** 2 / w_major ** 2 + pc[0] ** 2 / w_minor ** 2) ** n)
@@ -440,6 +446,10 @@ class LinkConfig:
     tau_target: float = 2.0
     polarization: str = "circular"
     shaped_spot: bool = True                        # phased-array elliptical spot (vs round aperture)
+    # If set, the emitter is a FIXED elliptical aperture of THIS aspect ratio (major:minor),
+    # same area as the round one, aligned to the silhouette axes — a single built array, NOT
+    # reshaped per geometry. None → the adaptive per-geometry aspect (silhouette elongation).
+    fixed_emitter_aspect: float | None = None
     spot_match: float = 0.90                        # deprecated: overlap_capture supersedes it
     # Rectenna element angular-response floor: the conversion still standing at grazing
     # incidence (eff = floor + (1−floor)·cosθ). 0.90 assumes a PHASED-ARRAY / CONFORMAL
@@ -520,7 +530,7 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, extra_min_wai
     geom, capture, w0 = overlap_capture(raster, emitter_diam_m / 2.0, wavelength, slant,
                                         shaped=cfg.shaped_spot, incidence_floor=cfg.incidence_floor,
                                         min_waist_m=min_waist, pointing_offset_m=cfg.pointing_error_m,
-                                        profile_order=order)
+                                        profile_order=order, fixed_aspect=cfg.fixed_emitter_aspect)
     return dict(area=area, r_recv=r_recv, beta=float(beta), roll=float(roll),
                 slant=float(slant), elevation=float(elevation), capture=capture,
                 capture_geom=geom, spot_waist_m=w0, profile_order=order,

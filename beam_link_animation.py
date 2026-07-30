@@ -253,7 +253,8 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     geom, eff, _, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
                                              min_waist_m=w0, pointing_offset_m=cfg.pointing_error_m,
                                              incidence_floor=cfg.incidence_floor,
-                                             profile_order=order, return_field=True)
+                                             profile_order=order, fixed_aspect=cfg.fixed_emitter_aspect,
+                                             return_field=True)
     wf = bl.waterfall(s)                              # [(stage label, efficiency), ...]
 
     # Orient panel A so the aircraft's DORSAL direction (−ẑ body = "up") points up in the
@@ -289,7 +290,12 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     else:
         sil_major_m = sil_minor_m = sil_radial_m
         sil_aspect = 1.0
-    aspect = sil_aspect if cfg.shaped_spot else 1.0
+    if not cfg.shaped_spot:
+        aspect = 1.0
+    elif cfg.fixed_emitter_aspect is not None:
+        aspect = float(cfg.fixed_emitter_aspect)      # fixed elliptical array (built once)
+    else:
+        aspect = sil_aspect                           # adaptive per-geometry aspect
     w_major, w_minor = w0 * np.sqrt(aspect), w0 / np.sqrt(aspect)
 
     # Panel-F beam-channel legs (end-to-end along the path). Relay = a ground→relay up-leg
