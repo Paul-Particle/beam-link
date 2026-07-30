@@ -30,58 +30,6 @@ import geo
 
 OUT = "out"
 
-# Custom play button. Two problems ruled out the obvious approaches: (1) Plotly's native
-# sequenced play only redraws Heatmap/Waterfall on the FIRST frame (the rest freeze); (2)
-# stepping with `Plotly.animate([k], redraw:true)` DOES redraw them but a full redraw tears
-# down and re-renders both WebGL 3-D scenes every tick → wild flicker. So this stepper applies
-# each frame's data with `Plotly.restyle` on just the animated traces — an IN-PLACE update (no
-# full-figure teardown, no flicker) that still redraws heatmaps/waterfall. Frame count injected
-# (`{n_frames}`) since `gd.frames` isn't populated when this runs; `{plot_id}` via write_html.
-_PLAYER_JS = """
-var gd = document.getElementById("{plot_id}");
-var N = {n_frames};
-var FPS = {play_fps};                 // pass-frames shown per wall-clock second
-var cur = 0, playing = false, raf = null, busy = false, startTs = null, startFrame = 0;
-function frameByName(k) {
-  var frs = (gd._transitionData && gd._transitionData._frames) || gd.frames || [];
-  for (var i = 0; i < frs.length; i++) { if (frs[i] && frs[i].name === String(k)) return frs[i]; }
-  return null;
-}
-function applyFrame(k) {
-  var fr = frameByName(k);
-  if (!fr) return Promise.resolve();
-  var proms = [];
-  for (var j = 0; j < fr.data.length; j++) {
-    var d = fr.data[j], tr = fr.traces ? fr.traces[j] : j, upd = {};
-    for (var key in d) { if (d.hasOwnProperty(key) && key !== 'type') { upd[key] = [d[key]]; } }
-    proms.push(Plotly.restyle(gd, upd, [tr]));
-  }
-  cur = k;
-  return Promise.all(proms);
-}
-// Wall-clock playback: the frame shown is chosen from elapsed time, not incremented one per
-// tick — so if a frame is slow to draw the loop SKIPS ahead and motion stays real-time and
-// smooth instead of stuttering in slow-motion. `busy` prevents overlapping restyles.
-function loop(ts) {
-  if (!playing) return;
-  if (startTs === null) { startTs = ts; startFrame = cur; }
-  var target = (startFrame + Math.round((ts - startTs) / 1000 * FPS)) % N;
-  if (target !== cur && !busy) { busy = true; applyFrame(target).then(function(){ busy = false; }); }
-  raf = requestAnimationFrame(loop);
-}
-var btn = document.createElement('button');
-btn.textContent = '\\u25B6 play';
-btn.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
-function play() { if (playing) return; playing = true; startTs = null; btn.textContent = '\\u275A\\u275A pause'; raf = requestAnimationFrame(loop); }
-function pause() { playing = false; if (raf) cancelAnimationFrame(raf); btn.textContent = '\\u25B6 play'; }
-btn.onclick = function(){ playing ? pause() : play(); };
-var host = gd.parentNode || gd;
-if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
-host.appendChild(btn);
-gd.on('plotly_sliderchange', function(e){ if (e && e.slider) { cur = e.slider.active | 0; startTs = null; } });
-"""
-
-
 def _box_sum(a, r):
     """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
     box filter used to fill the gaps between Monte-Carlo silhouette samples."""
@@ -247,7 +195,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
-                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None, play_fps=24,
+                          grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
 
@@ -564,10 +512,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ]))
     fig.frames = frames
 
-    # Slider steps redraw a SINGLE frame (mode immediate, redraw True) — the one path that
-    # reliably redraws Heatmap/Waterfall. Plotly's NATIVE sequenced play only honours redraw
-    # on the first frame of the sequence (subsequent frames skip the full redraw, freezing
-    # A/E/F), so the play button is a custom stepper injected below instead of updatemenus.
+    # The pass is scrubbed with the slider. Each step animates to a SINGLE frame (mode
+    # immediate, redraw True) — the one path that reliably redraws Heatmap/Waterfall (Plotly's
+    # native sequenced *play* only honours redraw on the first frame, freezing A/E/F), which
+    # is why there is no auto-play control: dragging the slider is the reliable way to view it.
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
@@ -611,13 +559,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_layout(
         template="plotly_dark", height=2100, width=1140,
         title=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, {pass_kind}, "
-               f"horizon-to-horizon (±{half/1e3:.0f} km; smooth in time — drag the slider or press play)"),
+               f"horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — drag the slider to scrub the pass)"),
         legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
-        fig.write_html(path, include_plotlyjs="inline", auto_play=False,
-                       post_script=(_PLAYER_JS.replace("{n_frames}", str(n_frames))
-                                    .replace("{play_fps}", str(play_fps))))
+        fig.write_html(path, include_plotlyjs="inline", auto_play=False)
     return fig
 
 
