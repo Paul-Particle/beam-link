@@ -115,35 +115,36 @@ def _beam_on_grid(field, gx, gy):
     return beam.reshape(uu.shape)
 
 
-def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m, axis):
+def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
     """Scalar-diffraction beam along the whole path, as a (n_dist, n_radial) side view: the
     along-path axis (fraction of the longest total path over the pass) is laid out over the
     link's legs — one leg for a direct link, TWO for a relay (ground→relay up-leg focused at
-    the relay, then relay→plane down-leg focused at the plane). Each leg's field is the exact
-    diffraction cut (`diffraction.axial_cut`) from its aperture to its focus, so the picture is
-    the model: converging cone → diffraction waist → divergence, Airy sidelobes included. NaN
-    beyond the current plane position. Returns (intensity, enclosed); intensity is normalised
-    to the frame peak, enclosed is the strip-marginal encircled-energy fraction (for the
-    funnel). `axis` selects the cut: 'y' = major (wide) cut, 'x' = minor (narrow) cut."""
+    the relay, then relay→plane down-leg focused at the plane). Both principal cuts are computed
+    in ONE diffraction pass per leg (`diffraction.axial_cut_xy`, complex64 — display precision),
+    so the picture is the model: converging cone → diffraction waist → divergence, Airy sidelobes
+    included. NaN beyond the current plane position. Returns (ix, ex, iy, ey): intensity of the
+    narrow (x) and wide (y) cuts, each normalised to the frame peak, with the strip-marginal
+    encircled-energy fraction for the funnel."""
     s = dist_norm * total_shown_m
-    inten = np.full((dist_norm.size, radial.size), np.nan)
-    enc = np.full((dist_norm.size, radial.size), np.nan)
+    shp = (dist_norm.size, radial.size)
+    ix = np.full(shp, np.nan); ex = np.full(shp, np.nan)
+    iy = np.full(shp, np.nan); ey = np.full(shp, np.nan)
     cum = 0.0
     for leg in legs:
         sel = (s >= cum) & (s < cum + leg["length_m"]) & (s <= current_total_m)
         if leg["length_m"] > 0 and np.any(sel):
             local_z = s[sel] - cum                           # distance from this leg's emitter
-            ii, ee = dfr.axial_cut(local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"],
-                                   leg["lam"], radial, taper_p=leg["taper_p"], axis=axis,
-                                   n_grid=CHANNEL_NGRID, normalize=False)
-            inten[sel] = ii
-            enc[sel] = ee
+            lix, lex, liy, ley = dfr.axial_cut_xy(
+                local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"], leg["lam"], radial,
+                taper_p=leg["taper_p"], n_grid=CHANNEL_NGRID, normalize=False, dtype=np.complex64)
+            ix[sel] = lix; ex[sel] = lex; iy[sel] = liy; ey[sel] = ley
         cum += leg["length_m"]
-    finite = np.isfinite(inten)
-    peak = inten[finite].max() if finite.any() else 0.0
-    if peak > 0:
-        inten = inten / peak
-    return inten.astype(np.float32), enc.astype(np.float32)
+
+    def _norm(inten):
+        finite = np.isfinite(inten)
+        peak = inten[finite].max() if finite.any() else 0.0
+        return (inten / peak if peak > 0 else inten).astype(np.float32)
+    return _norm(ix), ex.astype(np.float32), _norm(iy), ey.astype(np.float32)
 
 
 def _emitter_phase(ae, be, d_vec, aperture_R, lam, normal_up):
@@ -220,21 +221,16 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     raster = bl._cached_raster(beta, alpha)
     lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
     # The engine is the single source of truth: it chooses the aperture TAPER (adaptively) and
-    # the spot SHAPE (elliptical) and enforces the density cap. Read the winning taper back and
-    # re-form the SAME scalar-diffraction field here (with pointing) to draw panel A — so the
-    # picture is the field the capture integral used, matching panel D's η.
-    s = bl.evaluate(cfg, delivered_mw)
+    # the spot SHAPE (elliptical) and enforces the density cap (possibly DEFOCUSING to hold the
+    # W/m² cap). evaluate_with_field hands back the exact scalar-diffraction field the capture
+    # integral used (winning taper + focus + pointing), so panel A IS that field — no recompute —
+    # and matches panel D's η.
+    s, field = bl.evaluate_with_field(cfg, delivered_mw)
     eta = float(s["eta_end_to_end"])
     taper_p = float(s["aperture_taper_p"])
-    # The engine may DEFOCUS (focus short of the plane) to hold the W/m² cap; use its chosen
-    # focus so the drawn spot is the operating one behind the capture number, not the focused one.
     focus = float(s.get("focus_range_m", slant))
     geom = float(s.get("capture_geom", s.get("capture_down_geom", s["capture"])))
     eff = float(s["capture"])
-    _, _, _, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
-                                        incidence_floor=cfg.incidence_floor, taper_p=taper_p,
-                                        focus_range_m=focus, pointing_offset_m=cfg.pointing_error_m,
-                                        fixed_aspect=cfg.fixed_emitter_aspect, return_field=True)
     wf = bl.waterfall(s)                              # [(stage label, efficiency), ...]
 
     # Orient panel A so the aircraft's DORSAL direction (−ẑ body = "up") points up in the
@@ -473,18 +469,20 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # reading "how much lands on the plane".
     _chan_cache = {}
 
-    def _channel_both(f, axis):
-        key = (id(f), axis)
+    def _channel_all(f):                              # (ix, ex, iy, ey) — both cuts, one pass
+        key = id(f)
         if key not in _chan_cache:
             _chan_cache[key] = _channel_field(dist_norm, radial, f["chan_legs"], max_total,
-                                              f["chan_total"], axis)
+                                              f["chan_total"])
         return _chan_cache[key]
 
-    def channel(f, axis):                             # axis 'y' = major cut, 'x' = minor cut
-        return _channel_both(f, axis)[0]
+    def channel(f, axis):                             # axis 'y' = major (wide), 'x' = minor (narrow)
+        ix, ex, iy, ey = _channel_all(f)
+        return iy if axis == "y" else ix
 
     def channel_enc(f, axis):
-        return _channel_both(f, axis)[1]
+        ix, ex, iy, ey = _channel_all(f)
+        return ey if axis == "y" else ex
 
     # Panel G: the emitter face at the SAME radial scale as panels F/F₂ (±R_max), coloured by
     # the per-element FOCUSING phase taper (Fresnel zone rings; steering ramp removed).

@@ -29,8 +29,16 @@ The elliptical aperture is described by its own semi-axes; the caller orients it
 from __future__ import annotations
 
 import numpy as np
+import scipy.fft as sfft
 from scipy.special import j0, j1
 from scipy.ndimage import map_coordinates
+
+
+def _fft_workers(n_grid):
+    """FFT thread count by grid size: the small channel transforms (n≤256) are fastest
+    single-threaded (thread setup dominates the work); the larger capture/figure grids
+    (n≥320) pay for multi-threading. Measured crossover sits between 256 and 384."""
+    return -1 if n_grid >= 320 else 1
 
 
 def aperture_amplitude(x, y, semi_major_m, semi_minor_m, taper_p):
@@ -60,23 +68,25 @@ def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range
 
 
 def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
-                    taper_p=0.0, n_grid=1024):
+                    taper_p=0.0, n_grid=1024, dtype=np.complex128):
     """Power-normalized scalar-diffraction intensity in the plane at range `z_m` of an
     elliptical aperture phase-conjugated to focus at `focus_range_m`. Single-FFT Fresnel:
     the field at z is the 2-D Fourier transform of the aperture amplitude carrying the
     residual quadratic phase exp(iπ(1/z − 1/f)ρ²/λ), with aperture frequency mapped to
     transverse position x = λ·z·f_freq. At z = f this collapses to the Fraunhofer (focal)
     pattern. Aperture major axis is along x → the spot is NARROW along x (Fourier inverse).
-    Returns (x_m, y_m, intensity) with ∫∫ I dx dy = 1 (fraction of radiated power / m²)."""
+    Returns (x_m, y_m, intensity) with ∫∫ I dx dy = 1 (fraction of radiated power / m²).
+    `dtype` sets the FFT precision — complex128 for the model, complex64 for the (display-only)
+    channel cuts where the 2× cheaper transform is visually indistinguishable."""
     d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid)
     coord = (np.arange(n_grid) - n_grid // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
-    A = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p).astype(complex)
+    A = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p).astype(dtype)
     inv = 1.0 / max(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9)
     if inv != 0.0:
-        A *= np.exp(1j * np.pi / wavelength_m * inv * (X ** 2 + Y ** 2))
+        A *= np.exp(1j * np.pi / wavelength_m * inv * (X ** 2 + Y ** 2)).astype(dtype)
 
-    field = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(A)))
+    field = sfft.fftshift(sfft.fft2(sfft.ifftshift(A), workers=_fft_workers(n_grid)))
     intensity = np.abs(field) ** 2
 
     dx = wavelength_m * z_m / (n_grid * d)                # observation-plane sample spacing (m)
@@ -105,7 +115,8 @@ def plane_intensity_stack(z_m, focus_range_m, semi_major_m, semi_minor_m, wavele
     if inv != 0.0:
         stack *= np.exp(1j * np.pi / wavelength_m * inv * (X ** 2 + Y ** 2)).astype(np.complex64)
 
-    field = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(stack, axes=(1, 2)), axes=(1, 2)), axes=(1, 2))
+    field = sfft.fftshift(sfft.fft2(sfft.ifftshift(stack, axes=(1, 2)), axes=(1, 2),
+                                    workers=_fft_workers(n_grid)), axes=(1, 2))
     intensity = np.abs(field) ** 2
 
     dx = wavelength_m * z_m / (n_grid * d)
@@ -122,8 +133,33 @@ def focal_intensity(semi_major_m, semi_minor_m, wavelength_m, focus_range_m,
                            wavelength_m, taper_p=taper_p, n_grid=n_grid)
 
 
+def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
+    """One plane's cut resampled onto radial_m, plus its strip-marginal enclosed-energy row
+    E(r) = fraction of the plane's TOTAL power in the strip |coord| < r (∫∫ I dA = 1, so it
+    only reaches 1 where the beam is that contained)."""
+    intensity_row = np.interp(radial_m, coord, line, left=0.0, right=0.0)
+    o = np.argsort(np.abs(coord))
+    cum = np.cumsum(marginal[o] * dcoord)
+    idx = np.searchsorted(np.abs(coord)[o], r_query, side="right") - 1
+    enclosed_row = np.where(idx >= 0, cum[np.clip(idx, 0, cum.size - 1)], 0.0)
+    return intensity_row, enclosed_row
+
+
+def _finalize_cut(intensity, enclosed, normalize):
+    """Peak-normalise (when asked) and round for compact serialization. The raw field
+    (normalize=False) is areal intensity ~1e-4 W-fraction/m² and would collapse to 0 at 3
+    decimals, so it is left full-precision for the caller to normalise across legs."""
+    finite = np.isfinite(intensity)
+    peak = intensity[finite].max() if finite.any() else 0.0
+    if normalize and peak > 0:
+        intensity = intensity / peak
+    if normalize:
+        intensity = np.round(intensity, 3)
+    return intensity, np.round(np.clip(enclosed, 0.0, 1.0), 3)
+
+
 def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
-              taper_p=0.0, axis="x", n_grid=512, normalize=True):
+              taper_p=0.0, axis="x", n_grid=512, normalize=True, dtype=np.complex128):
     """(len(z), len(radial)) slice of the diffraction field ALONG the beam: for each plane z,
     the field is sampled along a principal `axis` ('x' = aperture-major axis → the NARROW spot
     cut; 'y' = aperture-minor axis → the WIDE spot cut) onto the common `radial_m` grid. Shows
@@ -135,7 +171,7 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
     raw per-plane intensity, which stays comparable across legs of a multi-hop channel. `enclosed`
     is the enclosed-energy-along-the-cut fraction E(z, r) = ∫_{|r'|≤r} I / ∫ I, for the funnel.
     Planes so close to the aperture that its width would be clipped by the transform grid are
-    left NaN (the near-aperture field isn't fabricated)."""
+    left NaN (the near-aperture field isn't fabricated). For BOTH cuts at once use axial_cut_xy."""
     z_m = np.asarray(z_m, dtype=float)
     radial_m = np.asarray(radial_m, dtype=float)
     r_query = np.abs(radial_m)
@@ -147,7 +183,7 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
         if n_grid * d < 2.4 * max_semi:                # near-aperture (phase-limited) plane → skip
             continue
         x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
-                                            wavelength_m, taper_p=taper_p, n_grid=n_grid)
+                                            wavelength_m, taper_p=taper_p, n_grid=n_grid, dtype=dtype)
         mid = field.shape[0] // 2
         dx_ax, dy_ax = x_ax[1] - x_ax[0], y_ax[1] - y_ax[0]
         if axis == "x":
@@ -156,23 +192,35 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
         else:
             line, coord, dcoord = field[mid, :], y_ax, dy_ax
             marginal = field.sum(axis=0) * dx_ax        # ∫ I dx → power per unit y
-        intensity[i] = np.interp(radial_m, coord, line, left=0.0, right=0.0)
-        # Enclosed-energy funnel = fraction of the plane's TOTAL power in the strip |coord| < r
-        # (∫∫ I dA = 1, so it never hits 1 at the window edge unless the beam is that contained).
-        o = np.argsort(np.abs(coord))
-        cum = np.cumsum(marginal[o] * dcoord)
-        idx = np.searchsorted(np.abs(coord)[o], r_query, side="right") - 1
-        enclosed[i] = np.where(idx >= 0, cum[np.clip(idx, 0, cum.size - 1)], 0.0)
-    finite = np.isfinite(intensity)
-    peak = intensity[finite].max() if finite.any() else 0.0
-    if normalize and peak > 0:
-        intensity = intensity / peak
-    # Round only the normalised (0–1) field for compact serialization; the raw field
-    # (normalize=False) is areal intensity ~1e-4 W-fraction/m² and would collapse to 0 at
-    # 3 decimals, so leave it full-precision for the caller to normalise across legs.
-    if normalize:
-        intensity = np.round(intensity, 3)
-    return intensity, np.round(np.clip(enclosed, 0.0, 1.0), 3)
+        intensity[i], enclosed[i] = _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query)
+    return _finalize_cut(intensity, enclosed, normalize)
+
+
+def axial_cut_xy(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
+                 taper_p=0.0, n_grid=512, normalize=True, dtype=np.complex128):
+    """BOTH principal cuts of the axial field in ONE pass: plane_intensity is computed once per
+    plane and both the x-cut (narrow spot) and y-cut (wide spot) are sliced out, halving the FFTs
+    vs two axial_cut calls. Returns (ix, ex, iy, ey) — see axial_cut for the per-cut meaning."""
+    z_m = np.asarray(z_m, dtype=float)
+    radial_m = np.asarray(radial_m, dtype=float)
+    r_query = np.abs(radial_m)
+    shape = (z_m.size, radial_m.size)
+    ix = np.full(shape, np.nan); ex = np.full(shape, np.nan)
+    iy = np.full(shape, np.nan); ey = np.full(shape, np.nan)
+    max_semi = max(semi_major_m, semi_minor_m)
+    for i, z in enumerate(z_m):
+        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m, n_grid)
+        if n_grid * d < 2.4 * max_semi:
+            continue
+        x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
+                                            wavelength_m, taper_p=taper_p, n_grid=n_grid, dtype=dtype)
+        mid = field.shape[0] // 2
+        dx_ax, dy_ax = x_ax[1] - x_ax[0], y_ax[1] - y_ax[0]
+        ix[i], ex[i] = _cut_enclosed(field[:, mid], x_ax, dx_ax, field.sum(axis=1) * dy_ax, radial_m, r_query)
+        iy[i], ey[i] = _cut_enclosed(field[mid, :], y_ax, dy_ax, field.sum(axis=0) * dx_ax, radial_m, r_query)
+    ix, ex = _finalize_cut(ix, ex, normalize)
+    iy, ey = _finalize_cut(iy, ey, normalize)
+    return ix, ex, iy, ey
 
 
 def sample_focal_intensity(x_axis, y_axis, intensity, xq, yq):

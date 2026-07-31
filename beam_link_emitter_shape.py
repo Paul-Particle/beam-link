@@ -71,17 +71,19 @@ def build_emitter_shape_comparison(arch_name="5.8 direct", weather="clear", late
 
     _cc = {}
 
-    def _both(f, axis):
-        k = (id(f), axis)
+    def _all(f):
+        k = id(f)
         if k not in _cc:
-            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"], axis)
+            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"])
         return _cc[k]
 
     def chan(f, axis):
-        return _both(f, axis)[0]
+        ix, ex, iy, ey = _all(f)
+        return iy if axis == "y" else ix
 
     def enc(f, axis):
-        return _both(f, axis)[1]
+        ix, ex, iy, ey = _all(f)
+        return ey if axis == "y" else ex
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=8, color="#c8ffe6"))

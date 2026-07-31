@@ -537,7 +537,7 @@ def _capture_dict(shared, geom, eff, peak, taper_p, focus_range_m):
 
 
 def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
-                  focus_range_m=None, raster_n_grid=150):
+                  focus_range_m=None, raster_n_grid=150, return_field=False):
     """The real receive-side geometry the plane presents to an emitter at `emitter_pos`:
     rasterize the (self-occluded) silhouette and overlap the emitter's scalar-diffraction
     field with it. Returns a dict with the silhouette area, incidence-weighted capture
@@ -548,12 +548,19 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
     raster, slant, wavelength, emitter_diam_m, shared = _capture_setup(
         cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid)
     p = cfg.taper_p if taper_p is None else float(taper_p)
-    geom, eff, peak = overlap_capture(
+    result = overlap_capture(
         raster, emitter_diam_m / 2.0, wavelength, slant, shaped=cfg.shaped_spot,
         incidence_floor=cfg.incidence_floor, taper_p=p, focus_range_m=focus_range_m,
-        pointing_offset_m=cfg.pointing_error_m, fixed_aspect=cfg.fixed_emitter_aspect)
+        pointing_offset_m=cfg.pointing_error_m, fixed_aspect=cfg.fixed_emitter_aspect,
+        return_field=return_field)
+    geom, eff, peak = result[:3]
     focus_used = slant if focus_range_m is None else float(focus_range_m)
-    return _capture_dict(shared, geom, eff, peak, p, focus_used)
+    out = _capture_dict(shared, geom, eff, peak, p, focus_used)
+    if return_field:
+        # overlap_capture computed the field regardless; retaining it lets the animation draw
+        # panel A from the winner without a second FFT.
+        out["field"] = result[3]
+    return out
 
 
 def _overlap_taper_grid(raster, emitter_radius_m, wavelength_m, slant_m, shaped,
@@ -602,14 +609,15 @@ def _peak_density(delivered_mw, capture, rect_total, peak_intensity):
 
 
 def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
-                       taper_p, pc=None):
+                       taper_p, pc=None, return_field=False):
     """`plane_capture` at a given aperture taper, DEFOCUSED (focus short of the plane) only
     as much as the W/m² density cap requires. Defocusing spreads the spot → lower peak, at
     some cost in capture, so we binary-search for the LEAST defocus (largest focus range)
     whose peak sits under the cap. `pc` is an optional already-computed focused capture at
-    this taper (reused to skip the initial FFT)."""
+    this taper (reused to skip the initial FFT); `return_field` attaches the winner's field."""
     if pc is None:
-        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p)
+        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
+                           return_field=return_field)
     cap = cfg.max_power_density_w_m2
     if cap is None or delivered_mw is None or pc["capture"] <= 0:
         return pc
@@ -624,11 +632,12 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
             hi = mid                                   # still too hot → defocus more (shorter focus)
         else:
             lo = mid
-    return plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p, focus_range_m=lo)
+    return plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
+                         focus_range_m=lo, return_field=return_field)
 
 
 def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
-                       n_taper=9):
+                       n_taper=9, return_field=False):
     """Pick the aperture TAPER per geometry and enforce the W/m² cap, returning the winning
     `plane_capture` dict. The taper is a continuous phased-array degree of freedom (like the
     spot's elliptical SHAPE and its defocus SIZE): a uniform aperture (p=0) has the tightest
@@ -640,7 +649,7 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     re-checked so the cap can't lock in a suboptimal choice."""
     if not cfg.adaptive_taper:
         return _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
-                                  delivered_mw, rect_total, cfg.taper_p)
+                                  delivered_mw, rect_total, cfg.taper_p, return_field=return_field)
 
     raster, slant, wavelength, emitter_diam_m, _ = _capture_setup(
         cfg, emitter_pos, freq_ghz, emitter_diam_m)
@@ -650,7 +659,8 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
         cfg.incidence_floor, 8.0, taper_grid, cfg.pointing_error_m, cfg.fixed_emitter_aspect)
     best_k = int(np.argmax(effs))
     # Recompute the winner at full resolution (accurate capture + peak for the cap decision).
-    result = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=float(taper_grid[best_k]))
+    result = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                           taper_p=float(taper_grid[best_k]), return_field=return_field)
     cap = cfg.max_power_density_w_m2
     if cap is None or delivered_mw is None or \
             _peak_density(delivered_mw, result["capture"], rect_total, result["peak_intensity"]) <= cap:
@@ -659,12 +669,13 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     # heavier tapers (they need less defocus). Heavier tapers have lower FOCUSED capture, so
     # once one needs NO defocus every heavier one only loses capture — stop there.
     focused_winner = result
-    result = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
-                                delivered_mw, rect_total, float(taper_grid[best_k]), pc=focused_winner)
+    result = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
+                                rect_total, float(taper_grid[best_k]), pc=focused_winner,
+                                return_field=return_field)
     slant = result["slant"]
     for p in taper_grid[best_k + 1:]:
-        r = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
-                               delivered_mw, rect_total, float(p))
+        r = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
+                               rect_total, float(p), return_field=return_field)
         if r["capture"] > result["capture"]:
             result = r
         if r["focus_range_m"] >= slant - 1e-6:     # no defocus needed → heavier tapers only worse
@@ -672,8 +683,9 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     return result
 
 
-def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
-    """End-to-end evaluation for ONE plane position (scalar geometry)."""
+def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
+    """End-to-end evaluation for ONE plane position (scalar geometry). With `return_field` also
+    returns the winning capture field dict (for the animation), as (stages, field)."""
     atmos = get_atmosphere()
     station = np.asarray(cfg.station_pos, dtype=float)
     plane = np.asarray(cfg.plane_pos, dtype=float)
@@ -684,7 +696,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         conv = float(napkin.rectenna_efficiency_band(f))
         pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
         # Choose the spot profile per geometry and enforce the W/m² cap.
-        pc = _capture_with_caps(cfg, station, f, cfg.emitter_diam_m, delivered_mw, conv * pol)
+        pc = _capture_with_caps(cfg, station, f, cfg.emitter_diam_m, delivered_mw, conv * pol,
+                                return_field=return_field)
         a, b = _to_ecef(station), _to_ecef(plane)
         blocked = bool(geo.horizon_blocked(a, b, 64))
         atmos_t = float(napkin.db_to_fraction(atmos.path_loss_db(f, a, b, cfg.weather))) * (0.0 if blocked else 1.0)
@@ -718,7 +731,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         # aperture is the relay's own (fixed) transmit array.
         conv = float(napkin.rectenna_efficiency_band(f2))
         pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
-        pc = _capture_with_caps(cfg, relay, f2, cfg.relay_aperture_diam_m, delivered_mw, conv * pol)
+        pc = _capture_with_caps(cfg, relay, f2, cfg.relay_aperture_diam_m, delivered_mw, conv * pol,
+                                return_field=return_field)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
         blocked2 = bool(geo.horizon_blocked(a2, b2, 64))
         atmos_dn = float(napkin.db_to_fraction(atmos.path_loss_db(f2, a2, b2, cfg.weather))) * (0.0 if blocked2 else 1.0)
@@ -754,6 +768,8 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         stages["delivered_mw"] = delivered_mw
         stages["grid_mw"] = delivered_mw / eta if eta > 0 else np.inf
         stages["waste_mw"] = stages["grid_mw"] - delivered_mw
+    if return_field:
+        return stages, pc.get("field")
     return stages
 
 
@@ -781,6 +797,14 @@ def _with_plane(cfg: LinkConfig, plane_pos):
     """Copy `cfg` with a single plane position (used to map evaluate over a trajectory)."""
     return LinkConfig(**{**cfg.__dict__, "plane_pos": tuple(np.asarray(plane_pos, float)),
                          "_silhouette": cfg._silhouette})
+
+
+def evaluate_with_field(cfg: LinkConfig, delivered_mw=None):
+    """Scalar `evaluate` that ALSO returns the winning capture field dict (the exact
+    scalar-diffraction field behind the capture number — winning taper, focus and pointing), so
+    the animation can draw panel A from it without recomputing overlap_capture. Returns
+    (stages, field). `cfg.plane_pos` must be a single position."""
+    return _evaluate_scalar(cfg, delivered_mw, return_field=True)
 
 
 def best_path(cfg: LinkConfig, delivered_mw=None):
