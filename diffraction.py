@@ -160,8 +160,9 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
         cum = np.cumsum(marginal[o] * dcoord)
         idx = np.searchsorted(np.abs(coord)[o], r_query, side="right") - 1
         enclosed[i] = np.where(idx >= 0, cum[np.clip(idx, 0, cum.size - 1)], 0.0)
-    peak = np.nanmax(intensity)
-    if normalize and peak and peak > 0:
+    finite = np.isfinite(intensity)
+    peak = intensity[finite].max() if finite.any() else 0.0
+    if normalize and peak > 0:
         intensity = intensity / peak
     # Round for compact serialization (3 decimals is ample for a 0–1 display field).
     return np.round(intensity, 3), np.round(np.clip(enclosed, 0.0, 1.0), 3)

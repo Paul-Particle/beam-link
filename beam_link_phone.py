@@ -43,13 +43,19 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
     r_t0 = fp[0]["chan_emit_radius_m"]
     geom = np.array([f["geom"] for f in fp]) * 100
 
-    def chan(f, key):
-        return anim._beam_channel(dist, radial, f[key], max_total, f["chan_total"],
-                                  leg_norms=None).astype(np.float32)
+    _cc = {}
 
-    def enc(f, key):
-        return anim._channel_encircled(dist, radial, f[key], max_total,
-                                       f["chan_total"]).astype(np.float32)
+    def _both(f, axis):
+        k = (id(f), axis)
+        if k not in _cc:
+            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"], axis)
+        return _cc[k]
+
+    def chan(f, axis):
+        return _both(f, axis)[0]
+
+    def enc(f, axis):
+        return _both(f, axis)[1]
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=8, color="#c8ffe6"))
@@ -78,19 +84,19 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
                                  hoverinfo="skip"), row=row, col=1)                # plane slice
         return heat_i, cont_i, plane_i
 
-    i_maj = add_cut(fp[0], "chan_segments_major", "sil_major_m", 1)
-    i_min = add_cut(fp[0], "chan_segments_minor", "sil_minor_m", 2)
+    i_maj = add_cut(fp[0], "y", "sil_major_m", 1)
+    i_min = add_cut(fp[0], "x", "sil_minor_m", 2)
     animated = [i_maj[0], i_maj[1], i_maj[2], i_min[0], i_min[1], i_min[2]]
 
     frames = []
     for k, f in enumerate(fp):
         yy = f["chan_total"] / max_total
         frames.append(go.Frame(name=str(k), traces=animated, data=[
-            go.Heatmap(z=chan(f, "chan_segments_major")),
-            go.Contour(x=radial, y=dist, z=enc(f, "chan_segments_major")),
+            go.Heatmap(z=chan(f, "y")),
+            go.Contour(x=radial, y=dist, z=enc(f, "y")),
             go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy]),
-            go.Heatmap(z=chan(f, "chan_segments_minor")),
-            go.Contour(x=radial, y=dist, z=enc(f, "chan_segments_minor")),
+            go.Heatmap(z=chan(f, "x")),
+            go.Contour(x=radial, y=dist, z=enc(f, "x")),
             go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy]),
         ]))
     fig.frames = frames
@@ -183,11 +189,19 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     cap_e = np.array([f["eff"] for f in fr_e]) * 100.0
     x_km = xs / 1e3
 
-    def chan(f, key):
-        return anim._beam_channel(dist, radial, f[key], max_total, f["chan_total"], leg_norms=None).astype(np.float32)
+    _cc = {}
 
-    def enc(f, key):
-        return anim._channel_encircled(dist, radial, f[key], max_total, f["chan_total"]).astype(np.float32)
+    def _both(f, axis):
+        k = (id(f), axis)
+        if k not in _cc:
+            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"], axis)
+        return _cc[k]
+
+    def chan(f, axis):
+        return _both(f, axis)[0]
+
+    def enc(f, axis):
+        return _both(f, axis)[1]
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=7, color="#c8ffe6"))
@@ -219,10 +233,10 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
                                  hoverinfo="skip"), row=row, col=1)                # plane slice
         return heat_i, cont_i, plane_i
 
-    i_cmaj = add_cut(fr_c[0], "chan_segments_major", "sil_major_m", "#f2b134", 1)
-    i_cmin = add_cut(fr_c[0], "chan_segments_minor", "sil_minor_m", "#f2b134", 2)
-    i_emaj = add_cut(fr_e[0], "chan_segments_major", "sil_major_m", "#00e5ff", 3)
-    i_emin = add_cut(fr_e[0], "chan_segments_minor", "sil_minor_m", "#00e5ff", 4)
+    i_cmaj = add_cut(fr_c[0], "y", "sil_major_m", "#f2b134", 1)
+    i_cmin = add_cut(fr_c[0], "x", "sil_minor_m", "#f2b134", 2)
+    i_emaj = add_cut(fr_e[0], "y", "sil_major_m", "#00e5ff", 3)
+    i_emin = add_cut(fr_e[0], "x", "sil_minor_m", "#00e5ff", 4)
 
     fig.add_trace(go.Scatter(x=x_km, y=cap_adap, mode="lines", name="adaptive ceiling",
                              line=dict(color="#888888", width=1.2, dash="dot"), hoverinfo="skip"), row=5, col=1)
@@ -244,17 +258,17 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
         fc, fe = fr_c[k], fr_e[k]
         yc, ye = fc["chan_total"] / max_total, fe["chan_total"] / max_total
         frames.append(go.Frame(name=str(k), traces=animated, data=[
-            go.Heatmap(z=chan(fc, "chan_segments_major")),
-            go.Contour(x=radial, y=dist, z=enc(fc, "chan_segments_major")),
+            go.Heatmap(z=chan(fc, "y")),
+            go.Contour(x=radial, y=dist, z=enc(fc, "y")),
             go.Scatter(x=[-fc["sil_major_m"], fc["sil_major_m"]], y=[yc, yc]),
-            go.Heatmap(z=chan(fc, "chan_segments_minor")),
-            go.Contour(x=radial, y=dist, z=enc(fc, "chan_segments_minor")),
+            go.Heatmap(z=chan(fc, "x")),
+            go.Contour(x=radial, y=dist, z=enc(fc, "x")),
             go.Scatter(x=[-fc["sil_minor_m"], fc["sil_minor_m"]], y=[yc, yc]),
-            go.Heatmap(z=chan(fe, "chan_segments_major")),
-            go.Contour(x=radial, y=dist, z=enc(fe, "chan_segments_major")),
+            go.Heatmap(z=chan(fe, "y")),
+            go.Contour(x=radial, y=dist, z=enc(fe, "y")),
             go.Scatter(x=[-fe["sil_major_m"], fe["sil_major_m"]], y=[ye, ye]),
-            go.Heatmap(z=chan(fe, "chan_segments_minor")),
-            go.Contour(x=radial, y=dist, z=enc(fe, "chan_segments_minor")),
+            go.Heatmap(z=chan(fe, "x")),
+            go.Contour(x=radial, y=dist, z=enc(fe, "x")),
             go.Scatter(x=[-fe["sil_minor_m"], fe["sil_minor_m"]], y=[ye, ye]),
             go.Scatter(x=[x_km[k]], y=[cap_c[k]]),
             go.Scatter(x=[x_km[k]], y=[cap_e[k]]),

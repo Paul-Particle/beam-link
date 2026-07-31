@@ -16,7 +16,7 @@ Figures:
   5. occlusion            — rasterized (self-occluded) vs convex silhouette area
   6. spot shape           — silhouette elongation and the emitter shape it implies
   7. frequency (physics)  — atmospheric transmittance + PAE scenarios (reference)
-  8. flat-top beam        — super-Gaussian peak-flattening vs the W/m² cap
+  8. aperture taper       — sidelobe spill vs main-lobe width, the phased-array taper knob
 """
 import os
 
@@ -25,6 +25,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 import beam_link as bl
+import diffraction as dfr
+import beam_link_animation as anim
 import bwb_model as m
 
 OUT = "out"
@@ -172,9 +174,9 @@ def _overlap_snapshot(arch_kwargs, x_along_m, plane_alt_m, shaped):
     beta, alpha = m.beta_alpha_from_enu(unit, *cfg.plane_attitude)
     raster = bl._cached_raster(beta, alpha)
     lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
-    geom, eff, w0, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=shaped,
-                                              incidence_floor=cfg.incidence_floor, return_field=True)
-    return field, dict(elevation=float(elevation), geom=geom, eff=eff, w0=w0,
+    geom, eff, peak, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=shaped,
+                                                incidence_floor=cfg.incidence_floor, return_field=True)
+    return field, dict(elevation=float(elevation), geom=geom, eff=eff,
                        area=raster["area"], beta=float(beta))
 
 
@@ -198,12 +200,13 @@ def figure_capture_overlap(arch_name="tether 30 direct", station_spacing_km=200.
         for col, (x, lbl) in enumerate(positions, start=1):
             field, meta = _overlap_snapshot(kw, x, 11_000.0, shaped)
             u, v = field["u"], field["v"]
-            # beam filled contour on a background grid
-            span = max(np.abs(np.concatenate([u, v])).max(), meta["w0"]) * 1.1
-            g = np.linspace(-span, span, 80)
-            uu, vv = np.meshgrid(g, g)
-            w0 = meta["w0"]
-            beam_bg = np.exp(-2.0 * (uu ** 2 + vv ** 2) / w0 ** 2)  # round reference ring
+            # beam filled contour: the ACTUAL scalar-diffraction intensity the overlap used,
+            # aligned to the silhouette's principal axes (sidelobes and all).
+            span = max(np.abs(np.concatenate([u, v])).max(), 1.0) * 1.3
+            g = np.linspace(-span, span, 120)
+            beam_bg = anim._beam_on_grid(field, g, g)
+            mx = float(beam_bg.max())
+            beam_bg = beam_bg / mx if mx > 0 else beam_bg
             fig.add_trace(go.Contour(
                 x=g, y=g, z=beam_bg, showscale=False, contours=dict(coloring="heatmap"),
                 colorscale="Hot", opacity=0.45, line=dict(width=0),
@@ -343,41 +346,41 @@ def figure_frequency(elevation_deg=30.0, path=f"{OUT}/beam_link_frequency.html")
     return path
 
 
-def figure_flattop(path=f"{OUT}/beam_link_flattop.html"):
-    """Answering 'can we flatten the peak without spilling?': a super-Gaussian spot of
-    order n puts the SAME total power through the SAME footprint at a LOWER peak. Left:
-    radial profiles at equal total power (peak drops, edge sharpens as n rises). Right:
-    for a fixed delivered power under the 25 W/cm² cap, how much power fits before the cap
-    bites (∝ 1/peak-factor) — a flat top lets you deliver more without widening (so
-    without spilling more)."""
-    r = np.linspace(0, 2.0, 400)                       # radius in units of the waist w
-    orders = [1.0, 2.0, 4.0, 8.0]
+def figure_taper(path=f"{OUT}/beam_link_taper.html"):
+    """The aperture TAPER trade — the phased-array knob that replaced peak-flattening. A uniform
+    aperture (p=0) gives the tightest main lobe but −17.6 dB Airy sidelobes that spill off the
+    airframe; a heavier taper (1−ρ²)^p lowers the sidelobes at the cost of a wider main lobe.
+    Left: the focal-plane radial intensity (log) for a few tapers — the sidelobes drop and the
+    main lobe broadens. Right: fraction of power landing within a main-lobe-sized receiver vs
+    taper — the sidelobe-spill vs main-lobe-width tradeoff the engine optimises per geometry."""
+    lam = bl.napkin.SPEED_OF_LIGHT / 5.8e9
+    R, D = 50.0, 213e3
+    r_null = 0.610 * lam * D / R                        # uniform-aperture first Airy null
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.13,
-                        subplot_titles=("Beam radial profile at EQUAL total power & waist",
-                                        "Power deliverable under a fixed W/m² cap vs flatness"))
-    for n in orders:
-        # Peak for unit total power in unit waist: B0 = 1/(π·C(n)); shape exp(−2 r^{2n}).
-        b0 = 1.0 / (np.pi * bl.supergaussian_area_factor(n))
-        prof = b0 * np.exp(-2.0 * (r ** 2) ** n)
-        fig.add_trace(go.Scatter(x=r, y=prof, mode="lines",
-                                 name=f"n={n:.0f}" + (" (Gaussian)" if n == 1 else " (flat top)"),
-                                 legendgroup=f"{n}"), row=1, col=1)
-    ns = np.linspace(1.0, 10.0, 40)
-    # Deliverable power at a fixed peak cap and fixed waist ∝ π·w²·C(n)·cap → ∝ C(n),
-    # normalized to the Gaussian (n=1). So a flat top delivers C(n)/C(1) × more power in
-    # the SAME footprint before hitting the cap.
-    gain = np.array([bl.supergaussian_area_factor(n) for n in ns]) / bl.supergaussian_area_factor(1.0)
-    fig.add_trace(go.Scatter(x=ns, y=gain, mode="lines", line=dict(color="#d62728"),
+                        subplot_titles=("Focal-plane radial intensity vs aperture taper",
+                                        "Power on a main-lobe-sized receiver vs taper"))
+    for p, color in zip([0.0, 1.0, 2.0, 3.0], ["#d62728", "#ff7f0e", "#2ca02c", "#1f77b4"]):
+        x, _, I = dfr.focal_intensity(R, R, lam, D, taper_p=p, n_grid=1024)
+        mid = I.shape[0] // 2
+        cut = I[mid:, mid] / I[mid, mid]                # positive-radius cut, peak-normalised
+        lbl = "uniform (Airy)" if p == 0 else f"(1−ρ²)^{p:.0f}"
+        fig.add_trace(go.Scatter(x=x[mid:] / r_null, y=np.clip(cut, 1e-5, None), mode="lines",
+                                 name=lbl, line=dict(color=color)), row=1, col=1)
+    fig.update_xaxes(title_text="radius / first Airy null", range=[0, 4], row=1, col=1)
+    fig.update_yaxes(title_text="intensity (peak = 1)", type="log", range=[-5, 0], row=1, col=1)
+
+    ps = np.linspace(0.0, 4.0, 25)
+    caps = [float(dfr.encircled_energy(*dfr.focal_intensity(R, R, lam, D, taper_p=p, n_grid=1024),
+                                       [r_null])[0]) for p in ps]
+    fig.add_trace(go.Scatter(x=ps, y=caps, mode="lines", line=dict(color="#d62728"),
                              showlegend=False), row=1, col=2)
-    fig.update_xaxes(title_text="radius / waist", row=1, col=1)
-    fig.update_yaxes(title_text="intensity (equal total power)", row=1, col=1, rangemode="tozero")
-    fig.update_xaxes(title_text="super-Gaussian order n (1 = Gaussian)", row=1, col=2)
-    fig.update_yaxes(title_text="power deliverable vs Gaussian (×)", row=1, col=2, rangemode="tozero")
+    fig.update_xaxes(title_text="taper p  (0 = uniform)", row=1, col=2)
+    fig.update_yaxes(title_text="fraction within the main lobe", row=1, col=2, rangemode="tozero")
     fig.update_layout(
         template="plotly_white", height=480, width=1150,
-        title=("Flat-topping the beam (super-Gaussian) lowers the peak for the same power & footprint: "
-               "it eases the W/m² cap — up to ~2× more power in the same spot — without spilling more "
-               "(but only helps capture when the spot is CONTAINED, not already overspilling)"))
+        title=("The aperture-taper trade: uniform gives the tightest main lobe but the most "
+               "sidelobe spill; a moderate taper lands more power on a main-lobe-sized receiver "
+               "— the engine picks p per geometry"))
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")
     return path
@@ -392,7 +395,7 @@ def build_all():
         figure_occlusion(),
         figure_spot_shape(),
         figure_frequency(),
-        figure_flattop(),
+        figure_taper(),
     ]
     print("wrote:")
     for p in paths:

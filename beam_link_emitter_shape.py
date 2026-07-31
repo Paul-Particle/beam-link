@@ -69,13 +69,19 @@ def build_emitter_shape_comparison(arch_name="5.8 direct", weather="clear", late
     cap_ellip = np.array([f["eff"] for f in fr_ellip]) * 100.0
     x_km = xs / 1e3
 
-    def chan(f, key):
-        return anim._beam_channel(dist, radial, f[key], max_total, f["chan_total"],
-                                  leg_norms=None).astype(np.float32)
+    _cc = {}
 
-    def enc(f, key):
-        return anim._channel_encircled(dist, radial, f[key], max_total,
-                                       f["chan_total"]).astype(np.float32)
+    def _both(f, axis):
+        k = (id(f), axis)
+        if k not in _cc:
+            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"], axis)
+        return _cc[k]
+
+    def chan(f, axis):
+        return _both(f, axis)[0]
+
+    def enc(f, axis):
+        return _both(f, axis)[1]
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=8, color="#c8ffe6"))
@@ -111,10 +117,10 @@ def build_emitter_shape_comparison(arch_name="5.8 direct", weather="clear", late
                                  hoverinfo="skip"), row=row, col=col)                # plane slice
         return heat_i, cont_i, plane_i
 
-    i_rmaj = add_cut(fr_round[0], "chan_segments_major", "sil_major_m", ROUND_C, 1, 1)
-    i_rmin = add_cut(fr_round[0], "chan_segments_minor", "sil_minor_m", ROUND_C, 1, 2)
-    i_emaj = add_cut(fr_ellip[0], "chan_segments_major", "sil_major_m", ELLIP_C, 2, 1)
-    i_emin = add_cut(fr_ellip[0], "chan_segments_minor", "sil_minor_m", ELLIP_C, 2, 2)
+    i_rmaj = add_cut(fr_round[0], "y", "sil_major_m", ROUND_C, 1, 1)
+    i_rmin = add_cut(fr_round[0], "x", "sil_minor_m", ROUND_C, 1, 2)
+    i_emaj = add_cut(fr_ellip[0], "y", "sil_major_m", ELLIP_C, 2, 1)
+    i_emin = add_cut(fr_ellip[0], "x", "sil_minor_m", ELLIP_C, 2, 2)
 
     # ---- capture curves (row 3) : a line per case + a moving marker per case -------------
     fig.add_trace(go.Scatter(x=x_km, y=cap_round, mode="lines", name="round emitter",
@@ -138,17 +144,17 @@ def build_emitter_shape_comparison(arch_name="5.8 direct", weather="clear", late
         fr, fe = fr_round[k], fr_ellip[k]
         yr, ye = fr["chan_total"] / max_total, fe["chan_total"] / max_total
         frames.append(go.Frame(name=str(k), traces=animated, data=[
-            go.Heatmap(z=chan(fr, "chan_segments_major")),
-            go.Contour(x=radial, y=dist, z=enc(fr, "chan_segments_major")),
+            go.Heatmap(z=chan(fr, "y")),
+            go.Contour(x=radial, y=dist, z=enc(fr, "y")),
             go.Scatter(x=[-fr["sil_major_m"], fr["sil_major_m"]], y=[yr, yr]),
-            go.Heatmap(z=chan(fr, "chan_segments_minor")),
-            go.Contour(x=radial, y=dist, z=enc(fr, "chan_segments_minor")),
+            go.Heatmap(z=chan(fr, "x")),
+            go.Contour(x=radial, y=dist, z=enc(fr, "x")),
             go.Scatter(x=[-fr["sil_minor_m"], fr["sil_minor_m"]], y=[yr, yr]),
-            go.Heatmap(z=chan(fe, "chan_segments_major")),
-            go.Contour(x=radial, y=dist, z=enc(fe, "chan_segments_major")),
+            go.Heatmap(z=chan(fe, "y")),
+            go.Contour(x=radial, y=dist, z=enc(fe, "y")),
             go.Scatter(x=[-fe["sil_major_m"], fe["sil_major_m"]], y=[ye, ye]),
-            go.Heatmap(z=chan(fe, "chan_segments_minor")),
-            go.Contour(x=radial, y=dist, z=enc(fe, "chan_segments_minor")),
+            go.Heatmap(z=chan(fe, "x")),
+            go.Contour(x=radial, y=dist, z=enc(fe, "x")),
             go.Scatter(x=[-fe["sil_minor_m"], fe["sil_minor_m"]], y=[ye, ye]),
             go.Scatter(x=[x_km[k]], y=[cap_round[k]]),
             go.Scatter(x=[x_km[k]], y=[cap_ellip[k]]),
