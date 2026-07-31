@@ -20,10 +20,17 @@ Run:  uv run python beam_link_animation.py   → out/flyby.html
 for other architectures, apertures, weathers or pass geometries.)
 """
 import os
+import io
+import base64
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import matplotlib as mpl
+import matplotlib.image as mpimg
+import contourpy
+
+from scipy.ndimage import uniform_filter1d
 
 import beam_link as bl
 import diffraction as dfr
@@ -38,12 +45,12 @@ OUT = "out"
 # 384 converges (RMS <0.2 %). n≥320 also trips scipy's multi-threaded FFT (see _fft_workers).
 CHANNEL_NGRID = 384
 
-# Play button: a custom sequential stepper. Plotly's native sequenced play only redraws
-# Heatmap/Waterfall on the FIRST frame (the rest freeze), and `Plotly.animate([k],redraw)`
-# tears down + re-renders both WebGL 3-D scenes each tick → flicker. So this advances ONE
-# frame per tick with `Plotly.restyle` on just the animated traces (in-place, in order, no
-# teardown), which still redraws the heatmaps/waterfall. `{n_frames}` is injected (gd.frames
-# isn't populated when this runs); `{plot_id}` is substituted by write_html.
+# Play button: a custom sequential stepper. Each frame swaps the five baked background images
+# (one `Plotly.relayout`) and restyles the handful of live vector traces (contours, plane slices,
+# curve markers) — no z-grid re-raster and no per-frame contour recompute, so playback stays
+# smooth. Plotly's native sequenced play is unreliable here (it only redraws some traces past the
+# first frame), so this advances ONE frame per tick in-place instead. `{n_frames}` is injected
+# (gd.frames isn't populated when this runs); `{plot_id}` is substituted by write_html.
 _PLAYER_JS = """
 var gd = document.getElementById("{plot_id}");
 var N = {n_frames};
@@ -62,6 +69,7 @@ function applyFrame(k) {
     for (var key in d) { if (d.hasOwnProperty(key) && key !== 'type') { upd[key] = [d[key]]; } }
     proms.push(Plotly.restyle(gd, upd, [tr]));
   }
+  if (fr.layout && fr.layout.images) { proms.push(Plotly.relayout(gd, {images: fr.layout.images})); }
   cur = k;
   return Promise.all(proms);
 }
@@ -77,6 +85,53 @@ if (getComputedStyle(host).position === 'static') host.style.position = 'relativ
 host.appendChild(btn);
 gd.on('plotly_sliderchange', function(e){ if (e && e.slider) cur = e.slider.active | 0; });
 """
+
+
+_CONTOUR_LEVELS = (0.1, 0.3, 0.5, 0.7, 0.9)
+
+
+def _field_to_png(field01, transpose=False, flip_rows=False):
+    """A 2-D field already scaled to [0, 1] → a base64 PNG data-URI: ONE pixel per sample, with
+    NO interpolation or anti-aliasing (a direct colour-mapped pixel dump). Any smoothness must
+    come from dense sampling, never from smoothing — so the picture stays a faithful display of
+    the computed field. NaN samples become fully transparent (the dark page shows through).
+    `transpose`/`flip_rows` orient the array so image row 0 lands at the top of the panel."""
+    a = field01.T if transpose else field01
+    if flip_rows:
+        a = a[::-1]
+    rgba = mpl.colormaps["plasma"](np.clip(np.nan_to_num(a, nan=0.0), 0.0, 1.0))
+    rgba[..., 3] = np.where(np.isfinite(a), 1.0, 0.0)
+    buf = io.BytesIO()
+    mpimg.imsave(buf, rgba, format="png")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _dejitter_along_path(enc, path_axis, window=9):
+    """De-jitter an enclosed-energy field ALONG the propagation axis only. Each plane's enclosed
+    fraction is measured on that plane's own observation grid (spacing λz/(N·d)), which steps
+    discontinuously along the path (notably at the spot/phase sampling-regime boundary), so the
+    field carries a plane-to-plane numerical jitter that has nothing to do with the physics. A
+    short NaN-aware moving average over neighbouring PLANES removes it; the RADIAL structure (spot
+    width, sidelobes — the actual physics) is never touched, and NaN (beyond the current plane)
+    stays NaN. Used only for the guide contours; the intensity maps are shown un-smoothed."""
+    finite = np.isfinite(enc).astype(float)
+    filled = np.where(finite > 0, enc, 0.0)
+    num = uniform_filter1d(filled, size=window, axis=path_axis, mode="nearest")
+    den = uniform_filter1d(finite, size=window, axis=path_axis, mode="nearest")
+    return np.where(finite > 0, num / np.maximum(den, 1e-9), np.nan)
+
+
+def _contour_xy(z, xs, ys, levels=_CONTOUR_LEVELS):
+    """Iso-level polylines of `z` (shape (len(ys), len(xs))) at `levels`, in DATA coords, as flat
+    x/y arrays with NaN gaps between segments — honest marching-squares lines (linear
+    interpolation between samples) drawn as crisp vectors, not a re-rastered contour trace."""
+    gen = contourpy.contour_generator(np.asarray(xs), np.asarray(ys), z)
+    xo, yo = [], []
+    for level in levels:
+        for seg in gen.lines(float(level)):
+            xo.extend(seg[:, 0]); xo.append(np.nan)
+            yo.extend(seg[:, 1]); yo.append(np.nan)
+    return np.asarray(xo), np.asarray(yo)
 
 
 def _box_sum(a, r):
@@ -426,8 +481,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     PHASE_L = 1.1 * ap_long                    # shared radial half-extent (m), fits the long axis
     EMIT_X = 1.25 * ap_short                   # emitter-plot cross half-window: fits F₂'s thin axis
     #                                            and crops F's wide axis to a sliver (same box both)
-    dist_norm = np.linspace(0.0, 1.0, 110)     # along-path samples (one diffraction pass each)
-    radial = np.linspace(-PHASE_L, PHASE_L, 161)  # radial samples — cheap (interp only)
+    # Dense sampling so the baked map images are smooth WITHOUT interpolation: radial is
+    # interpolation-only (free), along-path is one diffraction pass each (linear cost, kept
+    # moderate — the propagation envelope varies slowly).
+    dist_norm = np.linspace(0.0, 1.0, 200)     # along-path samples (one diffraction pass each)
+    radial = np.linspace(-PHASE_L, PHASE_L, 600)  # radial samples — cheap (interp only)
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
 
     # Intensity self-normalises per frame so the beam shape is always visible (a pass-peak
@@ -460,8 +518,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # long axis cropped off the sides), F₂'s to the LONG axis (fills the height). Plasma colormap
     # (matching the maps). Rings are the symmetric focusing zone plate φ = wrap(−(2π/λ)(√(f²+ρ²) − f)),
     # tightening as the focus nears.
-    phase_r = np.linspace(-PHASE_L, PHASE_L, 201)      # radial (vertical) — the shared scale
-    phase_c = np.linspace(-EMIT_X, EMIT_X, 81)         # cross (horizontal) — the cropped window
+    phase_r = np.linspace(-PHASE_L, PHASE_L, 400)      # radial (the shared scale) — dense, smooth
+    phase_c = np.linspace(-EMIT_X, EMIT_X, 160)        # cross (the cropped window)
 
     def emitter_phase(f, ap_radial_m, ap_cross_m):     # zone plate over the aperture, metres grid
         cross, rad = np.meshgrid(phase_c, phase_r)     # cross = x, rad = y
@@ -512,20 +570,29 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         A_rc, D_rc = (1, 1), (2, 1)
         F_emit, F_map, F2_emit, F2_map = (3, 1), (3, 2), (4, 1), (4, 2)
 
-    # ---- Panel A: incidence heatmap (filled outline) + encircled-energy contour ---------------
-    i_incA = len(fig.data)
-    fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
-                             colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
-                             showscale=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
-    contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
-                        labelfont=dict(size=9, color="#c8ffe6"))
+    # ---- offline renderers: heatmaps → honest no-AA PNG backgrounds; contours → vector lines --
+    LV = _CONTOUR_LEVELS
+    def map_png(f, cut):                                   # beam intensity → background image
+        return _field_to_png(channel(f, cut), transpose=not portrait, flip_rows=portrait)
+    def map_contour(f, cut):                               # encircled-energy vector polylines
+        ze = _dejitter_along_path(channel_enc(f, cut), path_axis=0)   # (dist, radial); smooth along dist
+        return (_contour_xy(ze, radial, dist_norm, LV) if portrait
+                else _contour_xy(ze.T, dist_norm, radial, LV))
+    def phase_png(f, ar, ac):                              # emitter zone-plate → background image
+        return _field_to_png((emitter_phase(f, ar, ac) + np.pi) / (2.0 * np.pi),
+                             transpose=portrait, flip_rows=False)
+    def incid_png(f):                                      # silhouette incidence → background image
+        return _field_to_png(incidence_grid(f), transpose=False, flip_rows=True)
+    def incid_contour(f):
+        return _contour_xy(encircled_grid(f), gx, gy, LV)
+
+    # ---- Panel A: incidence image (added to layout.images below) + encircled contour (vector) --
+    # Mint-green reads cleanly over Plasma (which has no green). The heatmap itself is a baked
+    # background image; only the contour and the capture text are live vector traces here.
     i_contA = len(fig.data)
-    # Bright mint-green: reads cleanly over Plasma (which has no green), unlike the old red.
-    # Toned down (opacity) so the beam overlay sits lightly over the silhouette fill.
-    fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
-                             colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
-                             contours=contour_opts, line=dict(width=1.1), opacity=0.45,
-                             hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
+    cAx, cAy = incid_contour(frames_phys[0])
+    fig.add_trace(go.Scatter(x=cAx, y=cAy, mode="lines", line=dict(color="#7dffce", width=1.1),
+                             opacity=0.55, showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
     # Live capture % in the corner of panel A — the beam fraction the silhouette intercepts.
     i_capA = len(fig.data)
     fig.add_trace(go.Scatter(x=[-EXT_H * 0.94], y=[EXT_V * 0.82], mode="text",
@@ -561,91 +628,91 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
 
     yy0 = frames_phys[0]["chan_total"] / max_total
-    m_ax = dict(x=radial, y=dist_norm) if portrait else dict(x=dist_norm, y=radial)
 
-    def add_pair(f0, cut, sil_key, ap_radial_m, ap_cross_m, map_rc, emit_rc):
-        """Emitter phase + beam-channel map, sharing the RADIAL axis. landscape: map reads
-        left→right, emitter to its left; portrait: map reads bottom→top, emitter directly below.
-        Returns (i_heat, i_cont, i_plane, i_phase)."""
-        mr, mc = map_rc
-        er, ec = emit_rc
+    def add_channel(f0, cut, sil_key, ap_radial_m, ap_cross_m, map_rc, emit_rc):
+        """Vector overlays for one channel: encircled contour + aperture line + plane slice on the
+        map, and the aperture outline on the emitter panel. The heatmaps themselves are baked
+        images added to layout.images. Returns the trace indices for this channel."""
+        mr, mc = map_rc; er, ec = emit_rc
         s0 = f0[sil_key]
-        # emitter phase — z is (radial, cross); outline is (cross, radial). Swap for portrait.
-        i_phase = len(fig.data)
-        zc = emitter_phase(f0, ap_radial_m, ap_cross_m)
-        oc, orad = emitter_outline(ap_radial_m, ap_cross_m)
+        i_cont = len(fig.data)
+        cxx, cyy = map_contour(f0, cut)
+        fig.add_trace(go.Scatter(x=cxx, y=cyy, mode="lines", line=dict(color="#7dffce", width=1.1),
+                                 opacity=0.6, showlegend=False, hoverinfo="skip"), row=mr, col=mc)
         if portrait:
-            e_x, e_y, e_z, o_x, o_y = phase_r, phase_c, zc.T, orad, oc
-        else:
-            e_x, e_y, e_z, o_x, o_y = phase_c, phase_r, zc, oc, orad
-        fig.add_trace(go.Heatmap(x=e_x, y=e_y, z=e_z, colorscale="Plasma", zmin=-np.pi, zmax=np.pi,
-                                 zauto=False, showscale=False, hoverinfo="skip"), row=er, col=ec)
-        fig.add_trace(go.Scatter(x=o_x, y=o_y, mode="lines", line=dict(color="white", width=1.0),
-                                 showlegend=False, hoverinfo="skip"), row=er, col=ec)   # aperture edge
-        # beam map — radial along one axis, emitter→plane along the other; aperture line at the
-        # emitter end, plane slice (cyan) at the current slant.
-        i_heat = len(fig.data)
-        if portrait:
-            m_z, m_ez = channel(f0, cut), channel_enc(f0, cut)
             ap_x, ap_y, pl_x, pl_y = [-ap_radial_m, ap_radial_m], [0.0, 0.0], [-s0, s0], [yy0, yy0]
         else:
-            m_z, m_ez = channel(f0, cut).T, channel_enc(f0, cut).T
             ap_x, ap_y, pl_x, pl_y = [0.0, 0.0], [-ap_radial_m, ap_radial_m], [yy0, yy0], [-s0, s0]
-        fig.add_trace(go.Heatmap(z=m_z, colorscale="Plasma", zmin=0, zmax=1, zauto=False,
-                                 zsmooth="fast", showscale=False, hoverinfo="skip", **m_ax),
-                      row=mr, col=mc)
-        i_cont = len(fig.data)
-        fig.add_trace(go.Contour(z=m_ez, showscale=False, colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
-                                 contours=contour_opts, line=dict(width=1.0), opacity=0.45,
-                                 hoverinfo="skip", **m_ax), row=mr, col=mc)
         fig.add_trace(go.Scatter(x=ap_x, y=ap_y, mode="lines", line=dict(color="white", width=5),
-                                 showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # aperture line
+                                 showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # aperture (static)
         i_plane = len(fig.data)
         fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="#00e5ff", width=4),
                                  showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # plane slice
-        return i_heat, i_cont, i_plane, i_phase
+        i_out = len(fig.data)
+        oc, orad = emitter_outline(ap_radial_m, ap_cross_m)          # (cross, radial)
+        ox, oy = (orad, oc) if portrait else (oc, orad)
+        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
+                                 showlegend=False, hoverinfo="skip"), row=er, col=ec)   # aperture edge
+        return dict(cont=i_cont, plane=i_plane, out=i_out)
 
-    # Panel F: major-axis (wide) cut — the SHORT aperture axis lies along the radial (a sliver).
-    i_fheat, i_fcont, i_fplane, i_fphase = add_pair(
-        frames_phys[0], "y", "sil_major_m", ap_short, ap_long, F_map, F_emit)
-    # Panel F₂: minor-axis (narrow) cut — the LONG aperture axis lies along the radial (fills the
-    # radial extent; the 90°-rotated view of F's aperture).
-    i_f2heat, i_f2cont, i_f2plane, i_f2phase = add_pair(
-        frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, F2_map, F2_emit)
+    # F: major-axis (wide) cut — SHORT aperture axis along the radial (a sliver). F₂: minor-axis
+    # (narrow) cut — LONG axis along the radial (fills it; the 90°-rotated view of F's aperture).
+    F = add_channel(frames_phys[0], "y", "sil_major_m", ap_short, ap_long, F_map, F_emit)
+    F2 = add_channel(frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, F2_map, F2_emit)
 
-    def _plane(sil, yy):
-        return (go.Scatter(x=[-sil, sil], y=[yy, yy]) if portrait
-                else go.Scatter(x=[yy, yy], y=[-sil, sil]))
+    # ---- background images (baked heatmaps), each positioned in its subplot's own data coords --
+    def _ax(idx):
+        d = fig.data[idx]
+        return (d.xaxis or "x"), (d.yaxis or "y")
+    axA, axFm, axF2m, axFe, axF2e = (_ax(i_contA), _ax(F["cont"]), _ax(F2["cont"]),
+                                     _ax(F["out"]), _ax(F2["out"]))
+    if portrait:
+        map_rect = (-PHASE_L, 0.0, 2 * PHASE_L, 1.0)             # x=radial, y=emitter→plane
+        em_rect = (-PHASE_L, -EMIT_X, 2 * PHASE_L, 2 * EMIT_X)   # x=radial, y=cross
+    else:
+        map_rect = (0.0, -PHASE_L, 1.0, 2 * PHASE_L)            # x=emitter→plane, y=radial
+        em_rect = (-EMIT_X, -PHASE_L, 2 * EMIT_X, 2 * PHASE_L)  # x=cross, y=radial
+    A_rect = (-EXT_H, -EXT_V, 2 * EXT_H, 2 * EXT_V)
 
-    ANIMATED = [i_incA, i_contA, i_capA, i_eta_m, i_cap_m, i_cum_m,
-                i_fheat, i_fcont, i_fplane, i_fphase, i_f2heat, i_f2cont, i_f2plane, i_f2phase]
+    def _image(src, ax, rect):
+        return dict(source=src, xref=ax[0], yref=ax[1], x=rect[0], y=rect[1], sizex=rect[2],
+                    sizey=rect[3], xanchor="left", yanchor="bottom", sizing="stretch", layer="below")
+
+    def frame_images(f):                                  # the 5 baked backgrounds for one frame
+        return [_image(incid_png(f), axA, A_rect),
+                _image(map_png(f, "y"), axFm, map_rect),
+                _image(map_png(f, "x"), axF2m, map_rect),
+                _image(phase_png(f, ap_short, ap_long), axFe, em_rect),
+                _image(phase_png(f, ap_long, ap_short), axF2e, em_rect)]
+
+    fig.update_layout(images=frame_images(frames_phys[0]))
+
+    # Each frame swaps the 5 background images (a cheap relayout) and restyles the live vector
+    # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
+    # recompute in the browser, so playback stays fast.
+    ANIMATED = [i_contA, i_capA, i_eta_m, i_cap_m, i_cum_m,
+                F["cont"], F["plane"], F2["cont"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
         yy = f["chan_total"] / max_total
-        zy, zx = channel(f, "y"), channel(f, "x")
-        ey, ex = channel_enc(f, "y"), channel_enc(f, "x")
-        pf, p2 = emitter_phase(f, ap_short, ap_long), emitter_phase(f, ap_long, ap_short)
-        if not portrait:
-            zy, zx, ey, ex, pf, p2 = zy.T, zx.T, ey.T, ex.T, pf, p2   # phase z already (radial,cross)
+        cAx, cAy = incid_contour(f)
+        fcx, fcy = map_contour(f, "y"); f2cx, f2cy = map_contour(f, "x")
+        if portrait:
+            fpl = go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy])
+            f2pl = go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy])
         else:
-            pf, p2 = pf.T, p2.T
-        frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
-            go.Heatmap(z=incidence_grid(f)),
-            go.Contour(x=gx, y=gy, z=encircled_grid(f)),
-            go.Scatter(text=[f"{capture_series[k]:.0f}% captured"]),
-            go.Scatter(x=[cur], y=[eta_series[k]]),
-            go.Scatter(x=[cur], y=[capture_series[k]]),
-            go.Scatter(x=[cur], y=[cum_gj[k]]),
-            go.Heatmap(z=zy),
-            go.Contour(z=ey, **m_ax),
-            _plane(f["sil_major_m"], yy),
-            go.Heatmap(z=pf),
-            go.Heatmap(z=zx),
-            go.Contour(z=ex, **m_ax),
-            _plane(f["sil_minor_m"], yy),
-            go.Heatmap(z=p2),
-        ]))
+            fpl = go.Scatter(x=[yy, yy], y=[-f["sil_major_m"], f["sil_major_m"]])
+            f2pl = go.Scatter(x=[yy, yy], y=[-f["sil_minor_m"], f["sil_minor_m"]])
+        frames.append(go.Frame(name=str(k), traces=ANIMATED,
+            data=[go.Scatter(x=cAx, y=cAy),
+                  go.Scatter(text=[f"{capture_series[k]:.0f}% captured"]),
+                  go.Scatter(x=[cur], y=[eta_series[k]]),
+                  go.Scatter(x=[cur], y=[capture_series[k]]),
+                  go.Scatter(x=[cur], y=[cum_gj[k]]),
+                  go.Scatter(x=fcx, y=fcy), fpl,
+                  go.Scatter(x=f2cx, y=f2cy), f2pl],
+            layout=go.Layout(images=frame_images(f))))
     fig.frames = frames
 
     # Slider steps animate to a SINGLE frame (mode immediate, redraw True) — the one path that
@@ -681,19 +748,19 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         for mr, mc in (F_map, F2_map):
             fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
             fig.update_yaxes(title_text="emitter → plane", range=[0, 1], row=mr, col=mc)
-        for i_ph, (er, ec) in ((i_fphase, F_emit), (i_f2phase, F2_emit)):
+        for i_out, (er, ec) in ((F["out"], F_emit), (F2["out"], F2_emit)):
             fig.update_xaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
             fig.update_yaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
-                             scaleanchor=fig.data[i_ph].xaxis, scaleratio=1, constrain="domain",
+                             scaleanchor=fig.data[i_out].xaxis, scaleratio=1, constrain="domain",
                              row=er, col=ec)
     else:
         for mr, mc in (F_map, F2_map):
             fig.update_xaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=mr, col=mc)
             fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
-        for i_ph, (er, ec) in ((i_fphase, F_emit), (i_f2phase, F2_emit)):
+        for i_out, (er, ec) in ((F["out"], F_emit), (F2["out"], F2_emit)):
             fig.update_yaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
             fig.update_xaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
-                             scaleanchor=fig.data[i_ph].yaxis, scaleratio=1, constrain="domain",
+                             scaleanchor=fig.data[i_out].yaxis, scaleratio=1, constrain="domain",
                              row=er, col=ec)
     fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=A_rc[0], col=A_rc[1],
                        xanchor="left", yanchor="bottom",
@@ -718,8 +785,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
-        # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): plotly's native
-        # sequenced play only honours redraw on the first frame, freezing panels A/E/F.
+        # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): it swaps the baked
+        # background images + restyles the live vector traces per frame, without a native replay.
         post = _PLAYER_JS.replace("{n_frames}", str(n_frames))
         fig.write_html(path, include_plotlyjs="inline", auto_play=False, post_script=post)
     return fig

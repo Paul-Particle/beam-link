@@ -139,9 +139,13 @@ def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
     only reaches 1 where the beam is that contained)."""
     intensity_row = np.interp(radial_m, coord, line, left=0.0, right=0.0)
     o = np.argsort(np.abs(coord))
+    abs_sorted = np.abs(coord)[o]
     cum = np.cumsum(marginal[o] * dcoord)
-    idx = np.searchsorted(np.abs(coord)[o], r_query, side="right") - 1
-    enclosed_row = np.where(idx >= 0, cum[np.clip(idx, 0, cum.size - 1)], 0.0)
+    # Linearly INTERPOLATE the enclosed-energy curve onto the query radii (not nearest-index via
+    # searchsorted): otherwise the iso-level radius snaps to this plane's grid spacing dx, which
+    # varies plane-to-plane, and the funnel contours staircase along the path.
+    enclosed_row = np.interp(r_query, abs_sorted, cum, left=0.0,
+                             right=(cum[-1] if cum.size else 0.0))
     return intensity_row, enclosed_row
 
 
