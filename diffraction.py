@@ -120,22 +120,24 @@ def focal_intensity(semi_major_m, semi_minor_m, wavelength_m, focus_range_m,
 
 
 def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
-              taper_p=0.0, axis="x", n_grid=512):
+              taper_p=0.0, axis="x", n_grid=512, normalize=True):
     """(len(z), len(radial)) slice of the diffraction field ALONG the beam: for each plane z,
     the field is sampled along a principal `axis` ('x' = aperture-major axis → the NARROW spot
     cut; 'y' = aperture-minor axis → the WIDE spot cut) onto the common `radial_m` grid. Shows
     the converging cone → diffraction-limited waist → diverging cone, sidelobe rings included.
 
-    Returns (intensity, enclosed): `intensity` is normalised to its own global peak (so the
-    waist is brightest and the beam dims through the divergence); `enclosed` is the
-    enclosed-energy-along-the-cut fraction E(z, r) = ∫_{|r'|≤r} I / ∫ I, for the funnel overlay.
+    Returns (intensity, enclosed): `intensity` is the areal intensity along the cut (fraction of
+    radiated power / m² per plane), divided by its own global peak when `normalize` (so the
+    waist is brightest and the beam dims through divergence); pass normalize=False to keep the
+    raw per-plane intensity, which stays comparable across legs of a multi-hop channel. `enclosed`
+    is the enclosed-energy-along-the-cut fraction E(z, r) = ∫_{|r'|≤r} I / ∫ I, for the funnel.
     Planes so close to the aperture that its width would be clipped by the transform grid are
     left NaN (the near-aperture field isn't fabricated)."""
     z_m = np.asarray(z_m, dtype=float)
     radial_m = np.asarray(radial_m, dtype=float)
+    r_query = np.abs(radial_m)
     intensity = np.full((z_m.size, radial_m.size), np.nan)
     enclosed = np.full((z_m.size, radial_m.size), np.nan)
-    order = np.argsort(np.abs(radial_m))
     max_semi = max(semi_major_m, semi_minor_m)
     for i, z in enumerate(z_m):
         d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m)
@@ -144,20 +146,25 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
         x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
                                             wavelength_m, taper_p=taper_p, n_grid=n_grid)
         mid = field.shape[0] // 2
-        line = field[:, mid] if axis == "x" else field[mid, :]
-        ax = x_ax if axis == "x" else y_ax
-        row = np.interp(radial_m, ax, line, left=0.0, right=0.0)
-        intensity[i] = row
-        total = row.sum()
-        if total > 0:
-            cdf = np.empty_like(row)
-            cdf[order] = np.cumsum(row[order])
-            enclosed[i] = cdf / total
+        dx_ax, dy_ax = x_ax[1] - x_ax[0], y_ax[1] - y_ax[0]
+        if axis == "x":
+            line, coord, dcoord = field[:, mid], x_ax, dx_ax
+            marginal = field.sum(axis=1) * dy_ax        # ∫ I dy → power per unit x
+        else:
+            line, coord, dcoord = field[mid, :], y_ax, dy_ax
+            marginal = field.sum(axis=0) * dx_ax        # ∫ I dx → power per unit y
+        intensity[i] = np.interp(radial_m, coord, line, left=0.0, right=0.0)
+        # Enclosed-energy funnel = fraction of the plane's TOTAL power in the strip |coord| < r
+        # (∫∫ I dA = 1, so it never hits 1 at the window edge unless the beam is that contained).
+        o = np.argsort(np.abs(coord))
+        cum = np.cumsum(marginal[o] * dcoord)
+        idx = np.searchsorted(np.abs(coord)[o], r_query, side="right") - 1
+        enclosed[i] = np.where(idx >= 0, cum[np.clip(idx, 0, cum.size - 1)], 0.0)
     peak = np.nanmax(intensity)
-    if peak and peak > 0:
+    if normalize and peak and peak > 0:
         intensity = intensity / peak
     # Round for compact serialization (3 decimals is ample for a 0–1 display field).
-    return np.round(intensity, 3), np.round(enclosed, 3)
+    return np.round(intensity, 3), np.round(np.clip(enclosed, 0.0, 1.0), 3)
 
 
 def sample_focal_intensity(x_axis, y_axis, intensity, xq, yq):
