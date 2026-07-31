@@ -1,13 +1,16 @@
 """Flyby animation for the beam-link engine — the whole link in one moving picture.
 
-A time slider drives synchronized views over a single pass, stacked in one column:
+A time slider drives synchronized views over a single pass. A and D span the full width; the
+two beam-channel rows read left→right, each with its emitter-phase plot in a narrow column to
+the left (sharing the map's vertical radial axis, so aperture and beam line up):
   A (2-D)  the focused beam spot (encircled-energy contours) over the self-occluded
            silhouette (filled by incidence) — where the power lands, frame by frame.
   D (2-D)  capture, end-to-end η and cumulative delivered energy along the pass.
   F  (2-D) the converging beam channel emitter→plane, MAJOR-axis (wide) cut (radial
-           exaggerated), with the bottom half of the emitter phase fused at its base.
-  F₂ (2-D) the same channel, MINOR-axis (narrow) cut, with its emitter-phase half — the
-           90°-rotated view of F's aperture (long axis along-radial instead of short).
+           exaggerated), with the emitter phase to its left — the SHORT aperture axis lies
+           along the radial here, so the aperture shows as a sliver (long axis cropped off).
+  F₂ (2-D) the same channel, MINOR-axis (narrow) cut — here the LONG aperture axis lies along
+           the radial, so the emitter phase fills the height (the 90°-rotated view of F's).
 
 The point is to spot inconsistencies at a glance (does the spot overspill? does the far
 wing go dark? does the aperture phase tighten toward the waist?) far faster than tables.
@@ -295,7 +298,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
-    """Build (and, if `write`, save) the 6-panel flyby animation, returning the figure.
+    """Build (and, if `write`, save) the 4-row flyby animation, returning the figure.
 
     `arch_name` selects a named case from `standard_architectures`; pass `arch_kwargs`
     (a LinkConfig kwarg dict, `plane_pos` omitted) instead to animate an architecture not
@@ -403,11 +406,19 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # shrink the emitter and all near-field detail to a blob. A beam wider than this window
     # simply fills the panel with no contours — the correct read for a badly overspilling beam.
     max_total = max(f["chan_total"] for f in frames_phys)
-    r_emit = max(f["chan_emit_radius_m"] for f in frames_phys)
-    r_sil = max(f["sil_major_m"] for f in frames_phys)
-    R_max = 1.4 * max(r_emit, r_sil)
-    dist_norm = np.linspace(0.0, 1.0, 110)   # along-path samples (one diffraction pass each)
-    radial = np.linspace(-R_max, R_max, 121)  # radial samples — cheap (interp only); smooths contours
+    # ONE shared radial scale for both channel cuts AND their emitter plots: fit the LARGEST
+    # emitter dimension (the long aperture semi-axis) over all frames, + a small margin. So the
+    # emitter aperture and the white aperture-line on each beam map read at exactly the same
+    # scale. The long axis lies along-radial in F₂ (fills the height); the short axis lies
+    # along-radial in F (a sliver — genuinely small in that direction, cross axis cropped off).
+    _ap = [(f["chan_legs"][-1]["ap_major"], f["chan_legs"][-1]["ap_minor"]) for f in frames_phys]
+    ap_short = min(min(a) for a in _ap)
+    ap_long = max(max(a) for a in _ap)
+    PHASE_L = 1.1 * ap_long                    # shared radial half-extent (m), fits the long axis
+    EMIT_X = 1.25 * ap_short                   # emitter-plot cross half-window: fits F₂'s thin axis
+    #                                            and crops F's wide axis to a sliver (same box both)
+    dist_norm = np.linspace(0.0, 1.0, 110)     # along-path samples (one diffraction pass each)
+    radial = np.linspace(-PHASE_L, PHASE_L, 161)  # radial samples — cheap (interp only)
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
 
     # Intensity self-normalises per frame so the beam shape is always visible (a pass-peak
@@ -432,53 +443,46 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ix, ex, iy, ey = _channel_all(f)
         return ey if axis == "y" else ex
 
-    # Emitter phase, split under each beam map (panels F/F₂), in its OWN 1:1 subplot so the
-    # aperture is undistorted. The disk is halved (bottom semicircle only). The two halves show
-    # the SAME elliptical aperture rotated 90°: F's radial axis is Fourier-conjugate to the SHORT
-    # aperture axis (short axis along-radial, long axis running down), F₂'s to the LONG axis. Both
-    # are drawn to a common metres scale ±PHASE_L that fits the LARGEST aperture dimension, so
-    # their sizes and the 90° rotation are literal. Rings are the symmetric focusing zone plate
-    # φ = wrap(−(2π/λ)(√(f²+ρ²) − f)) — it tightens as the focus nears.
-    _ap = [(f["chan_legs"][-1]["ap_major"], f["chan_legs"][-1]["ap_minor"]) for f in frames_phys]
-    ap_short = min(min(a) for a in _ap)
-    ap_long = max(max(a) for a in _ap)
-    PHASE_L = 1.12 * ap_long                           # metres half-extent (fits the long axis)
-    phase_x = np.linspace(-PHASE_L, PHASE_L, 161)
-    phase_y_m = np.linspace(-PHASE_L, 0.0, 81)         # bottom half only
+    # Emitter phase, placed to the LEFT of each beam map (panels F/F₂), sharing that map's
+    # vertical radial axis (±PHASE_L) — so the aperture and the map's white aperture-line read at
+    # the same scale and line up. y = radial (vertical, shared), x = cross axis (horizontal), the
+    # subplot cropped to ±EMIT_X. The two plots show the SAME elliptical aperture rotated 90°: F's
+    # radial axis is Fourier-conjugate to the SHORT aperture axis (short along-radial → a sliver,
+    # long axis cropped off the sides), F₂'s to the LONG axis (fills the height). Plasma colormap
+    # (matching the maps). Rings are the symmetric focusing zone plate φ = wrap(−(2π/λ)(√(f²+ρ²) − f)),
+    # tightening as the focus nears.
+    phase_r = np.linspace(-PHASE_L, PHASE_L, 201)      # radial (vertical) — the shared scale
+    phase_c = np.linspace(-EMIT_X, EMIT_X, 81)         # cross (horizontal) — the cropped window
 
-    def half_phase(f, ap_radial_m, ap_depth_m):        # bottom-half zone plate, metres grid
-        U, V = np.meshgrid(phase_x, phase_y_m)
-        inside = (U / ap_radial_m) ** 2 + (V / ap_depth_m) ** 2 <= 1.0
+    def emitter_phase(f, ap_radial_m, ap_cross_m):     # zone plate over the aperture, metres grid
+        cross, rad = np.meshgrid(phase_c, phase_r)     # cross = x, rad = y
+        inside = (rad / ap_radial_m) ** 2 + (cross / ap_cross_m) ** 2 <= 1.0
         lam = float(f["chan_legs"][-1]["lam"]); foc = float(f["chan_legs"][-1]["focus_m"])
-        phi = -(2.0 * np.pi / lam) * (np.sqrt(foc ** 2 + U ** 2 + V ** 2) - foc)
+        phi = -(2.0 * np.pi / lam) * (np.sqrt(foc ** 2 + cross ** 2 + rad ** 2) - foc)
         phi = (phi + np.pi) % (2.0 * np.pi) - np.pi
         return np.where(inside, phi, np.nan).astype(np.float32)
 
-    def half_outline(ap_radial_m, ap_depth_m):         # thin white boundary: arc + top diameter
-        t = np.linspace(np.pi, 2.0 * np.pi, 160)       # so the dark phase values don't vanish
-        ax, ay = ap_radial_m * np.cos(t), ap_depth_m * np.sin(t)
-        return np.append(ax, ax[0]), np.append(ay, ay[0])   # close (chord = the top diameter)
+    def emitter_outline(ap_radial_m, ap_cross_m):      # thin white ellipse (clipped to ±EMIT_X)
+        t = np.linspace(0.0, 2.0 * np.pi, 240)         # so the aperture edge stays visible
+        return ap_cross_m * np.cos(t), ap_radial_m * np.sin(t)   # x = cross, y = radial
 
-    # Layout: a single stacked column — beam spot over the silhouette (A), the along-pass curves
-    # (D), then each beam-channel map with its 1:1 emitter-phase half directly below, so the beam
-    # grows out of its own (undistorted) half of the aperture.
+    # Layout: A (beam spot over silhouette) and D (along-pass curves) span the full width; below
+    # them each beam-channel MAP reads left→right (x = emitter→plane), with its emitter-phase plot
+    # in a narrow column to its LEFT, sharing the map's vertical radial axis — so the aperture and
+    # the map's white aperture-line read at the same scale and line up.
     fig = make_subplots(
-        rows=6, cols=1, vertical_spacing=0.035,
-        row_heights=[0.185, 0.10, 0.16, 0.12, 0.16, 0.12],
-        specs=[[{"type": "xy"}],
-               [{"secondary_y": True}],
-               [{"type": "xy"}],
-               [{"type": "xy"}],
-               [{"type": "xy"}],
-               [{"type": "xy"}]],
+        rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.03,
+        row_heights=[0.24, 0.12, 0.32, 0.32], column_widths=[0.17, 0.83],
+        specs=[[{"type": "xy", "colspan": 2}, None],
+               [{"secondary_y": True, "colspan": 2}, None],
+               [{"type": "xy"}, {"type": "xy"}],
+               [{"type": "xy"}, {"type": "xy"}]],
         subplot_titles=("A · beam spot over silhouette (fill = incidence)",
                         "D · capture, η & cumulative energy along the pass",
-                        "F · beam channel, major-axis (wide) cut",
-                        "emitter phase — short axis along radial (1:1)",
-                        "F₂ · beam channel, minor-axis (narrow) cut",
-                        "emitter phase — long axis along radial (1:1, 90° rotated)"))
+                        "emitter phase", "F · beam channel, major-axis (wide) cut  (beam →)",
+                        "emitter phase", "F₂ · beam channel, minor-axis (narrow) cut  (beam →)"))
 
-    # ---- Panel A (1,1): incidence heatmap (filled outline) + encircled-energy contour ---
+    # ---- Panel A (row 1, full width): incidence heatmap (filled outline) + encircled contour ---
     i_incA = len(fig.data)
     fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
                              colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
@@ -524,43 +528,43 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     yy0 = frames_phys[0]["chan_total"] / max_total
 
-    def add_pair(f0, cut, sil_key, ap_radial_m, ap_depth_m, map_row, phase_row):
-        """A beam-channel map (emitter at y=0, beam up to the plane slice at y = slant/max_slant)
-        plus, in the row below, the bottom half of the emitter phase in its OWN 1:1 subplot.
-        Returns (i_heat, i_cont, i_plane, i_phase)."""
-        i_heat = len(fig.data)
-        fig.add_trace(go.Heatmap(x=radial, y=dist_norm, z=channel(f0, cut),
+    def add_pair(f0, cut, sil_key, ap_radial_m, ap_cross_m, row):
+        """Emitter phase (col 1) + beam-channel map (col 2), sharing the vertical radial axis.
+        The map reads left→right: x = emitter→plane, the white aperture line at x=0, the plane
+        slice (cyan) at the current slant. Returns (i_heat, i_cont, i_plane, i_phase)."""
+        i_phase = len(fig.data)                                       # emitter phase (col 1)
+        fig.add_trace(go.Heatmap(x=phase_c, y=phase_r, z=emitter_phase(f0, ap_radial_m, ap_cross_m),
+                                 colorscale="Plasma", zmin=-np.pi, zmax=np.pi, zauto=False,
+                                 showscale=False, hoverinfo="skip"), row=row, col=1)
+        ox, oy = emitter_outline(ap_radial_m, ap_cross_m)
+        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
+                                 showlegend=False, hoverinfo="skip"), row=row, col=1)   # aperture edge
+        i_heat = len(fig.data)                                        # beam map (col 2)
+        fig.add_trace(go.Heatmap(x=dist_norm, y=radial, z=channel(f0, cut).T,
                                  colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
-                                 showscale=False, hoverinfo="skip"), row=map_row, col=1)
+                                 showscale=False, hoverinfo="skip"), row=row, col=2)
         i_cont = len(fig.data)
-        fig.add_trace(go.Contour(x=radial, y=dist_norm, z=channel_enc(f0, cut),
+        fig.add_trace(go.Contour(x=dist_norm, y=radial, z=channel_enc(f0, cut).T,
                                  showscale=False, colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
                                  contours=contour_opts, line=dict(width=1.0), opacity=0.45,
-                                 hoverinfo="skip"), row=map_row, col=1)
-        fig.add_trace(go.Scatter(x=[-ap_radial_m, ap_radial_m], y=[0.0, 0.0], mode="lines",
+                                 hoverinfo="skip"), row=row, col=2)
+        fig.add_trace(go.Scatter(x=[0.0, 0.0], y=[-ap_radial_m, ap_radial_m], mode="lines",
                                  line=dict(color="white", width=5), showlegend=False,
-                                 hoverinfo="skip"), row=map_row, col=1)                 # aperture line
+                                 hoverinfo="skip"), row=row, col=2)                     # aperture line
         i_plane = len(fig.data)
         s0 = f0[sil_key]
-        fig.add_trace(go.Scatter(x=[-s0, s0], y=[yy0, yy0], mode="lines",               # plane slice
+        fig.add_trace(go.Scatter(x=[yy0, yy0], y=[-s0, s0], mode="lines",               # plane slice
                                  line=dict(color="#00e5ff", width=4), showlegend=False,
-                                 hoverinfo="skip"), row=map_row, col=1)
-        i_phase = len(fig.data)                                # emitter phase (bottom half), 1:1 row
-        fig.add_trace(go.Heatmap(x=phase_x, y=phase_y_m, z=half_phase(f0, ap_radial_m, ap_depth_m),
-                                 colorscale="Phase", zmin=-np.pi, zmax=np.pi, zauto=False,
-                                 showscale=False, hoverinfo="skip"), row=phase_row, col=1)
-        ox, oy = half_outline(ap_radial_m, ap_depth_m)
-        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.2),
-                                 showlegend=False, hoverinfo="skip"), row=phase_row, col=1)  # outline
+                                 hoverinfo="skip"), row=row, col=2)
         return i_heat, i_cont, i_plane, i_phase
 
-    # Panel F (rows 3–4): major-axis (wide) cut — the SHORT aperture axis lies along the radial.
+    # Panel F (row 3): major-axis (wide) cut — the SHORT aperture axis lies along the radial (sliver).
     i_fheat, i_fcont, i_fplane, i_fphase = add_pair(
-        frames_phys[0], "y", "sil_major_m", ap_short, ap_long, 3, 4)
-    # Panel F₂ (rows 5–6): minor-axis (narrow) cut — the LONG aperture axis lies along the radial
-    # (its emitter half is the 90°-rotated view of F's).
+        frames_phys[0], "y", "sil_major_m", ap_short, ap_long, 3)
+    # Panel F₂ (row 4): minor-axis (narrow) cut — the LONG aperture axis lies along the radial
+    # (fills the height; the 90°-rotated view of F's aperture).
     i_f2heat, i_f2cont, i_f2plane, i_f2phase = add_pair(
-        frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, 5, 6)
+        frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, 4)
 
     ANIMATED = [i_incA, i_contA, i_capA, i_eta_m, i_cap_m, i_cum_m,
                 i_fheat, i_fcont, i_fplane, i_fphase, i_f2heat, i_f2cont, i_f2plane, i_f2phase]
@@ -575,14 +579,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             go.Scatter(x=[cur], y=[eta_series[k]]),
             go.Scatter(x=[cur], y=[capture_series[k]]),
             go.Scatter(x=[cur], y=[cum_gj[k]]),
-            go.Heatmap(z=channel(f, "y")),
-            go.Contour(x=radial, y=dist_norm, z=channel_enc(f, "y")),
-            go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy]),
-            go.Heatmap(z=half_phase(f, ap_short, ap_long)),
-            go.Heatmap(z=channel(f, "x")),
-            go.Contour(x=radial, y=dist_norm, z=channel_enc(f, "x")),
-            go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy]),
-            go.Heatmap(z=half_phase(f, ap_long, ap_short)),
+            go.Heatmap(z=channel(f, "y").T),
+            go.Contour(x=dist_norm, y=radial, z=channel_enc(f, "y").T),
+            go.Scatter(x=[yy, yy], y=[-f["sil_major_m"], f["sil_major_m"]]),
+            go.Heatmap(z=emitter_phase(f, ap_short, ap_long)),
+            go.Heatmap(z=channel(f, "x").T),
+            go.Contour(x=dist_norm, y=radial, z=channel_enc(f, "x").T),
+            go.Scatter(x=[yy, yy], y=[-f["sil_minor_m"], f["sil_minor_m"]]),
+            go.Heatmap(z=emitter_phase(f, ap_long, ap_short)),
         ]))
     fig.frames = frames
 
@@ -595,13 +599,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                        transition=dict(duration=0))]) for k in range(n_frames)]
     # Slider at the TOP (in the top margin, just under the title) alongside the ▶ play button,
     # so the controls are reachable without scrolling to the bottom of this very tall figure.
-    slider = dict(active=0, y=1.0, yanchor="bottom", x=0.13, len=0.80,
+    slider = dict(active=0, y=1.02, yanchor="bottom", x=0.13, len=0.80,
                   currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)
     fig.update_layout(sliders=[slider])
 
-    # Panel A: 1:1 so the spot is undistorted over the silhouette.
+    # Panel A: 1:1 so the spot is undistorted; constrain="domain" shrinks the box to a 2:1 strip
+    # centred in the full-width row instead of padding the range.
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
-                     range=[-EXT_H, EXT_H], row=1, col=1)
+                     range=[-EXT_H, EXT_H], constrain="domain", row=1, col=1)
     fig.update_yaxes(title_text="v (m)", range=[-EXT_V, EXT_V], row=1, col=1)
     # Panel D: FIXED ranges (x, both y) so nothing re-autoranges as the markers move.
     d_left = max(float(eta_series.max()), float(capture_series.max())) * 1.08
@@ -609,18 +614,20 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.update_yaxes(title_text="capture / η (%)", range=[0, d_left], secondary_y=False, row=2, col=1)
     fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
                      secondary_y=True, row=2, col=1)
-    # Maps F/F₂ (rows 3, 5): radial x, along-path y (0 = emitter → 1 = far end of the pass).
-    for r in (3, 5):
-        fig.update_xaxes(title_text="radial offset (m)", range=[-R_max, R_max], row=r, col=1)
-        fig.update_yaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=r, col=1)
-    # Emitter-phase rows (4, 6): 1:1 (scaleanchor) so the aperture is undistorted; common metres
-    # scale ±PHASE_L fitting the long axis, so F's and F₂'s halves are literally the same ellipse
-    # rotated 90°. scaleanchor must reference each subplot's OWN x-axis id.
-    for i_ph, pr in ((i_fphase, 4), (i_f2phase, 6)):
-        fig.update_xaxes(title_text="aperture (m)", range=[-PHASE_L, PHASE_L],
-                         constrain="domain", row=pr, col=1)
-        fig.update_yaxes(range=[-PHASE_L, 0.06 * PHASE_L], scaleanchor=fig.data[i_ph].xaxis,
-                         scaleratio=1, constrain="domain", row=pr, col=1)
+    # Beam maps F/F₂ (rows 3, 4, col 2): x = along-path (0 = emitter → 1 = far end), y = radial,
+    # scaled to the shared ±PHASE_L (the long aperture axis).
+    for r in (3, 4):
+        fig.update_xaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=r, col=2)
+        fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=r, col=2)
+    # Emitter-phase plots (rows 3, 4, col 1): share the map's radial y (±PHASE_L) and are 1:1 in
+    # metres (scaleanchor). The cross axis is cropped to ±EMIT_X (box shrinks via
+    # constrain="domain"): the long aperture axis is cut off to a sliver in F, and fills in F₂.
+    # Ticks/titles hidden — the radial scale is read off the beam map it shares the row with.
+    for i_ph, r in ((i_fphase, 3), (i_f2phase, 4)):
+        fig.update_yaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=r, col=1)
+        fig.update_xaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
+                         scaleanchor=fig.data[i_ph].yaxis, scaleratio=1, constrain="domain",
+                         row=r, col=1)
     fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=1, col=1,
                        xanchor="left", yanchor="bottom",
                        text="green contours = enclosed beam-energy fraction (centre→edge)",
@@ -628,11 +635,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     fig.update_layout(
-        template="plotly_dark", height=2100, width=900, margin=dict(t=240, l=60, r=30, b=55),
+        template="plotly_dark", height=1450, width=1150, margin=dict(t=230, l=60, r=30, b=55),
         title=dict(text=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, "
                          f"{pass_kind}, horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — "
-                         f"press ▶ play or drag the slider above)"), y=0.995, yanchor="top"),
-        legend=dict(orientation="h", y=1.06, x=0.5, xanchor="center", font=dict(size=9)))
+                         f"press ▶ play or drag the slider above)"), y=0.992, yanchor="top"),
+        legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
         # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): plotly's native
