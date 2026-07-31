@@ -20,6 +20,23 @@ import beam_link_animation as anim
 OUT = "out"
 
 
+def build_flyby_phone(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
+                      emitter_diam_m=100.0, n_frames=41, grid_nA=120,
+                      write=True, path=f"{OUT}/flyby_phone.html"):
+    """The full flyby (A, D, F, F₂) in the PORTRAIT phone layout — the standard desktop figure
+    rotated 90° to fit an iPhone-width viewport, on a black background. Delegates to
+    beam_link_animation.build_flyby_animation(phone=True), so it stays in lock-step with the
+    desktop figure. Fewer frames and a lighter panel-A grid keep the embedded file phone-sized
+    (still tens of MB with the inline plotly.js — fine to open locally, too heavy to publish as
+    an artifact without dropping to a handful of frames).
+
+    Run:  uv run python beam_link_phone.py   → out/flyby_phone.html"""
+    return anim.build_flyby_animation(arch_name=arch_name, weather=weather,
+                                      lateral_offset_km=lateral_offset_km,
+                                      emitter_diam_m=emitter_diam_m, n_frames=n_frames,
+                                      grid_nA=grid_nA, phone=True, write=write, path=path)
+
+
 def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
                          emitter_diam_m=100.0, n_frames=25, grid_dist=60, grid_radial=90,
                          plane_alt_m=11_000.0, min_elevation_deg=2.0, delivered_mw=10.0,
@@ -459,8 +476,9 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5, tape
 
 
 if __name__ == "__main__":
-    # Build the focusing sweep (circle vs ellipse) → out/focus_phone.html. The two flyby
-    # channel views (build_phone_channels / build_phone_comparison) both write out/flyby_phone.html,
-    # so call whichever you want directly rather than building both here.
-    build_phone_focus()
-    print("wrote", f"{OUT}/focus_phone.html")
+    # The primary phone deliverable: the full flyby (A, D, F, F₂) in the portrait phone layout.
+    # The other builders here (build_phone_channels / build_phone_comparison → flyby_phone.html;
+    # build_phone_focus → focus_phone.html) are the round-vs-ellipse comparison figures — call
+    # whichever you want directly rather than building them all.
+    build_flyby_phone()
+    print("wrote", f"{OUT}/flyby_phone.html")

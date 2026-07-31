@@ -297,8 +297,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
+                          orientation="landscape", phone=False,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
-    """Build (and, if `write`, save) the 4-row flyby animation, returning the figure.
+    """Build (and, if `write`, save) the flyby animation (A, D, F, F₂), returning the figure.
 
     `arch_name` selects a named case from `standard_architectures`; pass `arch_kwargs`
     (a LinkConfig kwarg dict, `plane_pos` omitted) instead to animate an architecture not
@@ -306,7 +307,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     the display label. `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct →
     `emitter_diam_m`, relay → `relay_aperture_diam_m`) and bypasses the far-reference
     auto-sizing — so emitter size can be swept as the single variable. `grid_nA` is the
-    panel-A silhouette-grid resolution (lower it for lighter embedded figures)."""
+    panel-A silhouette-grid resolution (lower it for lighter embedded figures).
+
+    `orientation`: "landscape" (desktop — beam maps read left→right with the emitter phase
+    in a column to their LEFT) or "portrait" (the same views rotated 90° — beam maps read
+    bottom→top with the emitter phase directly BELOW; a single column that fits a phone).
+    `phone=True` selects the portrait layout at a phone-width size with a black background."""
+    if phone:
+        orientation = "portrait"
+    portrait = (orientation == "portrait")
     if arch_kwargs is None:
         archs = bl.standard_architectures(weather=weather)
         if arch_name not in archs:
@@ -466,27 +475,48 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         t = np.linspace(0.0, 2.0 * np.pi, 240)         # so the aperture edge stays visible
         return ap_cross_m * np.cos(t), ap_radial_m * np.sin(t)   # x = cross, y = radial
 
-    # Layout: A (beam spot over silhouette) and D (along-pass curves) span the full width; below
-    # them each beam-channel MAP reads left→right (x = emitter→plane), with its emitter-phase plot
-    # in a narrow column to its LEFT, sharing the map's vertical radial axis — so the aperture and
-    # the map's white aperture-line read at the same scale and line up.
-    fig = make_subplots(
-        rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.03,
-        row_heights=[0.24, 0.12, 0.32, 0.32], column_widths=[0.17, 0.83],
-        specs=[[{"type": "xy", "colspan": 2}, None],
-               [{"secondary_y": True, "colspan": 2}, None],
-               [{"type": "xy"}, {"type": "xy"}],
-               [{"type": "xy"}, {"type": "xy"}]],
-        subplot_titles=("A · beam spot over silhouette (fill = incidence)",
-                        "D · capture, η & cumulative energy along the pass",
-                        "emitter phase", "F · beam channel, major-axis (wide) cut  (beam →)",
-                        "emitter phase", "F₂ · beam channel, minor-axis (narrow) cut  (beam →)"))
+    # Layout: A (beam spot over silhouette) and D (along-pass curves) come first, then the two
+    # beam-channel maps each with its emitter-phase plot sharing the RADIAL axis (so the aperture
+    # and the map's white aperture-line read at one scale and line up).
+    #   landscape — A/D span the full width; each map reads left→right (x = emitter→plane) with
+    #               its emitter phase in a narrow column to its LEFT.
+    #   portrait  — a single column; each map reads bottom→top (y = emitter→plane) with its
+    #               emitter phase directly BELOW (the 90°-rotated view; fits a phone).
+    beam_dir = "↑" if portrait else "→"
+    if portrait:
+        f_title, f2_title = f"F · major-axis (wide) cut  {beam_dir}", f"F₂ · minor-axis (narrow) cut  {beam_dir}"
+        fig = make_subplots(
+            rows=6, cols=1, vertical_spacing=0.05,
+            row_heights=[0.17, 0.11, 0.185, 0.085, 0.185, 0.085],
+            specs=[[{"type": "xy"}], [{"secondary_y": True}], [{"type": "xy"}],
+                   [{"type": "xy"}], [{"type": "xy"}], [{"type": "xy"}]],
+            subplot_titles=("A · beam spot over silhouette", "D · capture, η & energy",
+                            f_title, "emitter phase", f2_title, "emitter phase"))
+        for ann in fig.layout.annotations:                # shrink subplot titles for phone width
+            ann.font.size = 12
+        A_rc, D_rc = (1, 1), (2, 1)
+        F_map, F_emit, F2_map, F2_emit = (3, 1), (4, 1), (5, 1), (6, 1)
+    else:
+        f_title = f"F · beam channel, major-axis (wide) cut  (beam {beam_dir})"
+        f2_title = f"F₂ · beam channel, minor-axis (narrow) cut  (beam {beam_dir})"
+        fig = make_subplots(
+            rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.03,
+            row_heights=[0.24, 0.12, 0.32, 0.32], column_widths=[0.17, 0.83],
+            specs=[[{"type": "xy", "colspan": 2}, None],
+                   [{"secondary_y": True, "colspan": 2}, None],
+                   [{"type": "xy"}, {"type": "xy"}],
+                   [{"type": "xy"}, {"type": "xy"}]],
+            subplot_titles=("A · beam spot over silhouette (fill = incidence)",
+                            "D · capture, η & cumulative energy along the pass",
+                            "emitter phase", f_title, "emitter phase", f2_title))
+        A_rc, D_rc = (1, 1), (2, 1)
+        F_emit, F_map, F2_emit, F2_map = (3, 1), (3, 2), (4, 1), (4, 2)
 
-    # ---- Panel A (row 1, full width): incidence heatmap (filled outline) + encircled contour ---
+    # ---- Panel A: incidence heatmap (filled outline) + encircled-energy contour ---------------
     i_incA = len(fig.data)
     fig.add_trace(go.Heatmap(x=gxA, y=gyA, z=incidence_grid(frames_phys[0]),
                              colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
-                             showscale=False, hoverinfo="skip"), row=1, col=1)
+                             showscale=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
                         labelfont=dict(size=9, color="#c8ffe6"))
     i_contA = len(fig.data)
@@ -495,76 +525,97 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     fig.add_trace(go.Contour(x=gx, y=gy, z=encircled_grid(frames_phys[0]), showscale=False,
                              colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
                              contours=contour_opts, line=dict(width=1.1), opacity=0.45,
-                             hoverinfo="skip"), row=1, col=1)
+                             hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
     # Live capture % in the corner of panel A — the beam fraction the silhouette intercepts.
     i_capA = len(fig.data)
     fig.add_trace(go.Scatter(x=[-EXT_H * 0.94], y=[EXT_V * 0.82], mode="text",
                              text=[f"{capture_series[0]:.0f}% captured"], textposition="middle right",
                              textfont=dict(size=16, color="#ffffff"), cliponaxis=False,
-                             showlegend=False, hoverinfo="skip"), row=1, col=1)
+                             showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
 
-    # ---- Panel D (row 2): capture, η (left %) + cumulative energy (right GJ) -------------
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name="η end-to-end (%)",
+    # ---- Panel D: capture, η (left %) + cumulative energy (right GJ) --------------------------
+    # Short legend labels on the phone so the horizontal legend fits one line at 402 px width.
+    nm_eta = "η (%)" if portrait else "η end-to-end (%)"
+    nm_cap = "capture (%)" if portrait else "overlap capture (%)"
+    nm_cum = "energy (GJ)" if portrait else "cumulative energy (GJ)"
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name=nm_eta,
                              line=dict(color="#1f77b4", width=2), hoverinfo="skip"),
-                  row=2, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=capture_series, mode="lines", name="overlap capture (%)",
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=capture_series, mode="lines", name=nm_cap,
                              line=dict(color="#2ca02c", width=2, dash="dot"), hoverinfo="skip"),
-                  row=2, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=cum_gj, mode="lines", name="cumulative energy (GJ)",
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=cum_gj, mode="lines", name=nm_cum,
                              line=dict(color="#ff7f0e", width=2), hoverinfo="skip"),
-                  row=2, col=1, secondary_y=True)
+                  row=D_rc[0], col=D_rc[1], secondary_y=True)
     i_eta_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
                              marker=dict(size=9, color="#1f77b4"), showlegend=False, hoverinfo="skip"),
-                  row=2, col=1, secondary_y=False)
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_cap_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[capture_series[0]], mode="markers",
                              marker=dict(size=9, color="#2ca02c"), showlegend=False, hoverinfo="skip"),
-                  row=2, col=1, secondary_y=False)
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_cum_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cum_gj[0]], mode="markers",
                              marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
-                  row=2, col=1, secondary_y=True)
+                  row=D_rc[0], col=D_rc[1], secondary_y=True)
 
     yy0 = frames_phys[0]["chan_total"] / max_total
+    m_ax = dict(x=radial, y=dist_norm) if portrait else dict(x=dist_norm, y=radial)
 
-    def add_pair(f0, cut, sil_key, ap_radial_m, ap_cross_m, row):
-        """Emitter phase (col 1) + beam-channel map (col 2), sharing the vertical radial axis.
-        The map reads left→right: x = emitter→plane, the white aperture line at x=0, the plane
-        slice (cyan) at the current slant. Returns (i_heat, i_cont, i_plane, i_phase)."""
-        i_phase = len(fig.data)                                       # emitter phase (col 1)
-        fig.add_trace(go.Heatmap(x=phase_c, y=phase_r, z=emitter_phase(f0, ap_radial_m, ap_cross_m),
-                                 colorscale="Plasma", zmin=-np.pi, zmax=np.pi, zauto=False,
-                                 showscale=False, hoverinfo="skip"), row=row, col=1)
-        ox, oy = emitter_outline(ap_radial_m, ap_cross_m)
-        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
-                                 showlegend=False, hoverinfo="skip"), row=row, col=1)   # aperture edge
-        i_heat = len(fig.data)                                        # beam map (col 2)
-        fig.add_trace(go.Heatmap(x=dist_norm, y=radial, z=channel(f0, cut).T,
-                                 colorscale="Plasma", zmin=0, zmax=1, zauto=False, zsmooth="fast",
-                                 showscale=False, hoverinfo="skip"), row=row, col=2)
-        i_cont = len(fig.data)
-        fig.add_trace(go.Contour(x=dist_norm, y=radial, z=channel_enc(f0, cut).T,
-                                 showscale=False, colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
-                                 contours=contour_opts, line=dict(width=1.0), opacity=0.45,
-                                 hoverinfo="skip"), row=row, col=2)
-        fig.add_trace(go.Scatter(x=[0.0, 0.0], y=[-ap_radial_m, ap_radial_m], mode="lines",
-                                 line=dict(color="white", width=5), showlegend=False,
-                                 hoverinfo="skip"), row=row, col=2)                     # aperture line
-        i_plane = len(fig.data)
+    def add_pair(f0, cut, sil_key, ap_radial_m, ap_cross_m, map_rc, emit_rc):
+        """Emitter phase + beam-channel map, sharing the RADIAL axis. landscape: map reads
+        left→right, emitter to its left; portrait: map reads bottom→top, emitter directly below.
+        Returns (i_heat, i_cont, i_plane, i_phase)."""
+        mr, mc = map_rc
+        er, ec = emit_rc
         s0 = f0[sil_key]
-        fig.add_trace(go.Scatter(x=[yy0, yy0], y=[-s0, s0], mode="lines",               # plane slice
-                                 line=dict(color="#00e5ff", width=4), showlegend=False,
-                                 hoverinfo="skip"), row=row, col=2)
+        # emitter phase — z is (radial, cross); outline is (cross, radial). Swap for portrait.
+        i_phase = len(fig.data)
+        zc = emitter_phase(f0, ap_radial_m, ap_cross_m)
+        oc, orad = emitter_outline(ap_radial_m, ap_cross_m)
+        if portrait:
+            e_x, e_y, e_z, o_x, o_y = phase_r, phase_c, zc.T, orad, oc
+        else:
+            e_x, e_y, e_z, o_x, o_y = phase_c, phase_r, zc, oc, orad
+        fig.add_trace(go.Heatmap(x=e_x, y=e_y, z=e_z, colorscale="Plasma", zmin=-np.pi, zmax=np.pi,
+                                 zauto=False, showscale=False, hoverinfo="skip"), row=er, col=ec)
+        fig.add_trace(go.Scatter(x=o_x, y=o_y, mode="lines", line=dict(color="white", width=1.0),
+                                 showlegend=False, hoverinfo="skip"), row=er, col=ec)   # aperture edge
+        # beam map — radial along one axis, emitter→plane along the other; aperture line at the
+        # emitter end, plane slice (cyan) at the current slant.
+        i_heat = len(fig.data)
+        if portrait:
+            m_z, m_ez = channel(f0, cut), channel_enc(f0, cut)
+            ap_x, ap_y, pl_x, pl_y = [-ap_radial_m, ap_radial_m], [0.0, 0.0], [-s0, s0], [yy0, yy0]
+        else:
+            m_z, m_ez = channel(f0, cut).T, channel_enc(f0, cut).T
+            ap_x, ap_y, pl_x, pl_y = [0.0, 0.0], [-ap_radial_m, ap_radial_m], [yy0, yy0], [-s0, s0]
+        fig.add_trace(go.Heatmap(z=m_z, colorscale="Plasma", zmin=0, zmax=1, zauto=False,
+                                 zsmooth="fast", showscale=False, hoverinfo="skip", **m_ax),
+                      row=mr, col=mc)
+        i_cont = len(fig.data)
+        fig.add_trace(go.Contour(z=m_ez, showscale=False, colorscale=[[0.0, "#7dffce"], [1.0, "#00f5a0"]],
+                                 contours=contour_opts, line=dict(width=1.0), opacity=0.45,
+                                 hoverinfo="skip", **m_ax), row=mr, col=mc)
+        fig.add_trace(go.Scatter(x=ap_x, y=ap_y, mode="lines", line=dict(color="white", width=5),
+                                 showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # aperture line
+        i_plane = len(fig.data)
+        fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="#00e5ff", width=4),
+                                 showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # plane slice
         return i_heat, i_cont, i_plane, i_phase
 
-    # Panel F (row 3): major-axis (wide) cut — the SHORT aperture axis lies along the radial (sliver).
+    # Panel F: major-axis (wide) cut — the SHORT aperture axis lies along the radial (a sliver).
     i_fheat, i_fcont, i_fplane, i_fphase = add_pair(
-        frames_phys[0], "y", "sil_major_m", ap_short, ap_long, 3)
-    # Panel F₂ (row 4): minor-axis (narrow) cut — the LONG aperture axis lies along the radial
-    # (fills the height; the 90°-rotated view of F's aperture).
+        frames_phys[0], "y", "sil_major_m", ap_short, ap_long, F_map, F_emit)
+    # Panel F₂: minor-axis (narrow) cut — the LONG aperture axis lies along the radial (fills the
+    # radial extent; the 90°-rotated view of F's aperture).
     i_f2heat, i_f2cont, i_f2plane, i_f2phase = add_pair(
-        frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, 4)
+        frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, F2_map, F2_emit)
+
+    def _plane(sil, yy):
+        return (go.Scatter(x=[-sil, sil], y=[yy, yy]) if portrait
+                else go.Scatter(x=[yy, yy], y=[-sil, sil]))
 
     ANIMATED = [i_incA, i_contA, i_capA, i_eta_m, i_cap_m, i_cum_m,
                 i_fheat, i_fcont, i_fplane, i_fphase, i_f2heat, i_f2cont, i_f2plane, i_f2phase]
@@ -572,6 +623,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
         yy = f["chan_total"] / max_total
+        zy, zx = channel(f, "y"), channel(f, "x")
+        ey, ex = channel_enc(f, "y"), channel_enc(f, "x")
+        pf, p2 = emitter_phase(f, ap_short, ap_long), emitter_phase(f, ap_long, ap_short)
+        if not portrait:
+            zy, zx, ey, ex, pf, p2 = zy.T, zx.T, ey.T, ex.T, pf, p2   # phase z already (radial,cross)
+        else:
+            pf, p2 = pf.T, p2.T
         frames.append(go.Frame(name=str(k), traces=ANIMATED, data=[
             go.Heatmap(z=incidence_grid(f)),
             go.Contour(x=gx, y=gy, z=encircled_grid(f)),
@@ -579,67 +637,85 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             go.Scatter(x=[cur], y=[eta_series[k]]),
             go.Scatter(x=[cur], y=[capture_series[k]]),
             go.Scatter(x=[cur], y=[cum_gj[k]]),
-            go.Heatmap(z=channel(f, "y").T),
-            go.Contour(x=dist_norm, y=radial, z=channel_enc(f, "y").T),
-            go.Scatter(x=[yy, yy], y=[-f["sil_major_m"], f["sil_major_m"]]),
-            go.Heatmap(z=emitter_phase(f, ap_short, ap_long)),
-            go.Heatmap(z=channel(f, "x").T),
-            go.Contour(x=dist_norm, y=radial, z=channel_enc(f, "x").T),
-            go.Scatter(x=[yy, yy], y=[-f["sil_minor_m"], f["sil_minor_m"]]),
-            go.Heatmap(z=emitter_phase(f, ap_long, ap_short)),
+            go.Heatmap(z=zy),
+            go.Contour(z=ey, **m_ax),
+            _plane(f["sil_major_m"], yy),
+            go.Heatmap(z=pf),
+            go.Heatmap(z=zx),
+            go.Contour(z=ex, **m_ax),
+            _plane(f["sil_minor_m"], yy),
+            go.Heatmap(z=p2),
         ]))
     fig.frames = frames
 
     # Slider steps animate to a SINGLE frame (mode immediate, redraw True) — the one path that
-    # reliably redraws Heatmap/Waterfall. Plotly's native sequenced *play* only honours redraw
-    # on the first frame (freezing A/E/F), so the ▶ play button is the custom sequential
-    # stepper injected via post_script instead of updatemenus.
+    # reliably redraws Heatmap. Plotly's native sequenced *play* only honours redraw on the first
+    # frame, so the ▶ play button is the custom sequential stepper injected via post_script.
     steps = [dict(method="animate", label=f"{xs[k]/1e3:.0f}",
                   args=[[str(k)], dict(mode="immediate", frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))]) for k in range(n_frames)]
-    # Slider at the TOP (in the top margin, just under the title) alongside the ▶ play button,
-    # so the controls are reachable without scrolling to the bottom of this very tall figure.
-    slider = dict(active=0, y=1.02, yanchor="bottom", x=0.13, len=0.80,
+    # Slider at the TOP (in the top margin, under the title) alongside the ▶ play button.
+    slider = dict(active=0, y=(1.035 if portrait else 1.02), yanchor="bottom",
+                  x=(0.16 if portrait else 0.13), len=(0.74 if portrait else 0.80),
                   currentvalue=dict(prefix="along-track: ", suffix=" km"), steps=steps)
     fig.update_layout(sliders=[slider])
 
-    # Panel A: 1:1 so the spot is undistorted; constrain="domain" shrinks the box to a 2:1 strip
-    # centred in the full-width row instead of padding the range.
+    # Panel A: 1:1 so the spot is undistorted; constrain="domain" shrinks the box to a 2:1 strip.
     fig.update_xaxes(title_text="view-plane u (m)", scaleanchor="y", scaleratio=1,
-                     range=[-EXT_H, EXT_H], constrain="domain", row=1, col=1)
-    fig.update_yaxes(title_text="v (m)", range=[-EXT_V, EXT_V], row=1, col=1)
+                     range=[-EXT_H, EXT_H], constrain="domain", row=A_rc[0], col=A_rc[1])
+    fig.update_yaxes(title_text="v (m)", range=[-EXT_V, EXT_V], row=A_rc[0], col=A_rc[1])
     # Panel D: FIXED ranges (x, both y) so nothing re-autoranges as the markers move.
     d_left = max(float(eta_series.max()), float(capture_series.max())) * 1.08
-    fig.update_xaxes(title_text="along-track (km)", range=[xs[0] / 1e3, xs[-1] / 1e3], row=2, col=1)
-    fig.update_yaxes(title_text="capture / η (%)", range=[0, d_left], secondary_y=False, row=2, col=1)
+    fig.update_xaxes(title_text="along-track (km)", range=[xs[0] / 1e3, xs[-1] / 1e3],
+                     row=D_rc[0], col=D_rc[1])
+    fig.update_yaxes(title_text="capture / η (%)", range=[0, d_left], secondary_y=False,
+                     row=D_rc[0], col=D_rc[1])
     fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
-                     secondary_y=True, row=2, col=1)
-    # Beam maps F/F₂ (rows 3, 4, col 2): x = along-path (0 = emitter → 1 = far end), y = radial,
-    # scaled to the shared ±PHASE_L (the long aperture axis).
-    for r in (3, 4):
-        fig.update_xaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=r, col=2)
-        fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=r, col=2)
-    # Emitter-phase plots (rows 3, 4, col 1): share the map's radial y (±PHASE_L) and are 1:1 in
-    # metres (scaleanchor). The cross axis is cropped to ±EMIT_X (box shrinks via
-    # constrain="domain"): the long aperture axis is cut off to a sliver in F, and fills in F₂.
-    # Ticks/titles hidden — the radial scale is read off the beam map it shares the row with.
-    for i_ph, r in ((i_fphase, 3), (i_f2phase, 4)):
-        fig.update_yaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=r, col=1)
-        fig.update_xaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
-                         scaleanchor=fig.data[i_ph].yaxis, scaleratio=1, constrain="domain",
-                         row=r, col=1)
-    fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=1, col=1,
+                     secondary_y=True, row=D_rc[0], col=D_rc[1])
+    # Beam maps + emitter-phase plots: the maps carry the emitter→plane axis (0 → 1) and the shared
+    # radial axis (±PHASE_L, the long aperture axis); the emitter plots share that radial axis and
+    # are 1:1 in metres (scaleanchor), the cross axis cropped to ±EMIT_X (box shrinks via
+    # constrain="domain") — so the long aperture axis is cut off to a sliver in F and fills in F₂.
+    # Emitter ticks/titles hidden — the radial scale is read off the map it shares its axis with.
+    if portrait:
+        for mr, mc in (F_map, F2_map):
+            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
+            fig.update_yaxes(title_text="emitter → plane", range=[0, 1], row=mr, col=mc)
+        for i_ph, (er, ec) in ((i_fphase, F_emit), (i_f2phase, F2_emit)):
+            fig.update_xaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
+            fig.update_yaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
+                             scaleanchor=fig.data[i_ph].xaxis, scaleratio=1, constrain="domain",
+                             row=er, col=ec)
+    else:
+        for mr, mc in (F_map, F2_map):
+            fig.update_xaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=mr, col=mc)
+            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
+        for i_ph, (er, ec) in ((i_fphase, F_emit), (i_f2phase, F2_emit)):
+            fig.update_yaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
+            fig.update_xaxes(range=[-EMIT_X, EMIT_X], showticklabels=False,
+                             scaleanchor=fig.data[i_ph].yaxis, scaleratio=1, constrain="domain",
+                             row=er, col=ec)
+    fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=A_rc[0], col=A_rc[1],
                        xanchor="left", yanchor="bottom",
-                       text="green contours = enclosed beam-energy fraction (centre→edge)",
-                       showarrow=False, font=dict(size=9, color="#8fffd0"))
+                       text="green = enclosed beam-energy fraction",
+                       showarrow=False, font=dict(size=8, color="#8fffd0"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
-    fig.update_layout(
-        template="plotly_dark", height=1450, width=1150, margin=dict(t=230, l=60, r=30, b=55),
-        title=dict(text=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, "
-                         f"{pass_kind}, horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — "
-                         f"press ▶ play or drag the slider above)"), y=0.992, yanchor="top"),
-        legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center", font=dict(size=9)))
+    if portrait:
+        fig.update_layout(
+            template="plotly_dark", height=1600, width=402, paper_bgcolor="black", plot_bgcolor="black",
+            margin=dict(t=225, l=44, r=10, b=40),
+            title=dict(text=(f"Flyby — {arch_name}<br><sub>{aperture_m:.0f} m emitter · {weather} · "
+                             f"{pass_kind} · ±{half/1e3:.0f} km · ▶ play or drag</sub>"),
+                       y=0.995, yanchor="top", x=0.5, xanchor="center", font=dict(size=12)),
+            legend=dict(orientation="h", y=1.10, x=0.5, xanchor="center", font=dict(size=7)))
+    else:
+        fig.update_layout(
+            template="plotly_dark", height=1450, width=1150, margin=dict(t=230, l=60, r=30, b=55),
+            title=dict(text=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, "
+                             f"{pass_kind}, horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — "
+                             f"press ▶ play or drag the slider above)"), y=0.992, yanchor="top"),
+            legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center", font=dict(size=9)))
     if write:
         os.makedirs(OUT, exist_ok=True)
         # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): plotly's native
