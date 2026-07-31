@@ -23,18 +23,69 @@ OUT = "out"
 def build_flyby_phone(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
                       emitter_diam_m=100.0, n_frames=41, grid_nA=120,
                       write=True, path=f"{OUT}/flyby_phone.html"):
-    """The full flyby (A, D, F, F₂) in the PORTRAIT phone layout — the standard desktop figure
-    rotated 90° to fit an iPhone-width viewport, on a black background. Delegates to
-    beam_link_animation.build_flyby_animation(phone=True), so it stays in lock-step with the
-    desktop figure. Fewer frames and a lighter panel-A grid keep the embedded file phone-sized
-    (still tens of MB with the inline plotly.js — fine to open locally, too heavy to publish as
-    an artifact without dropping to a handful of frames).
+    """CANONICAL local phone build: the full flyby (A, D, F, F₂) in the PORTRAIT phone layout — the
+    standard desktop figure rotated 90° to fit an iPhone-width viewport, on a black background, at
+    full frame count. Delegates to beam_link_animation.build_flyby_animation(phone=True), so it
+    stays in lock-step with the desktop figure. This writes a full standalone HTML document
+    (tens of MB with the inline plotly.js) — open it locally. To PUBLISH as an artifact, strip it
+    with build_phone_artifact() (which trades frames for bytes to fit the size cap).
 
     Run:  uv run python beam_link_phone.py   → out/flyby_phone.html"""
     return anim.build_flyby_animation(arch_name=arch_name, weather=weather,
                                       lateral_offset_km=lateral_offset_km,
                                       emitter_diam_m=emitter_diam_m, n_frames=n_frames,
                                       grid_nA=grid_nA, phone=True, write=write, path=path)
+
+
+# --- Artifact publishing --------------------------------------------------------------------------
+# A claude.ai artifact must be a self-contained body FRAGMENT (the platform wraps its own
+# <html>/<head>/<body>), with plotly.js INLINED (a strict CSP blocks CDNs), and must fit the
+# artifact size cap. The canonical build above is a full document; build_phone_artifact renders the
+# same figure as a fragment and picks the MOST frames that still fit `max_bytes`. The measured cap
+# is 16 MB (a 17 MB fragment is rejected, 13 MB accepted); 15 MB leaves ~1 MB headroom for the
+# platform's <html>/<head>/<body> wrapper.
+ARTIFACT_MAX_BYTES = 15_000_000
+
+
+def _phone_fragment(n_frames, grid_nA=120, **kw):
+    """The canonical phone figure at `n_frames`, rendered as a self-contained artifact fragment
+    (body-only, plotly.js inlined) — the exact bytes that would be published."""
+    fig = anim.build_flyby_animation(n_frames=n_frames, grid_nA=grid_nA, phone=True,
+                                     write=False, **kw)
+    post = anim._PLAYER_JS.replace("{n_frames}", str(n_frames))
+    return fig.to_html(full_html=False, include_plotlyjs="inline", auto_play=False, post_script=post)
+
+
+def build_phone_artifact(max_bytes=ARTIFACT_MAX_BYTES, path=f"{OUT}/flyby-phone-artifact.html",
+                         n_max=60, n_min=6, arch_name="5.8 direct", weather="clear",
+                         lateral_offset_km=5.0, emitter_diam_m=100.0, grid_nA=120):
+    """Reproducibly strip the canonical phone flyby down to the MOST frames that fit `max_bytes`,
+    written as a self-contained artifact fragment. Bytes are very nearly linear in frame count
+    (a fixed plotly.js floor + a per-frame image/vector cost), so this fits bytes ≈ a + b·n from
+    two trial renders, picks the largest n under budget, and shrinks if a rounding overshoots.
+    Deterministic: same config + budget → same file. Returns (path, n_frames, n_bytes)."""
+    import os
+    os.makedirs(OUT, exist_ok=True)
+    kw = dict(arch_name=arch_name, weather=weather, lateral_offset_km=lateral_offset_km,
+              emitter_diam_m=emitter_diam_m, grid_nA=grid_nA)
+    nbytes = lambda s: len(s.encode("utf-8"))
+
+    html_hi = _phone_fragment(n_max, **kw)
+    if nbytes(html_hi) <= max_bytes:
+        best_n, best_html = n_max, html_hi                       # everything fits — keep all frames
+    else:
+        html_lo = _phone_fragment(n_min, **kw)
+        per = (nbytes(html_hi) - nbytes(html_lo)) / (n_max - n_min)
+        floor = nbytes(html_lo) - per * n_min
+        best_n = max(n_min, min(n_max, int((max_bytes - floor) / per)))
+        best_html = _phone_fragment(best_n, **kw)
+        while nbytes(best_html) > max_bytes and best_n > n_min:  # shrink if the estimate overshot
+            best_n -= 1
+            best_html = _phone_fragment(best_n, **kw)
+    with open(path, "w") as fh:
+        fh.write(best_html)
+    print(f"artifact: {best_n} frames, {nbytes(best_html)/1e6:.2f} MB (cap {max_bytes/1e6:.1f}) → {path}")
+    return path, best_n, nbytes(best_html)
 
 
 def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
@@ -476,9 +527,13 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5, tape
 
 
 if __name__ == "__main__":
-    # The primary phone deliverable: the full flyby (A, D, F, F₂) in the portrait phone layout.
+    # The primary phone deliverable, in two forms:
+    #   flyby_phone.html          — CANONICAL full-quality local build (open directly on a phone)
+    #   flyby-phone-artifact.html — the reproducible stripped FRAGMENT for publishing as an artifact
+    #                               (most frames that fit the 16 MB cap; see build_phone_artifact)
     # The other builders here (build_phone_channels / build_phone_comparison → flyby_phone.html;
     # build_phone_focus → focus_phone.html) are the round-vs-ellipse comparison figures — call
     # whichever you want directly rather than building them all.
     build_flyby_phone()
     print("wrote", f"{OUT}/flyby_phone.html")
+    build_phone_artifact()
