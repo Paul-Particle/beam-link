@@ -32,7 +32,12 @@ import bwb_model as m
 import geo
 
 OUT = "out"
-CHANNEL_NGRID = 192          # diffraction transform grid for the beam-channel panels (F/F₂)
+# Diffraction transform grid for the beam-channel panels (F/F₂). 384 (not 192): the shaped
+# emitter's elongated aperture (semi-major ≈ √aspect · r_emit, ~141 m at aspect 8) only fits
+# the transform window with adequate margin at this size. At 192 the far/defocused frames alias
+# badly (RMS ~17 %, peak ~40 % off a converged reference — visible as non-monotone banding);
+# 384 converges (RMS <0.2 %). n≥320 also trips scipy's multi-threaded FFT (see _fft_workers).
+CHANNEL_NGRID = 384
 
 # Play button: a custom sequential stepper. Plotly's native sequenced play only redraws
 # Heatmap/Waterfall on the FIRST frame (the rest freeze), and `Plotly.animate([k],redraw)`
@@ -457,8 +462,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     r_emit = max(f["chan_emit_radius_m"] for f in frames_phys)
     r_sil = max(f["sil_major_m"] for f in frames_phys)
     R_max = 1.4 * max(r_emit, r_sil)
-    dist_norm = np.linspace(0.0, 1.0, 96)
-    radial = np.linspace(-R_max, R_max, 76)
+    dist_norm = np.linspace(0.0, 1.0, 110)   # along-path samples (one diffraction pass each)
+    radial = np.linspace(-R_max, R_max, 121)  # radial samples — cheap (interp only); smooths contours
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
     BOX = 45.0                                        # fixed half-extent of panel C (m)
 
