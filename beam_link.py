@@ -236,6 +236,34 @@ def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
     return np.sqrt(2.0) * wavelength_m * slant_m / (np.pi * np.maximum(emitter_radius_m, 1e-6))
 
 
+def gaussian_beam_radius(z_m, aperture_radius_m, wavelength_m, focus_range_m):
+    """Physically exact 1/e² field radius w(z) of a Gaussian beam radiating from an aperture of
+    1/e² radius `aperture_radius_m`, phase-conjugated to focus at range `focus_range_m` (a
+    converging wavefront, curvature −focus_range at the aperture plane z=0). Exact ABCD /
+    q-parameter propagation:
+
+        zR = π·a²/λ ;  u = L/zR ;  w0 = a·u/√(1+u²) ;  z_waist = L/(1+u²) ;  zR' = π·w0²/λ
+        w(z) = w0·√(1 + ((z − z_waist)/zR')²)
+
+    The beam fills the aperture at z=0 (w(0)=a), converges to a diffraction-limited waist w0 at
+    z_waist ≤ L, and diverges beyond it. Vectorized in z; returns (w(z), w0, z_waist).
+
+    Relationship to `focused_spot_waist`: the spot delivered AT the target is w(L)=λ·L/(π·a) —
+    a factor √2 SMALLER than `focused_spot_waist`, which is deliberately inflated by √2 so the
+    round-spot OVERLAP reproduces the Goubau near-field COUPLING law (a coupling proxy, not the
+    literal field). Use THIS for the true beam geometry; `focused_spot_waist` for capture."""
+    a = float(aperture_radius_m)
+    lam = float(wavelength_m)
+    L = max(float(focus_range_m), 1e-9)
+    zR = np.pi * a ** 2 / lam
+    u = L / zR
+    w0 = a * u / np.sqrt(1.0 + u ** 2)
+    z_waist = L / (1.0 + u ** 2)
+    zR_out = max(np.pi * w0 ** 2 / lam, 1e-12)
+    w = w0 * np.sqrt(1.0 + ((np.asarray(z_m, dtype=float) - z_waist) / zR_out) ** 2)
+    return w, float(w0), float(z_waist)
+
+
 def supergaussian_area_factor(profile_order):
     """C(n) with ∫∫ exp(−2(ρ²/w²)^n) dA = π·w²·C(n), so the total power in a spot of
     waist w and peak B0 is B0·π·w²·C(n) and the peak for a given total power P is

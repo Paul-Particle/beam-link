@@ -282,6 +282,23 @@ def test_overlap():
 
 # --- Trajectory-integrated flyby ----------------------------------------------
 
+def test_gaussian_beam():
+    print("\n[exact Gaussian beam — aperture → waist → beyond]")
+    lam, a = napkin.wavelength(5.8e9), 50.0
+    for L in (11e3, 107e3, 213e3):
+        w, w0, z_waist = bl.gaussian_beam_radius(np.array([0.0, L]), a, lam, L)
+        check(f"w(0)=aperture radius (L={L/1e3:.0f} km)", abs(w[0] - a) < 1e-6, f"{w[0]:.3f} vs {a}")
+        check(f"w(L)=λL/πa (L={L/1e3:.0f} km)", abs(w[1] - lam * L / (np.pi * a)) < 1e-6,
+              f"{w[1]:.3f} vs {lam*L/(np.pi*a):.3f}")
+        check(f"true waist ≤ delivered spot, and sits at z_waist ≤ L (L={L/1e3:.0f} km)",
+              w0 <= w[1] + 1e-9 and z_waist <= L + 1e-6, f"w0 {w0:.2f} @ {z_waist/1e3:.1f} km")
+    # The engine's capture waist is deliberately √2 larger (Goubau coupling calibration).
+    w_target = bl.gaussian_beam_radius(np.array([213e3]), a, lam, 213e3)[0][0]
+    check("focused_spot_waist = √2 · delivered spot",
+          abs(float(bl.focused_spot_waist(lam, 213e3, a)) - np.sqrt(2) * w_target) < 1e-6,
+          f"{float(bl.focused_spot_waist(lam, 213e3, a)):.2f} vs {np.sqrt(2)*w_target:.2f}")
+
+
 def test_flyby():
     print("\n[flyby — trajectory-integrated over a pass]")
     archs = bl.standard_architectures()
@@ -423,6 +440,7 @@ if __name__ == "__main__":
     test_vectorized()
     test_pass_profile()
     test_overlap()
+    test_gaussian_beam()
     test_flyby()
     test_pointing_density()
     test_flattop()
