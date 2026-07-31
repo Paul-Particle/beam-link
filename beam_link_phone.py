@@ -409,7 +409,8 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
         fig.update_yaxes(title_text="distance from emitter (km)", range=[0, L_max_km * 1.02], row=row, col=1)
     fig.update_xaxes(title_text="focal range (km)", type="log", row=5, col=1)
     fig.update_yaxes(title_text="waist (m)", type="log", row=5, col=1)
-    fig.update_layout(template="plotly_dark", height=1560, width=300,
+    fig.update_layout(template="plotly_dark", height=1560, width=330,
+                      paper_bgcolor="black", plot_bgcolor="black",
                       margin=dict(l=48, r=12, t=120, b=44),
                       legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center", font=dict(size=8)),
                       title=dict(text=(f"Focusing: circle vs ellipse<br><sub>same area · {emitter_diam_m:.0f} m equiv "
@@ -420,6 +421,7 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5,
         import os
         os.makedirs(OUT, exist_ok=True)
         post = anim._PLAYER_JS.replace("{n_frames}", str(n_frames))
+        post += "\ndocument.body.style.background='#000';document.documentElement.style.background='#000';"
         fig.write_html(path, include_plotlyjs="inline", full_html=False, auto_play=False, post_script=post)
     return fig
 
