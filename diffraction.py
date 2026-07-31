@@ -119,6 +119,47 @@ def focal_intensity(semi_major_m, semi_minor_m, wavelength_m, focus_range_m,
                            wavelength_m, taper_p=taper_p, n_grid=n_grid)
 
 
+def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
+              taper_p=0.0, axis="x", n_grid=512):
+    """(len(z), len(radial)) slice of the diffraction field ALONG the beam: for each plane z,
+    the field is sampled along a principal `axis` ('x' = aperture-major axis → the NARROW spot
+    cut; 'y' = aperture-minor axis → the WIDE spot cut) onto the common `radial_m` grid. Shows
+    the converging cone → diffraction-limited waist → diverging cone, sidelobe rings included.
+
+    Returns (intensity, enclosed): `intensity` is normalised to its own global peak (so the
+    waist is brightest and the beam dims through the divergence); `enclosed` is the
+    enclosed-energy-along-the-cut fraction E(z, r) = ∫_{|r'|≤r} I / ∫ I, for the funnel overlay.
+    Planes so close to the aperture that its width would be clipped by the transform grid are
+    left NaN (the near-aperture field isn't fabricated)."""
+    z_m = np.asarray(z_m, dtype=float)
+    radial_m = np.asarray(radial_m, dtype=float)
+    intensity = np.full((z_m.size, radial_m.size), np.nan)
+    enclosed = np.full((z_m.size, radial_m.size), np.nan)
+    order = np.argsort(np.abs(radial_m))
+    max_semi = max(semi_major_m, semi_minor_m)
+    for i, z in enumerate(z_m):
+        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m)
+        if n_grid * d < 2.4 * max_semi:                # aperture would be clipped → skip
+            continue
+        x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
+                                            wavelength_m, taper_p=taper_p, n_grid=n_grid)
+        mid = field.shape[0] // 2
+        line = field[:, mid] if axis == "x" else field[mid, :]
+        ax = x_ax if axis == "x" else y_ax
+        row = np.interp(radial_m, ax, line, left=0.0, right=0.0)
+        intensity[i] = row
+        total = row.sum()
+        if total > 0:
+            cdf = np.empty_like(row)
+            cdf[order] = np.cumsum(row[order])
+            enclosed[i] = cdf / total
+    peak = np.nanmax(intensity)
+    if peak and peak > 0:
+        intensity = intensity / peak
+    # Round for compact serialization (3 decimals is ample for a 0–1 display field).
+    return np.round(intensity, 3), np.round(enclosed, 3)
+
+
 def sample_focal_intensity(x_axis, y_axis, intensity, xq, yq):
     """Bilinearly sample a focal-plane intensity grid at query points (xq, yq) in metres
     (aperture principal frame: x along aperture major axis). Out-of-grid points → 0."""
