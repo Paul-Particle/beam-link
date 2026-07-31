@@ -9,6 +9,7 @@ import numpy as np
 import napkin
 import geo
 import beam_link as bl
+import diffraction as dfr
 import bwb_model as m
 from bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
@@ -229,8 +230,11 @@ def test_pass_profile():
 def test_overlap():
     print("\n[overlap capture — the 2-D beam × silhouette model]")
 
-    # (1) The overlap of a ROUND spot on a uniform round rectenna must reproduce the
-    # Goubau near-field law 1−e^(−τ²) exactly — the new model generalises the old one.
+    # (1) The overlap of a ROUND uniform aperture on a round rectenna must reproduce the
+    # exact analytic Airy encircled energy E = 1 − J0(2τ)² − J1(2τ)² — i.e. the diffraction
+    # field really is the Fraunhofer pattern of the aperture, sidelobe spill and all. (This
+    # replaces the old Goubau 1−e^(−τ²) check: Goubau is the optimal-taper envelope, which the
+    # ADAPTIVE taper approaches to ~1–2 %, but a fixed uniform aperture loses its sidelobes.)
     def disk_raster(r_r, n=400):
         g = np.linspace(-r_r, r_r, n)
         uu, vv = np.meshgrid(g, g)
@@ -239,11 +243,21 @@ def test_overlap():
         return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
                     proj_area=np.full(int(mask.sum()), cell), area=int(mask.sum()) * cell)
     lam, D, r_t, r_r = napkin.wavelength(30e9), 200e3, 40.0, 15.0
+    airy = float(dfr.airy_encircled_energy(r_r, r_t, lam, D))
+    geom, _, _ = bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False,
+                                    taper_p=0.0, incidence_floor=1.0)
+    check("round uniform aperture on a disk reproduces the Airy encircled energy",
+          abs(geom - airy) < 1.5e-2, f"overlap {geom:.4f} vs Airy {airy:.4f}")
+
+    # (1b) The adaptive taper recovers most of the sidelobe loss, tracking the Goubau
+    # optimal-coupling envelope 1−e^(−τ²) to within a couple of points on the same disk.
     tau = napkin.coupling_tau(30e9, D, r_t, r_r)
     goubau = napkin.collection_efficiency(tau)
-    geom, _, _ = bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False, incidence_floor=1.0)
-    check("round spot on a disk reproduces Goubau 1−e^(−τ²)", abs(geom - goubau) < 5e-3,
-          f"overlap {geom:.4f} vs Goubau {goubau:.4f}")
+    best = max(bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False,
+                                  taper_p=p, incidence_floor=1.0)[0]
+               for p in (0.0, 0.5, 1.0, 1.5, 2.0))
+    check("adaptive taper approaches the Goubau optimal-coupling envelope",
+          best >= goubau - 0.03, f"best-taper {best:.4f} vs Goubau {goubau:.4f}")
 
     # (2) The rasterized (self-occluded) silhouette is SMALLER than the convex identity
     # side-on at low elevation, where winglets + far wing overlap in projection.
@@ -356,8 +370,8 @@ def test_pointing_density():
           f"1 MW → {lo:.1f} m, 40 MW → {hi:.1f} m")
 
 
-def test_flattop():
-    print("\n[flat-top (super-Gaussian) beam]")
+def test_taper():
+    print("\n[aperture taper — sidelobe spill vs main-lobe width]")
     def disk_raster(r_r, n=400):
         g = np.linspace(-r_r, r_r, n)
         uu, vv = np.meshgrid(g, g)
@@ -366,57 +380,40 @@ def test_flattop():
         return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
                     proj_area=np.full(int(mask.sum()), cell), area=int(mask.sum()) * cell)
     lam, D, r_t = napkin.wavelength(30e9), 200e3, 40.0
-    w = bl.focused_spot_waist(lam, D, r_t)
-    # On a rectenna comparable to the spot (r_r ≈ w), the Gaussian's tail SPILLS past the
-    # edge while a flat top is sharply contained → flat top captures MORE of the same
-    # total power. (For a target much smaller than the spot the reverse holds — a peaked
-    # beam wins — so the flat top is the tool for a CONTAINED, density-limited spot.)
-    r = disk_raster(w)
-    _, e_gauss, _ = bl.overlap_capture(r, r_t, lam, D, shaped=False, profile_order=1.0, incidence_floor=1.0)
-    _, e_flat, _ = bl.overlap_capture(r, r_t, lam, D, shaped=False, profile_order=6.0, incidence_floor=1.0)
-    check("flat-top captures ≥ Gaussian on a contained spot", e_flat >= e_gauss - 1e-9,
-          f"flat {e_flat:.3f} ≥ gauss {e_gauss:.3f}")
-    pk_g = bl._peak_density(10.0, 0.5, 0.5, w, profile_order=1.0)
-    pk_f = bl._peak_density(10.0, 0.5, 0.5, w, profile_order=4.0)
-    check("flat-top lowers peak density at equal waist/power", pk_f < pk_g,
-          f"gauss {pk_g/1e4:.1f} vs flat {pk_f/1e4:.1f} W/cm²")
-    # Under a W/m² cap, the flatter top needs a SMALLER minimum footprint for the same
-    # delivered power → less spill.
-    w_g = bl._density_min_waist(10.0, 0.5, 0.5, 2.5e5, profile_order=1.0)
-    w_f = bl._density_min_waist(10.0, 0.5, 0.5, 2.5e5, profile_order=4.0)
-    check("flat-top needs a smaller capped footprint", w_f < w_g,
-          f"gauss {w_g:.1f} m vs flat {w_f:.1f} m")
+    # On a receiver the size of the uniform aperture's main lobe (first Airy null), the
+    # uniform pattern spills ~16 % into sidelobes that miss the disk; a taper trades main-lobe
+    # width for far lower sidelobes and so lands MORE of the power on the disk.
+    r_null = 0.610 * lam * D / r_t
+    r = disk_raster(r_null)
+    g_unif = bl.overlap_capture(r, r_t, lam, D, shaped=False, taper_p=0.0, incidence_floor=1.0)[0]
+    g_taper = bl.overlap_capture(r, r_t, lam, D, shaped=False, taper_p=1.5, incidence_floor=1.0)[0]
+    check("taper lifts capture on a main-lobe-sized receiver (kills sidelobe spill)",
+          g_taper > g_unif, f"uniform {g_unif:.3f} → taper {g_taper:.3f}")
+    # A heavier taper widens the main lobe → lower peak areal intensity for the same power.
+    p_unif = bl.overlap_capture(r, r_t, lam, D, shaped=False, taper_p=0.0, incidence_floor=1.0)[2]
+    p_taper = bl.overlap_capture(r, r_t, lam, D, shaped=False, taper_p=2.0, incidence_floor=1.0)[2]
+    check("heavier taper lowers the peak areal intensity", p_taper < p_unif,
+          f"uniform {p_unif:.2e} → taper {p_taper:.2e} /m²")
 
 
-def test_adaptive_profile():
-    print("\n[adaptive spot profile — flat-top when a capped spot would spill, else Gaussian]")
+def test_adaptive_taper():
+    print("\n[adaptive aperture taper — chosen per geometry for max capture under the cap]")
     st, relay = (0, 0, 0), (0, 0, 20e3)
     base = dict(station_pos=st, relay_pos=relay, relay_mode="multiplier", f_emit_relay_ghz=5.8,
-                f_relay_plane_ghz=17.4, relay_aperture_diam_m=40)
-    # High delivered power overhead: the density cap forces the spot wide enough that a plain
-    # Gaussian would spill past the plane → the array flattens the top (higher order) to fit
-    # the same power under the cap in a smaller footprint, spilling less. The order is
-    # optimised continuously in [1, profile_order_max], so expect an interior/upper value.
-    hot = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 40.0)
-    check("capped-and-spilling spot → flat-top engaged", hot["beam_profile_order"] > 1.0,
-          f"order {hot['beam_profile_order']:.2f}")
-    # Moderate power overhead: the cap-limited spot still fits the plane, so no flat-top is
-    # needed — the optimiser keeps a near-Gaussian. (Under the OLD silhouette-sized defocus
-    # floor this spot was forced wide and spilled, wrongly engaging a flat-top.)
-    warm = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), **base), 10.0)
-    check("contained capped spot → stays ~Gaussian", warm["beam_profile_order"] < 1.5,
-          f"order {warm['beam_profile_order']:.2f}")
-    # Far out: the spot overspills the foreshortened sliver → a peaked Gaussian delivers
-    # more to the small target, so the array stays Gaussian (the lower bound).
-    dr = float(bl.geo.downrange_for_elevation(3.0, 11e3))
-    far = bl.evaluate(bl.LinkConfig(plane_pos=(dr, 0, 11e3), **base), 10.0)
-    check("far out (overspilling) → stays Gaussian", far["beam_profile_order"] == 1.0,
-          f"order {far['beam_profile_order']:.2f}")
-    # Turning adaptation off pins the configured order.
-    fixed = bl.evaluate(bl.LinkConfig(plane_pos=(0, 0, 11e3), adaptive_profile=False,
-                                      beam_profile_order=1.0, **base), 10.0)
-    check("adaptive off pins the order", fixed["beam_profile_order"] == 1.0,
-          f"order {fixed['beam_profile_order']:.2f}")
+                f_relay_plane_ghz=17.4, relay_aperture_diam_m=40, plane_pos=(0, 0, 11e3))
+    # The adaptive taper optimises over the (1−ρ²)^p family, so it must capture ≥ ANY fixed
+    # taper at the same geometry.
+    adap = bl.evaluate(bl.LinkConfig(adaptive_taper=True, **base), 10.0)
+    fixed_caps = [bl.evaluate(bl.LinkConfig(adaptive_taper=False, taper_p=p, **base), 10.0)["capture"]
+                  for p in (0.0, 1.0, 2.0, 4.0)]
+    check("adaptive taper ≥ every fixed taper", adap["capture"] >= max(fixed_caps) - 3e-3,
+          f"adaptive {adap['capture']:.4f} vs best fixed {max(fixed_caps):.4f}")
+    check("chosen taper reported within [0, taper_p_max]", 0.0 <= adap["aperture_taper_p"] <= 4.0,
+          f"p = {adap['aperture_taper_p']:.2f}")
+    # Turning adaptation off pins the configured taper.
+    fixed = bl.evaluate(bl.LinkConfig(adaptive_taper=False, taper_p=2.0, **base), 10.0)
+    check("adaptive off pins the taper", abs(fixed["aperture_taper_p"] - 2.0) < 1e-9,
+          f"p = {fixed['aperture_taper_p']:.2f}")
 
 
 def test_energy_balance():
@@ -443,8 +440,8 @@ if __name__ == "__main__":
     test_gaussian_beam()
     test_flyby()
     test_pointing_density()
-    test_flattop()
-    test_adaptive_profile()
+    test_taper()
+    test_adaptive_taper()
     test_energy_balance()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)
