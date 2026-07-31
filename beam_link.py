@@ -32,7 +32,6 @@ generate_atmosphere_profile.py; rain/cloud are layered on per weather scenario.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import gamma
 from pathlib import Path
 
 import numpy as np
@@ -174,12 +173,6 @@ def emitter_aperture_efficiency(scan_deg=0.0, error_efficiency=0.95, scan_rollof
     return error_efficiency * scan
 
 
-def pointing_efficiency(pointing_error_m, spot_radius_m):
-    """Focused-spot pointing loss: η = exp(−2·(δ/w)²) for a Gaussian spot of
-    radius w and boresight error δ."""
-    return np.exp(-2.0 * (pointing_error_m / np.maximum(spot_radius_m, 1e-6)) ** 2)
-
-
 def polarization_efficiency(polarization="circular", roll_deg=0.0, axial_ratio_loss=0.95):
     """Circular pol: orientation-robust, a flat axial-ratio penalty. Linear pol:
     cos²(roll) mismatch as the airframe banks relative to the beam's E-field."""
@@ -212,21 +205,6 @@ def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
     pol = polarization_efficiency(polarization, roll_deg)
     return conv * spot_match * incidence * pol, dict(rf_to_dc=conv, spot_match=spot_match,
                                                      incidence=incidence, polarization=pol)
-
-
-def spot_match_from_aspect(aspect_ratio, shaped=False, fill=0.90):
-    """Physically-grounded spot-match efficiency from the silhouette's elongation.
-
-    A ROUND emitter makes a round spot; to cover an elongated silhouette (major:minor
-    = aspect) it must span the major axis, wasting the corners → overlap ≈ minor/major
-    = 1/aspect (times a soft-edge `fill`). A SHAPE-MATCHED (elliptical) emitter — which
-    a phased array can synthesise and re-orient electronically — recovers to `fill`.
-    This is the honest version of the constant `spot_match` knob.
-
-    NOTE: superseded for the main link by `overlap_capture`, which does the real 2-D
-    beam×silhouette integral. Kept for the illustrative spot-shape figure."""
-    aspect = np.maximum(aspect_ratio, 1.0)
-    return fill if shaped else fill / aspect
 
 
 def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
@@ -264,16 +242,6 @@ def gaussian_beam_radius(z_m, aperture_radius_m, wavelength_m, focus_range_m):
     zR_out = max(np.pi * w0 ** 2 / lam, 1e-12)
     w = w0 * np.sqrt(1.0 + ((np.asarray(z_m, dtype=float) - z_waist) / zR_out) ** 2)
     return w, float(w0), float(z_waist)
-
-
-def supergaussian_area_factor(profile_order):
-    """C(n) with ∫∫ exp(−2(ρ²/w²)^n) dA = π·w²·C(n), so the total power in a spot of
-    waist w and peak B0 is B0·π·w²·C(n) and the peak for a given total power P is
-    B0 = P/(π·w²·C(n)). C(1)=0.5 (Gaussian); C→1 as n→∞ (ideal top-hat). A higher-order
-    super-Gaussian (flat top) puts the SAME power through the SAME footprint at a LOWER
-    peak — it eases the W/m² cap without widening the spot (so without spilling more)."""
-    n = float(profile_order)
-    return (1.0 / n) * 2.0 ** (-1.0 / n) * gamma(1.0 / n)
 
 
 def effective_waist(peak_intensity):
@@ -562,9 +530,10 @@ def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=150
     return raster, float(slant), wavelength, float(emitter_diam_m), shared
 
 
-def _capture_dict(shared, geom, eff, peak, taper_p):
+def _capture_dict(shared, geom, eff, peak, taper_p, focus_range_m):
     return dict(**shared, capture=eff, capture_geom=geom, peak_intensity=peak,
-                spot_waist_m=effective_waist(peak), taper_p=float(taper_p))
+                spot_waist_m=effective_waist(peak), taper_p=float(taper_p),
+                focus_range_m=float(focus_range_m))
 
 
 def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
@@ -583,7 +552,8 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
         raster, emitter_diam_m / 2.0, wavelength, slant, shaped=cfg.shaped_spot,
         incidence_floor=cfg.incidence_floor, taper_p=p, focus_range_m=focus_range_m,
         pointing_offset_m=cfg.pointing_error_m, fixed_aspect=cfg.fixed_emitter_aspect)
-    return _capture_dict(shared, geom, eff, peak, p)
+    focus_used = slant if focus_range_m is None else float(focus_range_m)
+    return _capture_dict(shared, geom, eff, peak, p, focus_used)
 
 
 def _overlap_taper_grid(raster, emitter_radius_m, wavelength_m, slant_m, shaped,
@@ -631,12 +601,15 @@ def _peak_density(delivered_mw, capture, rect_total, peak_intensity):
     return p_spot_w * peak_intensity
 
 
-def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total, taper_p):
+def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
+                       taper_p, pc=None):
     """`plane_capture` at a given aperture taper, DEFOCUSED (focus short of the plane) only
     as much as the W/m² density cap requires. Defocusing spreads the spot → lower peak, at
     some cost in capture, so we binary-search for the LEAST defocus (largest focus range)
-    whose peak sits under the cap."""
-    pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p)
+    whose peak sits under the cap. `pc` is an optional already-computed focused capture at
+    this taper (reused to skip the initial FFT)."""
+    if pc is None:
+        pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p)
     cap = cfg.max_power_density_w_m2
     if cap is None or delivered_mw is None or pc["capture"] <= 0:
         return pc
@@ -682,14 +655,20 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     if cap is None or delivered_mw is None or \
             _peak_density(delivered_mw, result["capture"], rect_total, result["peak_intensity"]) <= cap:
         return result
-    # Cap binds → defocus the winner, and re-check the heavier tapers (less defocus needed).
+    # Cap binds → defocus the winner (reusing the focused solve above), then re-check the
+    # heavier tapers (they need less defocus). Heavier tapers have lower FOCUSED capture, so
+    # once one needs NO defocus every heavier one only loses capture — stop there.
+    focused_winner = result
     result = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
-                                delivered_mw, rect_total, float(taper_grid[best_k]))
+                                delivered_mw, rect_total, float(taper_grid[best_k]), pc=focused_winner)
+    slant = result["slant"]
     for p in taper_grid[best_k + 1:]:
         r = _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
                                delivered_mw, rect_total, float(p))
         if r["capture"] > result["capture"]:
             result = r
+        if r["focus_range_m"] >= slant - 1e-6:     # no defocus needed → heavier tapers only worse
+            break
     return result
 
 
@@ -703,8 +682,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         # ---- direct emitter → plane (emitter at station_pos; lofted for the tether case) ----
         f = cfg.f_emit_plane_ghz
         conv = float(napkin.rectenna_efficiency_band(f))
-        pc0 = plane_capture(cfg, station, f, cfg.emitter_diam_m)
-        pol = float(polarization_efficiency(cfg.polarization, pc0["roll"]))
+        pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
         # Choose the spot profile per geometry and enforce the W/m² cap.
         pc = _capture_with_caps(cfg, station, f, cfg.emitter_diam_m, delivered_mw, conv * pol)
         a, b = _to_ecef(station), _to_ecef(plane)
@@ -720,7 +698,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             rectenna_rf_to_dc=conv, polarization=pol,
             rectenna_total=conv * pol, silhouette_m2=pc["area"],
             receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], spot_waist_m=pc["spot_waist_m"],
-            aperture_taper_p=pc["taper_p"],
+            aperture_taper_p=pc["taper_p"], focus_range_m=pc["focus_range_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
             emitter_diam_m=pc["emitter_diam_m"], slant_km=pc["slant"] / 1e3,
@@ -739,8 +717,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
         # down-leg: relay → plane uses the real silhouette overlap; the emitting
         # aperture is the relay's own (fixed) transmit array.
         conv = float(napkin.rectenna_efficiency_band(f2))
-        pc0 = plane_capture(cfg, relay, f2, cfg.relay_aperture_diam_m)
-        pol = float(polarization_efficiency(cfg.polarization, pc0["roll"]))
+        pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
         pc = _capture_with_caps(cfg, relay, f2, cfg.relay_aperture_diam_m, delivered_mw, conv * pol)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
         blocked2 = bool(geo.horizon_blocked(a2, b2, 64))
@@ -763,7 +740,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None):
             capture=pc["capture"], atmos=atmos_dn,
             silhouette_m2=pc["area"], receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"],
             spot_waist_m=pc["spot_waist_m"], aperture_taper_p=pc["taper_p"],
-            emitter_diam_m=pc["emitter_diam_m"],
+            focus_range_m=pc["focus_range_m"], emitter_diam_m=pc["emitter_diam_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
             emitter_diam_up_m=float(h1.emitter_diam_m),

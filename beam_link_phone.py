@@ -455,7 +455,8 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5, tape
 
 
 if __name__ == "__main__":
-    # NOTE: build_phone_comparison() still rides on beam_link_animation's pre-diffraction
-    # channel helpers and is pending migration; only the diffraction focus view is built here.
+    # Build the focusing sweep (circle vs ellipse) → out/focus_phone.html. The two flyby
+    # channel views (build_phone_channels / build_phone_comparison) both write out/flyby_phone.html,
+    # so call whichever you want directly rather than building both here.
     build_phone_focus()
     print("wrote", f"{OUT}/focus_phone.html")

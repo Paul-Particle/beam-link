@@ -41,16 +41,19 @@ def aperture_amplitude(x, y, semi_major_m, semi_minor_m, taper_p):
     return np.where(inside, np.clip(1.0 - rho2, 0.0, None) ** float(taper_p), 0.0)
 
 
-def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m):
+def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid=1024):
     """Aperture-plane sample spacing d for a single-FFT propagation to plane z of an aperture
     focused at `focus_range_m`. Two Nyquist constraints:
       • Focal-plane spacing dx = λ·z/(N·d) and extent = λ·z/d, so the SPOT (widest along the
-        SHORT aperture axis) sets d = min_semi/12 → focal window ~12 spot-scales wide.
+        SHORT aperture axis) sets d = min_semi/12 → focal window ~12 spot-scales wide. But the
+        aperture-plane window is N·d, so d is floored at 2.5·max_semi/N so the LONG aperture
+        axis always fits the transform grid (else an elongated aperture is spuriously clipped
+        and the plane is dropped by the near-aperture guard in axial_cut).
       • Off-focus, the aperture carries a residual quadratic phase exp(iπ·(1/z−1/f)·ρ²/λ) whose
         edge frequency is max_semi·|1/z−1/f|/λ; d must resolve it (d ≤ λ/(4·max_semi·|1/z−1/f|)).
     The tighter of the two wins (the phase term vanishes at z = f, so the spot term rules there)."""
     min_semi, max_semi = min(semi_major_m, semi_minor_m), max(semi_major_m, semi_minor_m)
-    d_spot = min_semi / 12.0
+    d_spot = max(min_semi / 12.0, 2.5 * max_semi / n_grid)
     inv = abs(1.0 / max(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9))
     d_phase = wavelength_m / (4.0 * max_semi * inv) if inv > 0 else np.inf
     return min(d_spot, d_phase)
@@ -65,7 +68,7 @@ def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m
     transverse position x = λ·z·f_freq. At z = f this collapses to the Fraunhofer (focal)
     pattern. Aperture major axis is along x → the spot is NARROW along x (Fourier inverse).
     Returns (x_m, y_m, intensity) with ∫∫ I dx dy = 1 (fraction of radiated power / m²)."""
-    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m)
+    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid)
     coord = (np.arange(n_grid) - n_grid // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
     A = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p).astype(complex)
@@ -91,7 +94,7 @@ def plane_intensity_stack(z_m, focus_range_m, semi_major_m, semi_minor_m, wavele
     cheaper than one FFT per taper. Returns (x_m, y_m, stack) with stack[k] the
     power-normalised intensity (∫∫ I dA = 1) for taper_ps[k]."""
     taper_ps = np.atleast_1d(np.asarray(taper_ps, dtype=float))
-    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m)
+    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid)
     coord = (np.arange(n_grid) - n_grid // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
     rho2 = (X / semi_major_m) ** 2 + (Y / semi_minor_m) ** 2
@@ -140,8 +143,8 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
     enclosed = np.full((z_m.size, radial_m.size), np.nan)
     max_semi = max(semi_major_m, semi_minor_m)
     for i, z in enumerate(z_m):
-        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m)
-        if n_grid * d < 2.4 * max_semi:                # aperture would be clipped → skip
+        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m, n_grid)
+        if n_grid * d < 2.4 * max_semi:                # near-aperture (phase-limited) plane → skip
             continue
         x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
                                             wavelength_m, taper_p=taper_p, n_grid=n_grid)
@@ -164,8 +167,12 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
     peak = intensity[finite].max() if finite.any() else 0.0
     if normalize and peak > 0:
         intensity = intensity / peak
-    # Round for compact serialization (3 decimals is ample for a 0–1 display field).
-    return np.round(intensity, 3), np.round(np.clip(enclosed, 0.0, 1.0), 3)
+    # Round only the normalised (0–1) field for compact serialization; the raw field
+    # (normalize=False) is areal intensity ~1e-4 W-fraction/m² and would collapse to 0 at
+    # 3 decimals, so leave it full-precision for the caller to normalise across legs.
+    if normalize:
+        intensity = np.round(intensity, 3)
+    return intensity, np.round(np.clip(enclosed, 0.0, 1.0), 3)
 
 
 def sample_focal_intensity(x_axis, y_axis, intensity, xq, yq):

@@ -226,11 +226,14 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     s = bl.evaluate(cfg, delivered_mw)
     eta = float(s["eta_end_to_end"])
     taper_p = float(s["aperture_taper_p"])
+    # The engine may DEFOCUS (focus short of the plane) to hold the W/m² cap; use its chosen
+    # focus so the drawn spot is the operating one behind the capture number, not the focused one.
+    focus = float(s.get("focus_range_m", slant))
     geom = float(s.get("capture_geom", s.get("capture_down_geom", s["capture"])))
     eff = float(s["capture"])
     _, _, _, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=cfg.shaped_spot,
                                         incidence_floor=cfg.incidence_floor, taper_p=taper_p,
-                                        pointing_offset_m=cfg.pointing_error_m,
+                                        focus_range_m=focus, pointing_offset_m=cfg.pointing_error_m,
                                         fixed_aspect=cfg.fixed_emitter_aspect, return_field=True)
     wf = bl.waterfall(s)                              # [(stage label, efficiency), ...]
 
@@ -273,7 +276,7 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     # the focused relay→plane down-leg (the relay's elliptical aperture); direct = one leg. Each
     # leg carries its aperture semi-axes, focus range, wavelength and taper — the channel
     # renderer computes the exact diffraction field per leg.
-    down_leg = dict(ap_major=ap_major, ap_minor=ap_minor, focus_m=float(slant),
+    down_leg = dict(ap_major=ap_major, ap_minor=ap_minor, focus_m=focus,
                     length_m=float(slant), lam=lam, taper_p=taper_p)
     if cfg.relay_pos is not None:
         station = np.asarray(cfg.station_pos, float)
