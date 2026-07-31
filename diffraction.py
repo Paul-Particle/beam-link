@@ -158,6 +158,86 @@ def _finalize_cut(intensity, enclosed, normalize):
     return intensity, np.round(np.clip(enclosed, 0.0, 1.0), 3)
 
 
+def _cut_from_field(field, dx_ax, radial_m, r_query):
+    """Both principal center-line cuts + strip-marginals of one plane's intensity `field`
+    (square grid, spacing dx_ax on both axes; aperture major along axis 0). Returns
+    (ix, ex, iy, ey) rows on `radial_m`. Shared by the batched and per-plane paths."""
+    mid = field.shape[0] // 2
+    coord = (np.arange(field.shape[0]) - mid) * dx_ax
+    ix, ex = _cut_enclosed(field[:, mid], coord, dx_ax, field.sum(axis=1) * dx_ax, radial_m, r_query)
+    iy, ey = _cut_enclosed(field[mid, :], coord, dx_ax, field.sum(axis=0) * dx_ax, radial_m, r_query)
+    return ix, ex, iy, ey
+
+
+def _axial_cuts(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
+                taper_p, n_grid, dtype):
+    """Core of the axial-cut routines: for every plane z, both principal center-line cuts of the
+    diffraction field, on the common `radial_m` grid, RAW (per-plane ∫∫ I dA = 1, unnormalised).
+
+    The grid spacing d = min(d_spot, d_phase) (see `_aperture_spacing`) is pinned to the CONSTANT
+    d_spot for every plane except the strongly-defocused near-aperture ones (where the residual
+    quadratic phase forces a finer d_phase). All the d_spot planes therefore share one aperture
+    grid, so they are computed as a SINGLE batched FFT with the aperture amplitude and radius²
+    grid built once — far cheaper than one FFT + one aperture raster per plane, and numerically
+    identical to the per-plane path (only the FFT accumulation order differs, ~1e-7). The few
+    d_phase planes keep the exact per-plane path. Returns (ix, ex, iy, ey), NaN where a plane is
+    too close to the aperture for its width to fit the transform grid."""
+    z_m = np.asarray(z_m, dtype=float)
+    radial_m = np.asarray(radial_m, dtype=float)
+    r_query = np.abs(radial_m)
+    shape = (z_m.size, radial_m.size)
+    ix = np.full(shape, np.nan); ex = np.full(shape, np.nan)
+    iy = np.full(shape, np.nan); ey = np.full(shape, np.nan)
+    min_semi, max_semi = min(semi_major_m, semi_minor_m), max(semi_major_m, semi_minor_m)
+    d_spot = max(min_semi / 12.0, 2.5 * max_semi / n_grid)
+
+    inv = 1.0 / np.maximum(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9)
+    abs_inv = np.abs(inv)
+    d_phase = np.full_like(abs_inv, np.inf)            # exact-focus plane (inv = 0) → d_spot rules
+    nonzero = abs_inv > 0.0
+    d_phase[nonzero] = wavelength_m / (4.0 * max_semi * abs_inv[nonzero])
+    is_spot = d_phase >= d_spot                        # this plane's spacing is pinned to d_spot
+
+    # --- batched d_spot planes: one aperture raster + radius² grid, one batched FFT ------------
+    # The residual quadratic phase varies plane-to-plane only through the scalar `inv`, and the
+    # aperture masks everything outside the (typically ~few-percent-fill) ellipse, so the phase is
+    # evaluated ONLY at the aperture samples and scattered into the zero-padded transform grid —
+    # the exp() cost then scales with the aperture area, not the whole grid. Phase in complex64
+    # (float32 argument): a ~1e-4 rad rounding, invisible in the display field.
+    spot_idx = np.nonzero(is_spot)[0]
+    if spot_idx.size and n_grid * d_spot >= 2.4 * max_semi:
+        coord = (np.arange(n_grid) - n_grid // 2) * d_spot
+        X, Y = np.meshgrid(coord, coord, indexing="ij")
+        mask = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p) > 0.0
+        taper_in = aperture_amplitude(X[mask], Y[mask], semi_major_m, semi_minor_m,
+                                      taper_p).astype(np.float32)
+        radius2_in = ((X[mask] ** 2 + Y[mask] ** 2) * (np.pi / wavelength_m)).astype(np.float32)
+        chunk = max(1, int(24e6 / (n_grid * n_grid)))  # cap the padded stack ~200 MB (complex64)
+        for start in range(0, spot_idx.size, chunk):
+            gidx = spot_idx[start:start + chunk]
+            invs = inv[gidx].astype(np.float32)
+            vals = taper_in[None] * np.exp(1j * (invs[:, None] * radius2_in[None]))  # (chunk, n_ap)
+            stack = np.zeros((gidx.size, n_grid, n_grid), dtype=np.complex64)
+            stack[:, mask] = vals
+            field = sfft.fftshift(sfft.fft2(sfft.ifftshift(stack, axes=(1, 2)), axes=(1, 2),
+                                            workers=_fft_workers(n_grid)), axes=(1, 2))
+            inten = field.real ** 2 + field.imag ** 2  # |field|² without the wasted sqrt of abs()
+            dxs = wavelength_m * z_m[gidx] / (n_grid * d_spot)     # per-plane observation spacing
+            totals = inten.sum(axis=(1, 2)) * dxs ** 2
+            inten /= np.where(totals > 0, totals, 1.0)[:, None, None]
+            for k, gi in enumerate(gidx):
+                ix[gi], ex[gi], iy[gi], ey[gi] = _cut_from_field(inten[k], dxs[k], radial_m, r_query)
+
+    # --- the few strongly-defocused planes: exact per-plane path ------------------------------
+    for gi in np.nonzero(~is_spot)[0]:
+        if n_grid * d_phase[gi] < 2.4 * max_semi:      # near-aperture (phase-limited) → skip (NaN)
+            continue
+        x_ax, _, field = plane_intensity(z_m[gi], focus_range_m, semi_major_m, semi_minor_m,
+                                         wavelength_m, taper_p=taper_p, n_grid=n_grid, dtype=dtype)
+        ix[gi], ex[gi], iy[gi], ey[gi] = _cut_from_field(field, x_ax[1] - x_ax[0], radial_m, r_query)
+    return ix, ex, iy, ey
+
+
 def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
               taper_p=0.0, axis="x", n_grid=512, normalize=True, dtype=np.complex128):
     """(len(z), len(radial)) slice of the diffraction field ALONG the beam: for each plane z,
@@ -172,52 +252,19 @@ def axial_cut(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radi
     is the enclosed-energy-along-the-cut fraction E(z, r) = ∫_{|r'|≤r} I / ∫ I, for the funnel.
     Planes so close to the aperture that its width would be clipped by the transform grid are
     left NaN (the near-aperture field isn't fabricated). For BOTH cuts at once use axial_cut_xy."""
-    z_m = np.asarray(z_m, dtype=float)
-    radial_m = np.asarray(radial_m, dtype=float)
-    r_query = np.abs(radial_m)
-    intensity = np.full((z_m.size, radial_m.size), np.nan)
-    enclosed = np.full((z_m.size, radial_m.size), np.nan)
-    max_semi = max(semi_major_m, semi_minor_m)
-    for i, z in enumerate(z_m):
-        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m, n_grid)
-        if n_grid * d < 2.4 * max_semi:                # near-aperture (phase-limited) plane → skip
-            continue
-        x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
-                                            wavelength_m, taper_p=taper_p, n_grid=n_grid, dtype=dtype)
-        mid = field.shape[0] // 2
-        dx_ax, dy_ax = x_ax[1] - x_ax[0], y_ax[1] - y_ax[0]
-        if axis == "x":
-            line, coord, dcoord = field[:, mid], x_ax, dx_ax
-            marginal = field.sum(axis=1) * dy_ax        # ∫ I dy → power per unit x
-        else:
-            line, coord, dcoord = field[mid, :], y_ax, dy_ax
-            marginal = field.sum(axis=0) * dx_ax        # ∫ I dx → power per unit y
-        intensity[i], enclosed[i] = _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query)
-    return _finalize_cut(intensity, enclosed, normalize)
+    ix, ex, iy, ey = _axial_cuts(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
+                                 radial_m, taper_p, n_grid, dtype)
+    return _finalize_cut(*(( ix, ex) if axis == "x" else (iy, ey)), normalize)
 
 
 def axial_cut_xy(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
                  taper_p=0.0, n_grid=512, normalize=True, dtype=np.complex128):
-    """BOTH principal cuts of the axial field in ONE pass: plane_intensity is computed once per
-    plane and both the x-cut (narrow spot) and y-cut (wide spot) are sliced out, halving the FFTs
-    vs two axial_cut calls. Returns (ix, ex, iy, ey) — see axial_cut for the per-cut meaning."""
-    z_m = np.asarray(z_m, dtype=float)
-    radial_m = np.asarray(radial_m, dtype=float)
-    r_query = np.abs(radial_m)
-    shape = (z_m.size, radial_m.size)
-    ix = np.full(shape, np.nan); ex = np.full(shape, np.nan)
-    iy = np.full(shape, np.nan); ey = np.full(shape, np.nan)
-    max_semi = max(semi_major_m, semi_minor_m)
-    for i, z in enumerate(z_m):
-        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z, focus_range_m, n_grid)
-        if n_grid * d < 2.4 * max_semi:
-            continue
-        x_ax, y_ax, field = plane_intensity(z, focus_range_m, semi_major_m, semi_minor_m,
-                                            wavelength_m, taper_p=taper_p, n_grid=n_grid, dtype=dtype)
-        mid = field.shape[0] // 2
-        dx_ax, dy_ax = x_ax[1] - x_ax[0], y_ax[1] - y_ax[0]
-        ix[i], ex[i] = _cut_enclosed(field[:, mid], x_ax, dx_ax, field.sum(axis=1) * dy_ax, radial_m, r_query)
-        iy[i], ey[i] = _cut_enclosed(field[mid, :], y_ax, dy_ax, field.sum(axis=0) * dx_ax, radial_m, r_query)
+    """BOTH principal cuts of the axial field in ONE pass — the x-cut (narrow spot) and y-cut
+    (wide spot) share every diffraction transform. Returns (ix, ex, iy, ey) — see axial_cut for
+    the per-cut meaning. The planes at the common d_spot grid spacing are computed as one batched
+    FFT (see `_axial_cuts`)."""
+    ix, ex, iy, ey = _axial_cuts(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
+                                 radial_m, taper_p, n_grid, dtype)
     ix, ex = _finalize_cut(ix, ex, normalize)
     iy, ey = _finalize_cut(iy, ey, normalize)
     return ix, ex, iy, ey
