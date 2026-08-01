@@ -63,6 +63,13 @@ def _build_stamp():
 # 384 converges (RMS <0.2 %). n≥320 also trips scipy's multi-threaded FFT (see _fft_workers).
 CHANNEL_NGRID = 384
 
+# Panel-A encircled-energy contours recompute the focal-plane intensity at THIS (finer) grid. The
+# capture grid (384) sizes its window to the elongated APERTURE (~±1 km), so the tiny focused SPOT
+# lands on only ~5 px across its narrow axis — enough for the capture integral, but the iso-energy
+# contours come out jagged. 1024 resolves the spot (~13 px) → smooth contours; it's a display-only
+# recompute (one extra FFT/frame, cached), the capture number stays on the 384 field.
+CONTOUR_NGRID = 1024
+
 # Play button: a custom sequential stepper. Each frame swaps the five baked background images
 # (one `Plotly.relayout`) and restyles the handful of live vector traces (contours, plane slices,
 # curve markers) — no z-grid re-raster and no per-frame contour recompute, so playback stays
@@ -189,6 +196,23 @@ def _localize(downrange_m, crossrange_m, altitude_m, basis):
     base, east, north, up = basis
     d = geo.point(downrange_m, crossrange_m, altitude_m) - base
     return np.array([np.dot(d, north), np.dot(d, east), np.dot(d, up)])
+
+
+def _beam_on_grid(field, gx, gy):
+    """The emitter's SCALAR-DIFFRACTION target-plane intensity (from overlap_capture's returned
+    field: x_axis/y_axis/intensity in the aperture principal frame) resampled onto the panel grid
+    (gx, gy) and aligned to the DISPLAYED silhouette's principal axes. Out-of-grid samples → 0.
+    Used by `beam_link_figures` for the capture-overlap snapshot; the flyby's panel-A contours use
+    the native diffraction grid directly (see `incid_contour`). Returns z[row=y, col=x]."""
+    uu, vv = np.meshgrid(gx, gy)                              # (len(gy), len(gx))
+    if field["u"].size < 3 or "intensity" not in field:
+        return np.zeros_like(uu)
+    coords = np.vstack([field["u"], field["v"]])
+    _, evecs = np.linalg.eigh(np.cov(coords))                # display-frame principal axes
+    proj = evecs.T @ np.vstack([uu.ravel(), vv.ravel()])     # rows: [along minor, along major]
+    beam = dfr.sample_focal_intensity(field["x_axis"], field["y_axis"], field["intensity"],
+                                      proj[0], proj[1])
+    return beam.reshape(uu.shape)
 
 
 def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
@@ -418,7 +442,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
 
 def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
-                          n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
+                          n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           orientation="landscape", phone=False, beam_full_range=False,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
@@ -714,24 +738,37 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              transpose=portrait, flip_rows=portrait, cmap="twilight")
     def incid_png(f):                                      # silhouette incidence → background image
         return _field_to_png(incidence_grid(f), transpose=False, flip_rows=True)
+    _encA_cache = {}
+
+    def _panelA_enc(f):
+        """High-res encircled-energy field for panel A, cached per frame. The focal-plane intensity is
+        RECOMPUTED at CONTOUR_NGRID from the winning leg's aperture/focus/taper (the 384 capture grid
+        undersamples the tiny spot → jagged contours). Returns (enc[ix,iy], x_axis, y_axis, evecs);
+        evecs are the silhouette's display principal axes [minor, major] = [x_axis, y_axis] dirs."""
+        key = id(f)
+        if key not in _encA_cache:
+            leg = f["chan_legs"][-1]
+            xa, ya, I = dfr.plane_intensity(f["slant_m"], leg["focus_m"], leg["ap_major"],
+                                            leg["ap_minor"], leg["lam"], taper_p=leg["taper_p"],
+                                            n_grid=CONTOUR_NGRID)
+            flat = np.asarray(I, float).ravel(); order = np.argsort(flat)[::-1]
+            enc = np.empty_like(flat)
+            enc[order] = np.clip(np.cumsum(flat[order]) * (xa[1] - xa[0]) * (ya[1] - ya[0]), 0.0, 1.0)
+            coords = np.vstack([f["field"]["u"], f["field"]["v"]])
+            _, evecs = np.linalg.eigh(np.cov(coords))
+            _encA_cache[key] = (enc.reshape(np.shape(I)), xa, ya, evecs)
+        return _encA_cache[key]
+
     def incid_contour(f, levels):
-        """Encircled-energy contours for panel A, computed on the beam's NATIVE diffraction grid
-        (which contains the whole beam and decays smoothly to ~0 at its edges) and then transformed
-        into the display (u, v) frame — NOT on the clipped panel window. Truncating a spread beam at
-        the panel edge is what produced the spurious hooks/loops; the native grid has no such edge.
-        Physically accurate: iso-levels of the cumulative-energy field, each enclosing that fraction
-        of the beam's TOTAL radiated energy (∫∫ I dA = 1)."""
+        """Encircled-energy contours for panel A: iso-levels of the cumulative-energy field on the
+        beam's NATIVE (recomputed, finer) diffraction grid, transformed into the display (u, v) frame.
+        The native grid contains the whole beam and decays smoothly — NOT the clipped panel window,
+        whose edge-truncation of a spread beam produced the spurious hooks/loops. Each level encloses
+        that fraction of the beam's TOTAL radiated energy (∫∫ I dA = 1)."""
         fld = f["field"]
-        I = np.asarray(fld.get("intensity", np.empty(0)), float)     # I[ix, iy], power-normalised
-        coords = np.vstack([fld["u"], fld["v"]]) if fld["u"].size else np.empty((2, 0))
-        if I.size < 9 or coords.shape[1] < 3:
+        if fld["u"].size < 3 or "intensity" not in fld:
             return np.array([]), np.array([])
-        xa, ya = np.asarray(fld["x_axis"], float), np.asarray(fld["y_axis"], float)
-        flat = I.ravel(); order = np.argsort(flat)[::-1]
-        enc = np.empty_like(flat)
-        enc[order] = np.clip(np.cumsum(flat[order]) * (xa[1] - xa[0]) * (ya[1] - ya[0]), 0.0, 1.0)
-        enc = enc.reshape(I.shape)
-        _, evecs = np.linalg.eigh(np.cov(coords))         # cols [minor, major] = [x_axis, y_axis] dirs
+        enc, xa, ya, evecs = _panelA_enc(f)
         gen = contourpy.contour_generator(xa, ya, enc.T)  # z[row=ya, col=xa]; segs in (x_axis, y_axis)
         uo, vo = [], []
         for level in levels:
