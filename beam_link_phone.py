@@ -21,7 +21,7 @@ OUT = "out"
 
 
 def build_flyby_phone(arch_name="5.8 direct", weather="clear", lateral_offset_km=5.0,
-                      emitter_diam_m=100.0, n_frames=41, grid_nA=120,
+                      emitter_diam_m=100.0, n_frames=41, grid_nA=180,
                       write=True, path=f"{OUT}/flyby_phone.html"):
     """CANONICAL local phone build: the full flyby (A, D, F, F₂) in the PORTRAIT phone layout — the
     standard desktop figure rotated 90° to fit an iPhone-width viewport, on a black background, at
@@ -47,7 +47,7 @@ def build_flyby_phone(arch_name="5.8 direct", weather="clear", lateral_offset_km
 ARTIFACT_MAX_BYTES = 15_000_000
 
 
-def _phone_fragment(n_frames, grid_nA=120, **kw):
+def _phone_fragment(n_frames, grid_nA=180, **kw):
     """The canonical phone figure at `n_frames`, rendered as a self-contained artifact fragment
     (body-only, plotly.js inlined) — the exact bytes that would be published."""
     fig = anim.build_flyby_animation(n_frames=n_frames, grid_nA=grid_nA, phone=True,
@@ -58,7 +58,7 @@ def _phone_fragment(n_frames, grid_nA=120, **kw):
 
 def build_phone_artifact(max_bytes=ARTIFACT_MAX_BYTES, path=f"{OUT}/flyby-phone-artifact.html",
                          n_max=60, n_min=6, arch_name="5.8 direct", weather="clear",
-                         lateral_offset_km=5.0, emitter_diam_m=100.0, grid_nA=120):
+                         lateral_offset_km=5.0, emitter_diam_m=100.0, grid_nA=180):
     """Reproducibly strip the canonical phone flyby down to the MOST frames that fit `max_bytes`,
     written as a self-contained artifact fragment. Bytes are very nearly linear in frame count
     (a fixed plotly.js floor + a per-frame image/vector cost), so this fits bytes ≈ a + b·n from

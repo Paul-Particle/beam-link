@@ -31,7 +31,6 @@ import matplotlib.image as mpimg
 import contourpy
 
 from scipy.ndimage import uniform_filter1d
-from scipy.spatial import ConvexHull
 
 import beam_link as bl
 import diffraction as dfr
@@ -153,19 +152,6 @@ def _dejitter_along_path(enc, path_axis, window=9):
     return np.where(finite > 0, num / np.maximum(den, 1e-9), np.nan)
 
 
-def _contour_xy(z, xs, ys, levels=_CONTOUR_LEVELS):
-    """Iso-level polylines of `z` (shape (len(ys), len(xs))) at `levels`, in DATA coords, as flat
-    x/y arrays with NaN gaps between segments — honest marching-squares lines (linear
-    interpolation between samples) drawn as crisp vectors, not a re-rastered contour trace."""
-    gen = contourpy.contour_generator(np.asarray(xs), np.asarray(ys), z)
-    xo, yo = [], []
-    for level in levels:
-        for seg in gen.lines(float(level)):
-            xo.extend(seg[:, 0]); xo.append(np.nan)
-            yo.extend(seg[:, 1]); yo.append(np.nan)
-    return np.asarray(xo), np.asarray(yo)
-
-
 def _funnel_contour(enc, dist, radial, levels=_CONTOUR_LEVELS):
     """Enclosed-energy funnel contours by DIRECT per-plane inversion, not 2-D marching squares. At
     each plane the enclosed fraction E(|r|) rises monotonically from 0 (on axis) to its window
@@ -203,24 +189,6 @@ def _localize(downrange_m, crossrange_m, altitude_m, basis):
     base, east, north, up = basis
     d = geo.point(downrange_m, crossrange_m, altitude_m) - base
     return np.array([np.dot(d, north), np.dot(d, east), np.dot(d, up)])
-
-
-def _beam_on_grid(field, gx, gy):
-    """The emitter's SCALAR-DIFFRACTION target-plane intensity (from overlap_capture's
-    returned field: x_axis/y_axis/intensity in the aperture principal frame) resampled onto
-    the panel grid (gx, gy) and aligned to the DISPLAYED silhouette's principal axes — so the
-    picture is exactly the field the capture integral used, sidelobes and all. Returns the
-    beam grid with plotly's z[row=y, col=x] shape (len(gy), len(gx))."""
-    uu, vv = np.meshgrid(gx, gy)                              # (len(gy), len(gx))
-    if field["u"].size < 3 or "intensity" not in field:
-        return np.zeros_like(uu)
-    coords = np.vstack([field["u"], field["v"]])
-    _, evecs = np.linalg.eigh(np.cov(coords))                # display-frame principal axes
-    proj = evecs.T @ np.vstack([uu.ravel(), vv.ravel()])     # rows: [along minor, along major]
-    # grid x-axis = spot minor (silhouette minor coord); grid y-axis = spot major.
-    beam = dfr.sample_focal_intensity(field["x_axis"], field["y_axis"], field["intensity"],
-                                      proj[0], proj[1])
-    return beam.reshape(uu.shape)
 
 
 def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
@@ -290,11 +258,16 @@ def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
                     e_out[zi] = np.interp(radial, r_wide, Ew_r[a])   # smooth enclosed fraction
         cum += leg["length_m"]
 
-    def _norm(inten):
-        finite = np.isfinite(inten)
-        peak = inten[finite].max() if finite.any() else 0.0
-        return (inten / peak if peak > 0 else inten).astype(np.float32)
-    return _norm(ix), ex.astype(np.float32), _norm(iy), ey.astype(np.float32)
+    # Normalise BOTH cuts to ONE shared peak over the whole frame (not each to its own peak), so the
+    # relative brightness between the wide (F) and narrow (F₂) cuts is preserved — the narrow cut
+    # focuses tighter so it is genuinely brighter at the waist. The near field is then dim in both
+    # (its power is spread over the aperture width) — that is honest, per the display convention.
+    fin_x, fin_y = np.isfinite(ix), np.isfinite(iy)
+    peak = max(float(ix[fin_x].max()) if fin_x.any() else 0.0,
+               float(iy[fin_y].max()) if fin_y.any() else 0.0)
+    scale = peak if peak > 0 else 1.0
+    return ((ix / scale).astype(np.float32), ex.astype(np.float32),
+            (iy / scale).astype(np.float32), ey.astype(np.float32))
 
 
 _SIL_EXTENT = None
@@ -506,42 +479,44 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     PANEL_A_ASPECT = 2.0                             # panel A width:height (spans both columns)
     EXT_H = max_silhouette_extent() / ZOOM_FILL
     EXT_V = EXT_H / PANEL_A_ASPECT
-    gx = np.linspace(-EXT_H, EXT_H, grid_n)          # contour grid (smooth beam)
-    gy = np.linspace(-EXT_V, EXT_V, grid_n)
     gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the z-buffered silhouette image
     gyA = np.linspace(-EXT_V, EXT_V, grid_nA)
     # Fine mesh for the crisp z-buffered panel-A silhouette (denser than the coarse channel mesh, so
     # winglets and edges render at their true width). Normals are per-face (flat incidence per pixel).
     silA_v, silA_f = m.make_bwb_mesh()
     silA_n, _ = m.triangle_normals_areas(silA_v, silA_f)
-    # Orthographic TOP and SIDE outlines of the airframe (body metres), for the to-scale plane drawn
-    # at the plane line in F (top) / F₂ (side). Body frame: x̂=nose, ŷ=starboard, ẑ=belly-down, so
-    # dorsal-up = −ẑ. Each is the convex envelope of the projected vertices, centred on its own mid.
-    #   F  (top view):  radial ← span (ŷ), along-beam ← nose-tail (x̂), nose toward +along (far).
-    #   F₂ (side view): radial ← nose-tail (x̂), along-beam ← dorsal (−ẑ), so winglets point +along
-    #                   (away from the emitter — the beam arrives on the belly).
-    def _hull_loop(pts2d):
-        h = ConvexHull(pts2d)
-        loop = pts2d[np.append(h.vertices, h.vertices[0])]
-        return loop - loop.mean(axis=0)                   # (radial_m, along_m), centred
-    plane_top = _hull_loop(np.column_stack([silA_v[:, 1], silA_v[:, 0]]))
-    plane_side = _hull_loop(np.column_stack([silA_v[:, 0], -silA_v[:, 2]]))
+    # To-scale airframe drawn at the plane line: a z-BUFFERED SILHOUETTE (same source/style as panel A —
+    # incidence-filled, crisp), rendered as a fixed orthographic TOP view in F and SIDE view in F₂. Body
+    # frame: x̂=nose, ŷ=starboard, ẑ=belly-down (dorsal-up = −ẑ). Each render fixes the map's radial axis
+    # ← one body axis and the along-beam axis ← another:
+    #   F  (top view):  radial ← span (ŷ); along ← nose-tail (x̂); look from dorsal (−ẑ).
+    #   F₂ (side view): radial ← height (dorsal −ẑ); along ← nose-tail (x̂), so the LONG side (length)
+    #                   runs along the beam axis (vertical in portrait); look from the port side (−ŷ).
+    # (These are FIXED views; if a banking manoeuvre is ever modelled they should follow the attitude.)
+    def _plane_view(u_ax, v_ax, w_ax, n=200):
+        """z-buffer incidence of the airframe for a fixed view: `u_ax`→radial (metres), `v_ax`→along
+        (beam), `w_ax`=look. Returns (incid[row=v, col=u], radial_half_m, along_half_m), the grid fit
+        to the front-facing projection (centred)."""
+        u_ax, v_ax, w_ax = (np.asarray(a, float) for a in (u_ax, v_ax, w_ax))
+        face_inc = silA_n @ w_ax
+        front = face_inc > 1e-6
+        fv = np.unique(silA_f[front])
+        U, V = silA_v @ u_ax, silA_v @ v_ax
+        u_mid, v_mid = 0.5 * (U[fv].min() + U[fv].max()), 0.5 * (V[fv].min() + V[fv].max())
+        u_half = 0.5 * (U[fv].max() - U[fv].min()) * 1.04
+        v_half = 0.5 * (V[fv].max() - V[fv].min()) * 1.04
+        u_lin = np.linspace(u_mid - u_half, u_mid + u_half, n)
+        v_lin = np.linspace(v_mid - v_half, v_mid + v_half, n)
+        incid = m.rasterize_view_zbuffer(u_ax, v_ax, w_ax, silA_v, silA_f, face_inc, u_lin, v_lin)
+        return incid, float(u_half), float(v_half)
+    _pt_incid, plane_top_rhalf, plane_top_ahalf = _plane_view([0, 1, 0], [1, 0, 0], [0, 0, -1])
+    _ps_incid, plane_side_rhalf, plane_side_ahalf = _plane_view([0, 0, -1], [1, 0, 0], [0, -1, 0])
+    # Bake once (incid[row=v=along, col=u=radial] → PNG oriented radial=y/along=x landscape,
+    # radial=x/along=y portrait). transpose swaps the two axes for landscape; flip_rows puts the
+    # top of the image at the high end of the vertical axis.
+    plane_top_png = _field_to_png(_pt_incid, transpose=not portrait, flip_rows=True, cmap="plasma")
+    plane_side_png = _field_to_png(_ps_incid, transpose=not portrait, flip_rows=True, cmap="plasma")
 
-    def encircled_grid(f):
-        """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
-        of the beam's TOTAL radiated energy carried by all cells at least as bright — so
-        contours at 0.1…0.9 are rings enclosing that fraction of the radiated beam. The
-        diffraction field is power-normalised (∫∫ I dA = 1 over all space), so the divisor is
-        1: when the beam overspills the panel window the outer rings correctly fail to appear
-        (the beam is shown as uncontained), matching the low capture number."""
-        beam_grid = _beam_on_grid(f["field"], gx, gy)
-        flat = beam_grid.ravel()
-        order = np.argsort(flat)[::-1]
-        dcell = (gx[1] - gx[0]) * (gy[1] - gy[0])
-        csum = np.clip(np.cumsum(flat[order]) * dcell, 0.0, 1.0)   # total radiated power = 1
-        encircled = np.empty_like(flat)
-        encircled[order] = csum
-        return encircled.reshape(beam_grid.shape).astype(np.float32)
 
     def incidence_grid(f):
         """The silhouette's incidence on the fine panel-A grid, z-BUFFERED: per pixel, the incidence
@@ -613,10 +588,29 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     PHASE_L = 1.1 * ap_long                    # shared radial half-extent (m), fits the long axis
     # Dense sampling so the baked map images are smooth WITHOUT interpolation: radial is
     # interpolation-only (free), along-path is one diffraction pass each (linear cost, kept
-    # moderate — the propagation envelope varies slowly).
-    dist_norm = np.linspace(0.0, 1.0, 360)     # along-path samples (one diffraction pass each)
+    # moderate — the propagation envelope varies slowly). Along-path is EVALUATED on a grid with
+    # EXTRA DENSITY near the aperture (`dist_norm`) — the near field converges fast and the geometric
+    # near-field fill lives there — while the IMAGE is baked on a UNIFORM grid (`dist_disp`) so the
+    # along/distance axis stays physically linear (regular km ticks); the beam is resampled from the
+    # dense evaluation onto the uniform display grid. Funnel contours carry their own z, so they use
+    # the dense grid directly (no resample).
+    dist_norm = np.unique(np.concatenate([
+        np.linspace(0.0, 0.14, 150),           # extra near-aperture density (evaluation/integration)
+        np.linspace(0.0, 1.0, 300)]))          # regular coverage over the whole path
+    dist_disp = np.linspace(0.0, 1.0, 360)     # UNIFORM grid for the baked image (linear distance axis)
     radial = np.linspace(-PHASE_L, PHASE_L, 600)  # radial samples — cheap (interp only)
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
+
+    def _resample_along(field2d):
+        """Resample a (len(dist_norm), n_radial) field from the dense (near-aperture-heavy) evaluation
+        grid onto the UNIFORM display grid `dist_disp`, per radial column (both grids ascending). NaN
+        (beyond the current plane) is preserved so the mask stays intact."""
+        idx = np.clip(np.searchsorted(dist_norm, dist_disp, side="right") - 1, 0, dist_norm.size - 2)
+        x0, x1 = dist_norm[idx], dist_norm[idx + 1]
+        w = np.where(x1 > x0, (dist_disp - x0) / (x1 - x0), 0.0)[:, None]
+        lo, hi = field2d[idx], field2d[idx + 1]
+        out = lo * (1.0 - w) + hi * w
+        return np.where(np.isnan(lo) | np.isnan(hi), np.nan, out)
 
     # The along-path axis spans max_total, so the sample SPACING (Δz = max_total/(N−1)) is CONSTANT
     # across frames and the sample count effectively grows with slant (near/overhead frames fill only
@@ -704,7 +698,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     # ---- offline renderers: heatmaps → honest no-AA PNG backgrounds; contours → vector lines --
     def map_png(f, cut):                                   # beam intensity → background image
-        return _field_to_png(channel(f, cut), transpose=not portrait, flip_rows=portrait)
+        # Resample the dense (near-aperture-heavy) evaluation onto the uniform display grid so the
+        # baked image has a physically-linear distance axis.
+        return _field_to_png(_resample_along(channel(f, cut)), transpose=not portrait, flip_rows=portrait)
     def map_contour(f, cut):                               # encircled-energy funnel (per-plane inversion)
         # Enclosed field is now integrated on a common grid (see _channel_field) so it's smooth
         # along the path — no dejitter needed; the surviving waviness is real Fresnel structure.
@@ -719,7 +715,31 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     def incid_png(f):                                      # silhouette incidence → background image
         return _field_to_png(incidence_grid(f), transpose=False, flip_rows=True)
     def incid_contour(f, levels):
-        return _contour_xy(encircled_grid(f), gx, gy, levels)
+        """Encircled-energy contours for panel A, computed on the beam's NATIVE diffraction grid
+        (which contains the whole beam and decays smoothly to ~0 at its edges) and then transformed
+        into the display (u, v) frame — NOT on the clipped panel window. Truncating a spread beam at
+        the panel edge is what produced the spurious hooks/loops; the native grid has no such edge.
+        Physically accurate: iso-levels of the cumulative-energy field, each enclosing that fraction
+        of the beam's TOTAL radiated energy (∫∫ I dA = 1)."""
+        fld = f["field"]
+        I = np.asarray(fld.get("intensity", np.empty(0)), float)     # I[ix, iy], power-normalised
+        coords = np.vstack([fld["u"], fld["v"]]) if fld["u"].size else np.empty((2, 0))
+        if I.size < 9 or coords.shape[1] < 3:
+            return np.array([]), np.array([])
+        xa, ya = np.asarray(fld["x_axis"], float), np.asarray(fld["y_axis"], float)
+        flat = I.ravel(); order = np.argsort(flat)[::-1]
+        enc = np.empty_like(flat)
+        enc[order] = np.clip(np.cumsum(flat[order]) * (xa[1] - xa[0]) * (ya[1] - ya[0]), 0.0, 1.0)
+        enc = enc.reshape(I.shape)
+        _, evecs = np.linalg.eigh(np.cov(coords))         # cols [minor, major] = [x_axis, y_axis] dirs
+        gen = contourpy.contour_generator(xa, ya, enc.T)  # z[row=ya, col=xa]; segs in (x_axis, y_axis)
+        uo, vo = [], []
+        for level in levels:
+            for seg in gen.lines(float(level)):
+                uv = evecs @ np.vstack([seg[:, 0], seg[:, 1]])   # (x_axis, y_axis) → display (u, v)
+                uo.extend(uv[0]); uo.append(np.nan)
+                vo.extend(uv[1]); vo.append(np.nan)
+        return np.asarray(uo), np.asarray(vo)
 
     # ---- Panel A: incidence image (added to layout.images below) + encircled contours (vector) --
     # Mint-green reads cleanly over Plasma (which has no green). The heatmap itself is a baked
@@ -861,33 +881,20 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     add_emitter(F_rc, ap_short, ap_long, lo_F)
     add_emitter(F2_rc, ap_long, ap_short, lo_F2)
 
-    # To-scale airframe at the plane line: an orthographic TOP outline in F, SIDE outline in F₂, both
-    # isotropically pre-distorted (radial 1:1 metres, along stretched via _iso_norm_per_m) so the
-    # shape reads in true proportion despite the along axis being ~150 km. Its midpoint is set BACK
-    # from the plane slice line (unlike the emitter, which sits ON its aperture line) so the outline
-    # never collides with the line. Only the along position tracks the plane per frame; the shape and
-    # radial size are fixed (the true planform/profile, not the foreshortened per-frame silhouette).
+    # To-scale airframe at the plane line: the baked TOP/SIDE z-buffer silhouettes (above) are placed
+    # as background IMAGES, isotropically pre-distorted (radial 1:1 metres, along stretched via
+    # _iso_norm_per_m) so the shape reads in true proportion despite the along axis being ~150 km. The
+    # image is set BEHIND the plane slice line (on the far side, along > plane) with a gap, so it never
+    # collides with the line; only the along position tracks the plane per frame (fixed shape/size).
     npm_F, npm_F2 = _iso_norm_per_m(axF, alo_F), _iso_norm_per_m(axF2, alo_F2)
 
-    def _plane_xy(outline, d_npm, yy):
-        rad = outline[:, 0]                               # radial metres, 1:1 with the radial axis
-        al_m = outline[:, 1] * d_npm                      # along metres → normalised units (isotropic)
-        half = float(np.abs(al_m).max())
-        gap = max(0.01, 0.35 * half)                      # clear gap between the outline and the line
-        sign = 1.0 if (1.0 - yy) >= yy else -1.0          # offset toward the roomier side of the line
-        al = yy + sign * (half + gap) + al_m
-        return (rad, al) if portrait else (al, rad)
-
-    def add_plane_outline(rc, outline, d_npm):
-        px, py = _plane_xy(outline, d_npm, yy0)
-        idx = len(fig.data)
-        fig.add_trace(go.Scatter(x=px, y=py, mode="lines", fill="toself",
-                                 fillcolor="rgba(255,255,255,0.18)",
-                                 line=dict(color="white", width=_MAP_EDGE_W),
-                                 showlegend=False, hoverinfo="skip"), row=rc[0], col=rc[1])
-        return idx
-    i_planeF = add_plane_outline(F_rc, plane_top, npm_F)
-    i_planeF2 = add_plane_outline(F2_rc, plane_side, npm_F2)
+    def _plane_rect(rhalf_m, ahalf_m, d_npm, yy):
+        ahalf = ahalf_m * d_npm                           # along half-extent (isotropic, norm units)
+        gap = max(0.008, 0.35 * ahalf)
+        mid = min(yy + ahalf + gap, 1.0 - ahalf)          # behind the line, kept inside the far edge
+        if portrait:
+            return (-rhalf_m, mid - ahalf, 2.0 * rhalf_m, 2.0 * ahalf)   # x=radial, y=along
+        return (mid - ahalf, -rhalf_m, 2.0 * ahalf, 2.0 * rhalf_m)       # x=along, y=radial
 
     # ---- background images (baked heatmaps), each positioned in its subplot's own data coords --
     def _map_rect():                                      # beam map over along ∈ [0,1], radial ±PHASE_L
@@ -901,12 +908,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         return dict(source=src, xref=ax[0], yref=ax[1], x=rect[0], y=rect[1], sizex=rect[2],
                     sizey=rect[3], xanchor="left", yanchor="bottom", sizing="stretch", layer="below")
 
-    def frame_images(f):                                  # the 5 baked backgrounds for one frame
+    def frame_images(f):                                  # baked backgrounds for one frame
+        yy = f["chan_total"] / max_total
         return [_image(incid_png(f), axA, A_rect),
                 _image(map_png(f, "y"), axF, _map_rect()),
                 _image(map_png(f, "x"), axF2, _map_rect()),
                 _image(phase_png(f, ap_short, ap_long), axF, _em_rect(ap_short, lo_F)),
-                _image(phase_png(f, ap_long, ap_short), axF2, _em_rect(ap_long, lo_F2))]
+                _image(phase_png(f, ap_long, ap_short), axF2, _em_rect(ap_long, lo_F2)),
+                _image(plane_top_png, axF, _plane_rect(plane_top_rhalf, plane_top_ahalf, npm_F, yy)),
+                _image(plane_side_png, axF2, _plane_rect(plane_side_rhalf, plane_side_ahalf, npm_F2, yy))]
 
     fig.update_layout(images=frame_images(frames_phys[0]))
 
@@ -914,7 +924,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
     ANIMATED = [i_contA, i_contA_dot, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
-                F["cont"], F["plane"], F2["cont"], F2["plane"], i_planeF, i_planeF2]
+                F["cont"], F["plane"], F2["cont"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
@@ -922,8 +932,6 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         cAx, cAy = incid_contour(f, _SIL_SOLID)
         dAx, dAy = incid_contour(f, _SIL_DOTTED)
         fcx, fcy = map_contour(f, "y"); f2cx, f2cy = map_contour(f, "x")
-        potx, poty = _plane_xy(plane_top, npm_F, yy)      # to-scale top outline at the plane
-        posx, posy = _plane_xy(plane_side, npm_F2, yy)    # to-scale side outline at the plane
         if portrait:
             fpl = go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy])
             f2pl = go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy])
@@ -940,8 +948,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   go.Scatter(x=[cur], y=[cum_mk[k]]),
                   go.Scatter(x=[cur], y=[win_gj_mk[k]]),
                   go.Scatter(x=fcx, y=fcy), fpl,
-                  go.Scatter(x=f2cx, y=f2cy), f2pl,
-                  go.Scatter(x=potx, y=poty), go.Scatter(x=posx, y=posy)],
+                  go.Scatter(x=f2cx, y=f2cy), f2pl],
             layout=go.Layout(images=frame_images(f))))
     fig.frames = frames
 

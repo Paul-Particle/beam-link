@@ -41,7 +41,7 @@ import geo
 import diffraction
 import bwb_model
 from bwb_model import (BWBSilhouette, beta_alpha_from_enu, direction_from_beta_alpha,
-                       get_surface_samples, rasterize_silhouette)
+                       get_mesh, rasterize_silhouette_zbuffer)
 
 
 # --- Weather scenarios --------------------------------------------------------
@@ -500,18 +500,18 @@ class LinkConfig:
 _RASTER_CACHE = {}
 
 
-def _cached_raster(beta_deg, alpha_deg, n_grid=150):
+def _cached_raster(beta_deg, alpha_deg, n_grid=200):
     key = (round(float(beta_deg), 1), round(float(alpha_deg), 1), n_grid)
     raster = _RASTER_CACHE.get(key)
     if raster is None:
         look = direction_from_beta_alpha(key[0], key[1])
-        samples, sample_normals, sample_weights = get_surface_samples()
-        raster = rasterize_silhouette(look, samples, sample_normals, sample_weights, n_grid=n_grid)
+        verts, faces, normals = get_mesh()
+        raster = rasterize_silhouette_zbuffer(look, verts, faces, normals, n_grid=n_grid)
         _RASTER_CACHE[key] = raster
     return raster
 
 
-def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=150):
+def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=200):
     """Shared receive-side geometry: rasterize the (self-occluded) silhouette toward the
     emitter, size the emitter to τ_target on the equal-area disk if not fixed, and collect
     the look geometry. Returns (raster, slant, wavelength, emitter_diam_m, shared_fields)."""
@@ -537,7 +537,7 @@ def _capture_dict(shared, geom, eff, peak, taper_p, focus_range_m):
 
 
 def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
-                  focus_range_m=None, raster_n_grid=150, return_field=False):
+                  focus_range_m=None, raster_n_grid=200, return_field=False):
     """The real receive-side geometry the plane presents to an emitter at `emitter_pos`:
     rasterize the (self-occluded) silhouette and overlap the emitter's scalar-diffraction
     field with it. Returns a dict with the silhouette area, incidence-weighted capture
