@@ -31,6 +31,7 @@ import matplotlib.image as mpimg
 import contourpy
 
 from scipy.ndimage import uniform_filter1d
+from scipy.spatial import ConvexHull
 
 import beam_link as bl
 import diffraction as dfr
@@ -254,15 +255,36 @@ def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
                 local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"], leg["lam"], r_wide,
                 taper_p=leg["taper_p"], n_grid=CHANNEL_NGRID, normalize=False, dtype=np.complex64)
             idx = np.where(sel)[0]
-            for inten_w, i_out, e_out in ((lix, ix, ex), (liy, iy, ey)):
-                allnan = ~np.isfinite(inten_w).any(axis=1)   # near-field planes stay NaN (the gap)
+            taper_p = float(leg["taper_p"])
+            for inten_w, i_out, e_out, ap_cut in ((lix, ix, ex, leg["ap_major"]),
+                                                  (liy, iy, ey, leg["ap_minor"])):
                 Iw = np.abs(np.nan_to_num(np.asarray(inten_w, dtype=np.float64), nan=0.0))
+                filled = np.isfinite(inten_w).any(axis=1)    # planes with a resolved diffraction cut
+                # NEAR-FIELD FILL: planes too close to the aperture come back all-NaN (diffraction's
+                # transform grid would clip the aperture). Synthesize them as the aperture's OWN
+                # illumination — a taper² top-hat of the aperture half-width `ap_cut` in this cut —
+                # crossfaded (∝ z) into the first RESOLVED plane so there is no seam. Honest: at z→0
+                # the field IS the aperture, and the fill only spans the sub-Fresnel near zone that
+                # diffraction can't sample. Closes the black gap between the array face and the beam.
+                if filled.any() and (~filled).any():
+                    fv = int(np.argmax(filled))              # first resolved plane (planes sort by z)
+                    z_h = max(float(local_z[fv]), 1e-9)
+                    rho = np.abs(r_wide) / max(float(ap_cut), 1e-9)
+                    ap_shape = np.where(rho < 1.0, np.clip(1.0 - rho ** 2, 0.0, None) ** (2.0 * taper_p), 0.0)
+                    ssa = ap_shape.sum()
+                    ap_prof = ap_shape * (Iw[fv].sum() / ssa) if ssa > 0 else Iw[fv].copy()
+                    near = np.nonzero(~filled)[0]
+                    near = near[local_z[near] < z_h]         # only the near-aperture side of the gap
+                    for a in near:
+                        w = float(np.clip(local_z[a] / z_h, 0.0, 1.0))
+                        Iw[a] = (1.0 - w) * ap_prof + w * Iw[fv]
+                    filled[near] = True
                 c = np.cumsum(Iw[:, o] * dw, axis=1)         # enclosed from the axis outward
                 tot = c[:, -1:]
                 Ew = np.divide(c, tot, out=np.full_like(c, np.nan), where=tot > 0)
                 Ew_r = np.empty_like(Ew); Ew_r[:, o] = Ew    # undo the |r| sort → r_wide order
                 for a, zi in enumerate(idx):
-                    if allnan[a]:
+                    if not filled[a]:
                         continue
                     i_out[zi] = np.interp(radial, r_wide, Iw[a])     # display intensity (common grid)
                     e_out[zi] = np.interp(radial, r_wide, Ew_r[a])   # smooth enclosed fraction
@@ -492,6 +514,18 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # winglets and edges render at their true width). Normals are per-face (flat incidence per pixel).
     silA_v, silA_f = m.make_bwb_mesh()
     silA_n, _ = m.triangle_normals_areas(silA_v, silA_f)
+    # Orthographic TOP and SIDE outlines of the airframe (body metres), for the to-scale plane drawn
+    # at the plane line in F (top) / F₂ (side). Body frame: x̂=nose, ŷ=starboard, ẑ=belly-down, so
+    # dorsal-up = −ẑ. Each is the convex envelope of the projected vertices, centred on its own mid.
+    #   F  (top view):  radial ← span (ŷ), along-beam ← nose-tail (x̂), nose toward +along (far).
+    #   F₂ (side view): radial ← nose-tail (x̂), along-beam ← dorsal (−ẑ), so winglets point +along
+    #                   (away from the emitter — the beam arrives on the belly).
+    def _hull_loop(pts2d):
+        h = ConvexHull(pts2d)
+        loop = pts2d[np.append(h.vertices, h.vertices[0])]
+        return loop - loop.mean(axis=0)                   # (radial_m, along_m), centred
+    plane_top = _hull_loop(np.column_stack([silA_v[:, 1], silA_v[:, 0]]))
+    plane_side = _hull_loop(np.column_stack([silA_v[:, 0], -silA_v[:, 2]]))
 
     def encircled_grid(f):
         """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
@@ -784,6 +818,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     ALONG_GUT = 0.03      # data-space gutter (fraction of the map width) beyond the arc, for the axis
 
+    def _panel_px(ax):
+        """(along_px, radial_px): the panel's on-screen size in pixels along each map axis, from its
+        fixed paper domain — the basis for isotropic pre-distortion of the emitter AND the plane."""
+        xd = fig.layout[("xaxis" + ax[0][1:])].domain if ax[0] != "x" else fig.layout["xaxis"].domain
+        yd = fig.layout[("yaxis" + ax[1][1:])].domain if ax[1] != "y" else fig.layout["yaxis"].domain
+        px_w, px_h = (xd[1] - xd[0]) * inner_w, (yd[1] - yd[0]) * inner_h
+        return (px_h, px_w) if portrait else (px_w, px_h)
+
     def _iso_lo(ax, ap_cross_m):
         """Returns (lo, along_lo): the emitter region's extent `lo` in ALONG-axis (normalised
         emitter→plane) units so `ap_cross_m` metres render ISOTROPICALLY with the radial-axis metres,
@@ -792,15 +834,21 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ratio is the distortion: the cross must fill A = ap_cross·(radial_px/2PHASE_L)/along_px of the
         along axis. Over a range [along_lo, 1] = [−(lo+GUT), 1] that pins lo = A·(1+GUT)/(1−A) — the
         gutter is folded into the derivation so isotropy stays EXACT, not just approximate."""
-        xd = fig.layout[("xaxis" + ax[0][1:])].domain if ax[0] != "x" else fig.layout["xaxis"].domain
-        yd = fig.layout[("yaxis" + ax[1][1:])].domain if ax[1] != "y" else fig.layout["yaxis"].domain
-        px_w, px_h = (xd[1] - xd[0]) * inner_w, (yd[1] - yd[0]) * inner_h
-        along_px, radial_px = (px_h, px_w) if portrait else (px_w, px_h)
+        along_px, radial_px = _panel_px(ax)
         A = min(0.85, ap_cross_m * (radial_px / (2.0 * PHASE_L)) / along_px)
         lo = A * (1.0 + ALONG_GUT) / (1.0 - A)
         return lo, -(lo + ALONG_GUT)
 
     (lo_F, alo_F), (lo_F2, alo_F2) = _iso_lo(axF, ap_long), _iso_lo(axF2, ap_short)
+
+    def _iso_norm_per_m(ax, along_lo):
+        """Normalised along-axis units per METRE in the beam direction, so a body outline drawn at the
+        plane line renders ISOTROPICALLY (a metre along the beam covers the same screen px as a metre
+        on the radial axis) — the same trick as the emitter, applied to the plane. The along axis
+        spans (1 − along_lo) normalised units over along_px pixels; the radial spans 2·PHASE_L m over
+        radial_px, so along-units/m = (radial_px/2PHASE_L)·(1 − along_lo)/along_px."""
+        along_px, radial_px = _panel_px(ax)
+        return (radial_px / (2.0 * PHASE_L)) * (1.0 - along_lo) / along_px
 
     def add_emitter(rc, ap_radial_m, ap_cross_m, lo):
         """Emitter half-aperture outline, in the map subplot, pre-distorted so it reads isotropic:
@@ -812,6 +860,34 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                  showlegend=False, hoverinfo="skip"), row=rc[0], col=rc[1])
     add_emitter(F_rc, ap_short, ap_long, lo_F)
     add_emitter(F2_rc, ap_long, ap_short, lo_F2)
+
+    # To-scale airframe at the plane line: an orthographic TOP outline in F, SIDE outline in F₂, both
+    # isotropically pre-distorted (radial 1:1 metres, along stretched via _iso_norm_per_m) so the
+    # shape reads in true proportion despite the along axis being ~150 km. Its midpoint is set BACK
+    # from the plane slice line (unlike the emitter, which sits ON its aperture line) so the outline
+    # never collides with the line. Only the along position tracks the plane per frame; the shape and
+    # radial size are fixed (the true planform/profile, not the foreshortened per-frame silhouette).
+    npm_F, npm_F2 = _iso_norm_per_m(axF, alo_F), _iso_norm_per_m(axF2, alo_F2)
+
+    def _plane_xy(outline, d_npm, yy):
+        rad = outline[:, 0]                               # radial metres, 1:1 with the radial axis
+        al_m = outline[:, 1] * d_npm                      # along metres → normalised units (isotropic)
+        half = float(np.abs(al_m).max())
+        gap = max(0.01, 0.35 * half)                      # clear gap between the outline and the line
+        sign = 1.0 if (1.0 - yy) >= yy else -1.0          # offset toward the roomier side of the line
+        al = yy + sign * (half + gap) + al_m
+        return (rad, al) if portrait else (al, rad)
+
+    def add_plane_outline(rc, outline, d_npm):
+        px, py = _plane_xy(outline, d_npm, yy0)
+        idx = len(fig.data)
+        fig.add_trace(go.Scatter(x=px, y=py, mode="lines", fill="toself",
+                                 fillcolor="rgba(255,255,255,0.18)",
+                                 line=dict(color="white", width=_MAP_EDGE_W),
+                                 showlegend=False, hoverinfo="skip"), row=rc[0], col=rc[1])
+        return idx
+    i_planeF = add_plane_outline(F_rc, plane_top, npm_F)
+    i_planeF2 = add_plane_outline(F2_rc, plane_side, npm_F2)
 
     # ---- background images (baked heatmaps), each positioned in its subplot's own data coords --
     def _map_rect():                                      # beam map over along ∈ [0,1], radial ±PHASE_L
@@ -838,7 +914,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
     ANIMATED = [i_contA, i_contA_dot, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
-                F["cont"], F["plane"], F2["cont"], F2["plane"]]
+                F["cont"], F["plane"], F2["cont"], F2["plane"], i_planeF, i_planeF2]
     frames = []
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
@@ -846,6 +922,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         cAx, cAy = incid_contour(f, _SIL_SOLID)
         dAx, dAy = incid_contour(f, _SIL_DOTTED)
         fcx, fcy = map_contour(f, "y"); f2cx, f2cy = map_contour(f, "x")
+        potx, poty = _plane_xy(plane_top, npm_F, yy)      # to-scale top outline at the plane
+        posx, posy = _plane_xy(plane_side, npm_F2, yy)    # to-scale side outline at the plane
         if portrait:
             fpl = go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy])
             f2pl = go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy])
@@ -862,7 +940,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   go.Scatter(x=[cur], y=[cum_mk[k]]),
                   go.Scatter(x=[cur], y=[win_gj_mk[k]]),
                   go.Scatter(x=fcx, y=fcy), fpl,
-                  go.Scatter(x=f2cx, y=f2cy), f2pl],
+                  go.Scatter(x=f2cx, y=f2cy), f2pl,
+                  go.Scatter(x=potx, y=poty), go.Scatter(x=posx, y=posy)],
             layout=go.Layout(images=frame_images(f))))
     fig.frames = frames
 
@@ -890,23 +969,30 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                      row=D_rc[0], col=D_rc[1])
     fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
                      secondary_y=True, row=D_rc[0], col=D_rc[1])
-    # Beam maps (with the emitter merged in): the ALONG axis runs the emitter aperture region
-    # (along ∈ [−lo, 0]) then the map (0 → 1); ticks only at 0/0.5/1 (the negative region is the
-    # emitter, not distance). The RADIAL axis (±PHASE_L) carries the metre ticks + title, sitting at
-    # the plot's far edge — to the LEFT of the ellipses (landscape) / BELOW them (portrait). The two
-    # axes are NOT scale-anchored (different units); the emitter's isotropy is baked into `lo`.
+    # Beam maps (with the emitter merged in): the ALONG axis carries DISTANCE FROM THE EMITTER in km
+    # (0 at the array face → max_total at the far horizon; the plane slice slides along it per frame).
+    # Ticks are placed only in the physical map region (along ≥ 0) at regular km intervals — the
+    # negative region is the emitter aperture (the isotropically-compressed near-array zone), NOT
+    # distance, so it gets no distance ticks. The RADIAL axis (±PHASE_L) carries the metre ticks +
+    # title at the plot's far edge (LEFT of the ellipses landscape / BELOW portrait). The two axes are
+    # NOT scale-anchored (different units); emitter + plane isotropy is baked into `lo` / _iso_norm_per_m.
+    max_km = max_total / 1e3
+    dk = next(d for d in (10, 20, 25, 50, 100, 150, 200, 250) if max_km / d <= 7)
+    km_ticks = np.arange(0.0, max_km + 1e-9, dk)
+    km_tickvals = (km_ticks * 1e3 / max_total).tolist()          # normalised positions in [0, 1]
+    km_ticktext = [f"{v:.0f}" for v in km_ticks]
     for rc, along_lo in ((F_rc, alo_F), (F2_rc, alo_F2)):
         along_rng = [along_lo, 1.0]
+        along_kw = dict(title_text="distance from emitter (km)", range=along_rng,
+                        tickvals=km_tickvals, ticktext=km_ticktext, showgrid=False, zeroline=False)
+        radial_kw = dict(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
+                         showgrid=False, zeroline=False)
         if portrait:
-            fig.update_yaxes(title_text="emitter → plane", range=along_rng, tickvals=[0, 0.5, 1.0],
-                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
-            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
-                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
+            fig.update_yaxes(**along_kw, row=rc[0], col=rc[1])
+            fig.update_xaxes(**radial_kw, row=rc[0], col=rc[1])
         else:
-            fig.update_xaxes(title_text="emitter → plane (norm.)", range=along_rng,
-                             tickvals=[0, 0.5, 1.0], showgrid=False, zeroline=False, row=rc[0], col=rc[1])
-            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
-                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
+            fig.update_xaxes(**along_kw, row=rc[0], col=rc[1])
+            fig.update_yaxes(**radial_kw, row=rc[0], col=rc[1])
     fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=A_rc[0], col=A_rc[1],
                        xanchor="left", yanchor="bottom",
                        text="green = enclosed beam-energy fraction",
