@@ -548,14 +548,38 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             _proj_cache[key] = (png, float(r_half), float(a_half))
         return _proj_cache[key]
 
+    _incidA_cache = {}
+
     def incidence_grid(f):
-        """The silhouette's incidence on the fine panel-A grid, z-BUFFERED: per pixel, the incidence
-        cosine (n̂·ŵ) of the nearest visible triangle, NaN where uncovered. A deterministic,
-        resolution-independent, self-occluded outline — raising grid_nA genuinely sharpens (winglets
-        and edges at true width), unlike the old Monte-Carlo point-binning + box-smoothing which
-        blurred small features. An SVG heatmap so the contour overlays it (WebGL would hide it)."""
-        return m.rasterize_view_zbuffer(f["view_u"], f["view_v"], f["view_w"],
-                                        silA_v, silA_f, silA_n @ f["view_w"], gxA, gyA)
+        """The silhouette's incidence on the fine panel-A grid (gxA×gyA), z-BUFFERED: per pixel, the
+        incidence cosine (n̂·ŵ) of the nearest visible triangle, NaN where uncovered. Deterministic,
+        resolution-independent, self-occluded outline. Cached per frame (the image AND the panel-A
+        capture integral read it)."""
+        key = id(f)
+        if key not in _incidA_cache:
+            _incidA_cache[key] = m.rasterize_view_zbuffer(f["view_u"], f["view_v"], f["view_w"],
+                                                          silA_v, silA_f, silA_n @ f["view_w"], gxA, gyA)
+        return _incidA_cache[key]
+
+    def _panelA_capture(f):
+        """Capture integrated on the DISPLAYED panel-A grid — the integration step IS the image pixel,
+        and the beam intensity is evaluated DIRECTLY at each covered pixel (the plane's area) by the
+        zoom-DFT (`focal_intensity_at`), not sampled from a coarser grid. So the silhouette image the
+        eye sees is exactly the surface the capture integrates over. Returns (geom, eff)."""
+        incid = incidence_grid(f)
+        covered = np.isfinite(incid)
+        if not covered.any() or f["field"]["u"].size < 3:
+            return 0.0, 0.0
+        UU, VV = np.meshgrid(gxA, gyA)                     # UU[row=v, col=u] = gxA[col]; VV = gyA[row]
+        u_c, v_c, inc_c = UU[covered], VV[covered], incid[covered].astype(float)
+        _, evecs = np.linalg.eigh(np.cov(np.vstack([f["field"]["u"], f["field"]["v"]])))
+        pc = evecs.T @ np.vstack([u_c, v_c])              # → (minor, major) aperture-frame coords
+        leg = f["chan_legs"][-1]
+        beam = dfr.focal_intensity_at(f["slant_m"], leg["focus_m"], leg["ap_major"], leg["ap_minor"],
+                                      leg["lam"], pc[0], pc[1], taper_p=leg["taper_p"], n_ap=384)
+        dA = (gxA[1] - gxA[0]) * (gyA[1] - gyA[0])
+        inc_eff = 0.90 + 0.10 * inc_c
+        return min(float(beam.sum() * dA), 1.0), min(float((beam * inc_eff).sum() * dA), 1.0)
 
     half = float(xs.max())
 
@@ -598,7 +622,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     cum_mk = np.interp(xs, xs_curve, cum_gj)
     win_eta_mk = np.interp(xs, xs_curve, windowed_eta)
     win_gj_mk = np.interp(xs, xs_curve, windowed_gj)
-    cap_pct_frame = np.array([f["geom"] for f in frames_phys]) * 100    # panel-A "% captured" text
+    # Panel-A "% captured": integrated on the DISPLAYED silhouette grid (image = integration surface),
+    # beam evaluated directly at each covered pixel. Matches the engine number (f["geom"]) to ~1%
+    # (that integrates on the coarser capture raster); showing the on-screen-grid value keeps the
+    # picture honest about what it sums.
+    cap_pct_frame = np.array([_panelA_capture(f)[0] for f in frames_phys]) * 100
     # Panels F/F₂ (beam channel): the along-path axis is normalised to the LONGEST path over the
     # pass, so the plane's position along it encodes actual slant (far = near the far end, close
     # = near the emitter) — that distance cue is what keeps F/F₂ from being redundant with A.
