@@ -586,29 +586,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # shrink the emitter and all near-field detail to a blob. A beam wider than this window
     # simply fills the panel with no contours — the correct read for a badly overspilling beam.
     max_total = max(f["chan_total"] for f in frames_phys)
-    # ONE shared RADIAL scale for both channel cuts AND their emitter plots: fit the LARGEST
+    # ONE shared RADIAL scale for both channel cuts AND their emitter overlays: fit the LARGEST
     # emitter dimension (the long aperture semi-axis) over all frames, + a small margin. So the
     # emitter aperture and the white aperture-line on each beam map read at exactly the same scale
-    # and line up (alignment). The CROSS axis of each emitter plot is sized per-panel to CONTAIN
-    # its aperture (see _cross_window): when the cross axis is the LONG one (F) we show one HALF of
-    # the aperture — centre → edge — rather than cropping it to a sliver; when it is the short one
-    # (F₂) we show the full width. The aperture is symmetric, so half loses no information while
-    # keeping the box far less extreme in aspect. In portrait this makes F's emitter (half of the
-    # long axis) a lot taller than F₂'s (the short axis).
+    # and line up. BOTH panels draw a HALF aperture cut along the RADIAL axis (cut at cross = 0, on
+    # the map side; arc bulging to negative cross), pre-distorted to render isotropically (_iso_lo).
     _ap = [(f["chan_legs"][-1]["ap_major"], f["chan_legs"][-1]["ap_minor"]) for f in frames_phys]
     ap_short = min(min(a) for a in _ap)
     ap_long = max(max(a) for a in _ap)
     PHASE_L = 1.1 * ap_long                    # shared radial half-extent (m), fits the long axis
-    EMIT_MARGIN = 0.06                         # padding around the shown (half-)aperture
-
-    def _cross_window(ap_radial_m, ap_cross_m):
-        """(lo, hi) range for an emitter panel's CROSS axis, at true (isotropic) scale. BOTH panels
-        show a HALF aperture cut along the RADIAL axis: the cut sits at cross = 0 (the map-adjacent
-        edge, so it lines up with and touches the map's white aperture-line) and the arc bulges to
-        NEGATIVE cross (away from the map). The aperture is symmetric, so a half is lossless; the pad
-        is applied only on the arc (outer) side so the cut stays flush with the panel edge."""
-        pad = EMIT_MARGIN * ap_cross_m
-        return -ap_cross_m - pad, 0.0
     # Dense sampling so the baked map images are smooth WITHOUT interpolation: radial is
     # interpolation-only (free), along-path is one diffraction pass each (linear cost, kept
     # moderate — the propagation envelope varies slowly).
@@ -642,19 +628,17 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         ix, ex, iy, ey = _channel_all(f)
         return ey if axis == "y" else ex
 
-    # Emitter phase, placed beside each beam map (panels F/F₂), sharing that map's radial axis
-    # (±PHASE_L) — so the aperture and the map's white aperture-line read at the same scale and line
-    # up (alignment). radial = the shared axis, cross = the other axis, sized per-panel by
-    # _cross_window to CONTAIN the (half-)aperture. The two plots show the SAME elliptical aperture
-    # rotated 90°: F's radial axis is Fourier-conjugate to the SHORT aperture axis (short
-    # along-radial; the long axis runs along cross → we show half of it), F₂'s to the LONG axis
-    # (fills the radial; the short axis along cross, shown full). CYCLIC `twilight` colormap (a
-    # phase wraps 0↔2π, so a sequential map would put a false bright→dark cliff at the seam). Rings
-    # are the symmetric focusing zone plate φ = wrap(−(2π/λ)(√(f²+ρ²) − f)), tightening as focus nears.
-    phase_r = np.linspace(-PHASE_L, PHASE_L, 400)      # radial (the shared scale) — dense, smooth
-
+    # Emitter phase, drawn INTO each beam map's plot (in the along < 0 region), sharing the map's
+    # radial axis so the aperture's straight cut lands on the map's white aperture-line. The image is
+    # rendered over its OWN cross×radial metre grid (cross ∈ [−ap_cross, 0], radial ∈ ±ap_radial), then
+    # placed into the isotropically pre-distorted rect (see _iso_lo). The two panels show the SAME
+    # elliptical aperture rotated 90°: F's radial axis is Fourier-conjugate to the SHORT aperture axis
+    # (long axis along cross), F₂'s to the LONG axis (short axis along cross). CYCLIC `twilight`
+    # colormap (phase wraps 0↔2π, so a sequential map puts a false bright→dark cliff at the seam).
+    # Rings are the symmetric zone plate φ = wrap(−(2π/λ)(√(f²+ρ²) − f)), tightening as focus nears.
     def emitter_phase(f, ap_radial_m, ap_cross_m, cross_lin):   # zone plate over the aperture (m grid)
-        cross, rad = np.meshgrid(cross_lin, phase_r)   # cross = x, rad = y
+        rad_lin = np.linspace(-ap_radial_m, ap_radial_m, 400)
+        cross, rad = np.meshgrid(cross_lin, rad_lin)   # cross = x, rad = y
         inside = (rad / ap_radial_m) ** 2 + (cross / ap_cross_m) ** 2 <= 1.0
         lam = float(f["chan_legs"][-1]["lam"]); foc = float(f["chan_legs"][-1]["focus_m"])
         phi = -(2.0 * np.pi / lam) * (np.sqrt(foc ** 2 + cross ** 2 + rad ** 2) - foc)
@@ -675,43 +659,33 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     #               its emitter phase in a narrow column to its LEFT.
     #   portrait  — a single column; each map reads bottom→top (y = emitter→plane) with its
     #               emitter phase directly BELOW (the 90°-rotated view; fits a phone).
+    # Layout: four stacked panels (A, D, F, F₂). The emitter phase is drawn INTO each beam map's own
+    # plot, in the region just before the emitter end (along < 0), rather than as a separate subplot —
+    # so the aperture's straight cut lands exactly on the map's white aperture-line (touch + align) and
+    # the shared radial axis needs no reconciliation. Because that plot's two axes carry DIFFERENT
+    # units (along = normalised emitter→plane distance, radial = metres), the aperture's cross extent
+    # is pre-distorted (see _iso_lo) so the half-ellipse still renders ISOTROPICALLY on screen.
     beam_dir = "↑" if portrait else "→"
     if portrait:
+        FIG_W, FIG_H, MARG = 402, 1750, dict(t=150, l=54, r=10, b=40)
         f_title = "F · beam channel · top view · wide cut"
         f2_title = "F₂ · beam channel · side view · narrow cut"
-        # Size the two emitter rows to their isotropic box aspect (cross-span / radial-span), so F's
-        # half-of-the-long-axis panel comes out a lot taller than F₂'s short-axis strip and neither
-        # wastes space. Expressed relative to a ~250 px map row at this 402 px phone width.
-        _col_w_px = 402 - 44 - 10
-        _emit_row = lambda ar, ac: max(0.05, 0.185 * ((_cross_window(ar, ac)[1] - _cross_window(ar, ac)[0])
-                                                      / (2.0 * PHASE_L) * _col_w_px) / 250.0)
-        _rF, _rF2 = _emit_row(ap_short, ap_long), _emit_row(ap_long, ap_short)
-        fig = make_subplots(
-            rows=6, cols=1, vertical_spacing=0.062,               # room so 'radial (m)' clears the ellipse
-            row_heights=[0.17, 0.22, 0.185, _rF, 0.185, _rF2],   # D (line graph) 2× taller
-            specs=[[{"type": "xy"}], [{"secondary_y": True}], [{"type": "xy"}],
-                   [{"type": "xy"}], [{"type": "xy"}], [{"type": "xy"}]],
-            subplot_titles=("A · beam spot over silhouette", "D · capture, η & energy",
-                            f_title, "emitter phase", f2_title, "emitter phase"))
-        for ann in fig.layout.annotations:                # shrink subplot titles for phone width
-            ann.font.size = 12
-        A_rc, D_rc = (1, 1), (2, 1)
-        F_map, F_emit, F2_map, F2_emit = (3, 1), (4, 1), (5, 1), (6, 1)
+        row_heights, vspace = [0.18, 0.24, 0.29, 0.29], 0.05
     else:
-        f_title = f"F · beam channel, top view — major-axis (wide) cut  beam {beam_dir}"
-        f2_title = f"F₂ · beam channel, side view — minor-axis (narrow) cut  beam {beam_dir}"
-        fig = make_subplots(
-            rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.06,
-            row_heights=[0.24, 0.24, 0.32, 0.32], column_widths=[0.17, 0.83],   # D 2× taller; wider emitter gap
-            specs=[[{"type": "xy", "colspan": 2}, None],
-                   [{"secondary_y": True, "colspan": 2}, None],
-                   [{"type": "xy"}, {"type": "xy"}],
-                   [{"type": "xy"}, {"type": "xy"}]],
-            subplot_titles=("A · beam spot over silhouette (fill = incidence)",
-                            "D · capture, η & cumulative energy along the pass",
-                            "emitter phase", f_title, "emitter phase", f2_title))
-        A_rc, D_rc = (1, 1), (2, 1)
-        F_emit, F_map, F2_emit, F2_map = (3, 1), (3, 2), (4, 1), (4, 2)
+        FIG_W, FIG_H, MARG = 1150, 1550, dict(t=140, l=66, r=25, b=55)
+        f_title = f"F · beam channel, top view — major-axis (wide) cut, emitter phase at left  beam {beam_dir}"
+        f2_title = f"F₂ · beam channel, side view — minor-axis (narrow) cut, emitter phase at left  beam {beam_dir}"
+        row_heights, vspace = [0.22, 0.24, 0.27, 0.27], 0.075
+    fig = make_subplots(
+        rows=4, cols=1, vertical_spacing=vspace, row_heights=row_heights,
+        specs=[[{"type": "xy"}], [{"secondary_y": True}], [{"type": "xy"}], [{"type": "xy"}]],
+        subplot_titles=("A · beam spot over silhouette (fill = incidence)",
+                        "D · capture, η & cumulative energy along the pass", f_title, f2_title))
+    if portrait:
+        for ann in fig.layout.annotations:
+            ann.font.size = 12
+    A_rc, D_rc, F_rc, F2_rc = (1, 1), (2, 1), (3, 1), (4, 1)
+    inner_w, inner_h = FIG_W - MARG["l"] - MARG["r"], FIG_H - MARG["t"] - MARG["b"]
 
     # ---- offline renderers: heatmaps → honest no-AA PNG backgrounds; contours → vector lines --
     def map_png(f, cut):                                   # beam intensity → background image
@@ -722,10 +696,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         r_vals, z_vals = _funnel_contour(channel_enc(f, cut), dist_norm, radial, _BEAM_LEVELS)  # r_L(z)=E⁻¹
         return (r_vals, z_vals) if portrait else (z_vals, r_vals)     # portrait x=radial; landscape x=dist
     def phase_png(f, ar, ac):                              # emitter zone-plate → background image
-        lo, hi = _cross_window(ar, ac)
-        cross_lin = np.linspace(lo, hi, 220)
+        cross_lin = np.linspace(-ac, 0.0, 220)             # cross ∈ [−ap_cross, 0] (cut at 0, map side)
+        # portrait: transpose so cross→y, and flip so the cut (cross=0) is the TOP row (abuts the map
+        # above). landscape: cross→x already; radial is symmetric so row order is irrelevant.
         return _field_to_png((emitter_phase(f, ar, ac, cross_lin) + np.pi) / (2.0 * np.pi),
-                             transpose=portrait, flip_rows=False, cmap="twilight")
+                             transpose=portrait, flip_rows=portrait, cmap="twilight")
     def incid_png(f):                                      # silhouette incidence → background image
         return _field_to_png(incidence_grid(f), transpose=False, flip_rows=True)
     def incid_contour(f, levels):
@@ -795,11 +770,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     yy0 = frames_phys[0]["chan_total"] / max_total
 
-    def add_channel(f0, cut, sil_key, ap_radial_m, ap_cross_m, map_rc, emit_rc):
-        """Vector overlays for one channel: encircled contour + aperture line + plane slice on the
-        map, and the aperture outline on the emitter panel. The heatmaps themselves are baked
-        images added to layout.images. Returns the trace indices for this channel."""
-        mr, mc = map_rc; er, ec = emit_rc
+    def add_channel(f0, cut, sil_key, ap_radial_m, rc):
+        """Vector overlays for one channel, all in the SAME subplot `rc`: encircled contour + the
+        white aperture-line + the plane slice (the emitter outline is added later, once the isotropic
+        cross extent is known). Heatmaps are baked images. Returns the trace indices."""
+        mr, mc = rc
         s0 = f0[sil_key]
         i_cont = len(fig.data)
         cxx, cyy = map_contour(f0, cut)
@@ -814,35 +789,56 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         i_plane = len(fig.data)
         fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="#00e5ff", width=4),
                                  showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # plane slice
-        i_out = len(fig.data)
-        oc, orad = emitter_outline(ap_radial_m, ap_cross_m)          # (cross, radial)
-        ox, oy = (orad, oc) if portrait else (oc, orad)
-        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
-                                 showlegend=False, hoverinfo="skip"), row=er, col=ec)   # aperture edge
-        return dict(cont=i_cont, plane=i_plane, out=i_out)
+        return dict(cont=i_cont, plane=i_plane)
 
-    # F: major-axis (wide) cut — SHORT aperture axis along the radial (a sliver). F₂: minor-axis
-    # (narrow) cut — LONG axis along the radial (fills it; the 90°-rotated view of F's aperture).
-    F = add_channel(frames_phys[0], "y", "sil_major_m", ap_short, ap_long, F_map, F_emit)
-    F2 = add_channel(frames_phys[0], "x", "sil_minor_m", ap_long, ap_short, F2_map, F2_emit)
+    # F: major-axis (wide) cut — SHORT aperture axis along the radial. F₂: minor-axis (narrow) cut —
+    # LONG axis along the radial (the 90°-rotated view of F's aperture). ap_cross is the OTHER axis.
+    F = add_channel(frames_phys[0], "y", "sil_major_m", ap_short, F_rc)
+    F2 = add_channel(frames_phys[0], "x", "sil_minor_m", ap_long, F2_rc)
 
-    # ---- background images (baked heatmaps), each positioned in its subplot's own data coords --
     def _ax(idx):
         d = fig.data[idx]
         return (d.xaxis or "x"), (d.yaxis or "y")
-    axA, axFm, axF2m, axFe, axF2e = (_ax(i_contA), _ax(F["cont"]), _ax(F2["cont"]),
-                                     _ax(F["out"]), _ax(F2["out"]))
-    if portrait:
-        map_rect = (-PHASE_L, 0.0, 2 * PHASE_L, 1.0)             # x=radial, y=emitter→plane
-    else:
-        map_rect = (0.0, -PHASE_L, 1.0, 2 * PHASE_L)            # x=emitter→plane, y=radial
-    A_rect = (-EXT_H, -EXT_V, 2 * EXT_H, 2 * EXT_V)
+    axF, axF2, axA = _ax(F["cont"]), _ax(F2["cont"]), _ax(i_contA)
 
-    def em_rect_for(ap_radial_m, ap_cross_m):             # emitter-image rect: cross axis per-panel
-        lo, hi = _cross_window(ap_radial_m, ap_cross_m)
-        if portrait:
-            return (-PHASE_L, lo, 2 * PHASE_L, hi - lo)    # x=radial, y=cross
-        return (lo, -PHASE_L, hi - lo, 2 * PHASE_L)        # x=cross, y=radial
+    ALONG_GUT = 0.03      # data-space gutter (fraction of the map width) beyond the arc, for the axis
+
+    def _iso_lo(ax, ap_cross_m):
+        """Returns (lo, along_lo): the emitter region's extent `lo` in ALONG-axis (normalised
+        emitter→plane) units so `ap_cross_m` metres render ISOTROPICALLY with the radial-axis metres,
+        and the along-axis lower bound `along_lo` (a small gutter beyond the arc, so the radial axis
+        sits clear of the ellipse). The two axes carry different units, so the pixel-per-data-scale
+        ratio is the distortion: the cross must fill A = ap_cross·(radial_px/2PHASE_L)/along_px of the
+        along axis. Over a range [along_lo, 1] = [−(lo+GUT), 1] that pins lo = A·(1+GUT)/(1−A) — the
+        gutter is folded into the derivation so isotropy stays EXACT, not just approximate."""
+        xd = fig.layout[("xaxis" + ax[0][1:])].domain if ax[0] != "x" else fig.layout["xaxis"].domain
+        yd = fig.layout[("yaxis" + ax[1][1:])].domain if ax[1] != "y" else fig.layout["yaxis"].domain
+        px_w, px_h = (xd[1] - xd[0]) * inner_w, (yd[1] - yd[0]) * inner_h
+        along_px, radial_px = (px_h, px_w) if portrait else (px_w, px_h)
+        A = min(0.85, ap_cross_m * (radial_px / (2.0 * PHASE_L)) / along_px)
+        lo = A * (1.0 + ALONG_GUT) / (1.0 - A)
+        return lo, -(lo + ALONG_GUT)
+
+    (lo_F, alo_F), (lo_F2, alo_F2) = _iso_lo(axF, ap_long), _iso_lo(axF2, ap_short)
+
+    def add_emitter(rc, ap_radial_m, ap_cross_m, lo):
+        """Emitter half-aperture outline, in the map subplot, pre-distorted so it reads isotropic:
+        cross ∈ [−ap_cross, 0] maps to along ∈ [−lo, 0], radial is 1:1 metres."""
+        oc, orad = emitter_outline(ap_radial_m, ap_cross_m)          # (cross ∈ [−ap_cross,0], radial)
+        along = oc * (lo / ap_cross_m)
+        ox, oy = (orad, along) if portrait else (along, orad)
+        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
+                                 showlegend=False, hoverinfo="skip"), row=rc[0], col=rc[1])
+    add_emitter(F_rc, ap_short, ap_long, lo_F)
+    add_emitter(F2_rc, ap_long, ap_short, lo_F2)
+
+    # ---- background images (baked heatmaps), each positioned in its subplot's own data coords --
+    def _map_rect():                                      # beam map over along ∈ [0,1], radial ±PHASE_L
+        return (-PHASE_L, 0.0, 2 * PHASE_L, 1.0) if portrait else (0.0, -PHASE_L, 1.0, 2 * PHASE_L)
+    def _em_rect(ap_radial_m, lo):                        # phase over along ∈ [−lo,0], radial ±ap_radial
+        return ((-ap_radial_m, -lo, 2 * ap_radial_m, lo) if portrait
+                else (-lo, -ap_radial_m, lo, 2 * ap_radial_m))
+    A_rect = (-EXT_H, -EXT_V, 2 * EXT_H, 2 * EXT_V)
 
     def _image(src, ax, rect):
         return dict(source=src, xref=ax[0], yref=ax[1], x=rect[0], y=rect[1], sizex=rect[2],
@@ -850,10 +846,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     def frame_images(f):                                  # the 5 baked backgrounds for one frame
         return [_image(incid_png(f), axA, A_rect),
-                _image(map_png(f, "y"), axFm, map_rect),
-                _image(map_png(f, "x"), axF2m, map_rect),
-                _image(phase_png(f, ap_short, ap_long), axFe, em_rect_for(ap_short, ap_long)),
-                _image(phase_png(f, ap_long, ap_short), axF2e, em_rect_for(ap_long, ap_short))]
+                _image(map_png(f, "y"), axF, _map_rect()),
+                _image(map_png(f, "x"), axF2, _map_rect()),
+                _image(phase_png(f, ap_short, ap_long), axF, _em_rect(ap_short, lo_F)),
+                _image(phase_png(f, ap_long, ap_short), axF2, _em_rect(ap_long, lo_F2))]
 
     fig.update_layout(images=frame_images(frames_phys[0]))
 
@@ -913,31 +909,21 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                      row=D_rc[0], col=D_rc[1])
     fig.update_yaxes(title_text="cumulative energy (GJ)", range=[0, float(cum_gj[-1]) * 1.08 + 1e-9],
                      secondary_y=True, row=D_rc[0], col=D_rc[1])
-    # Beam maps + emitter-phase plots: the maps carry the emitter→plane axis (0 → 1) and the shared
-    # radial axis (±PHASE_L, the long aperture axis); the emitter plots share that radial axis (so
-    # the aperture lines up with the map's white aperture-line) and are 1:1 in metres (scaleanchor),
-    # the CROSS axis sized per-panel by _cross_window to contain the (half-)aperture (box shrinks via
-    # constrain="domain"). Emitter ticks/titles hidden — the radial scale is read off its map.
-    if portrait:
-        for mr, mc in (F_map, F2_map):
-            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
-            fig.update_yaxes(title_text="emitter → plane", range=[0, 1], row=mr, col=mc)
-        for i_out, (er, ec), ar, ac in ((F["out"], F_emit, ap_short, ap_long),
-                                        (F2["out"], F2_emit, ap_long, ap_short)):
-            fig.update_xaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
-            fig.update_yaxes(range=list(_cross_window(ar, ac)), showticklabels=False,
-                             scaleanchor=fig.data[i_out].xaxis, scaleratio=1, constrain="domain",
-                             row=er, col=ec)
-    else:
-        for mr, mc in (F_map, F2_map):
-            fig.update_xaxes(title_text="emitter → plane (norm.)", range=[0, 1], row=mr, col=mc)
-            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=mr, col=mc)
-        for i_out, (er, ec), ar, ac in ((F["out"], F_emit, ap_short, ap_long),
-                                        (F2["out"], F2_emit, ap_long, ap_short)):
-            fig.update_yaxes(range=[-PHASE_L, PHASE_L], showticklabels=False, row=er, col=ec)
-            fig.update_xaxes(range=list(_cross_window(ar, ac)), showticklabels=False,
-                             scaleanchor=fig.data[i_out].yaxis, scaleratio=1, constrain="domain",
-                             row=er, col=ec)
+    # Beam maps (with the emitter merged in): the ALONG axis runs the emitter aperture region
+    # (along ∈ [−lo, 0]) then the map (0 → 1); ticks only at 0/0.5/1 (the negative region is the
+    # emitter, not distance). The RADIAL axis (±PHASE_L) carries the metre ticks + title, sitting at
+    # the plot's far edge — to the LEFT of the ellipses (landscape) / BELOW them (portrait). The two
+    # axes are NOT scale-anchored (different units); the emitter's isotropy is baked into `lo`.
+    for rc, along_lo in ((F_rc, alo_F), (F2_rc, alo_F2)):
+        along_rng = [along_lo, 1.0]
+        if portrait:
+            fig.update_yaxes(title_text="emitter → plane", range=along_rng, tickvals=[0, 0.5, 1.0],
+                             row=rc[0], col=rc[1])
+            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=rc[0], col=rc[1])
+        else:
+            fig.update_xaxes(title_text="emitter → plane (norm.)", range=along_rng,
+                             tickvals=[0, 0.5, 1.0], row=rc[0], col=rc[1])
+            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=rc[0], col=rc[1])
     fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=A_rc[0], col=A_rc[1],
                        xanchor="left", yanchor="bottom",
                        text="green = enclosed beam-energy fraction",
@@ -955,8 +941,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     btn_top = 46 if portrait else 60          # clear of the (now multi-line) headline
     if portrait:
         fig.update_layout(
-            template="plotly_dark", height=1750, width=402, paper_bgcolor="black", plot_bgcolor="black",
-            margin=dict(t=150, l=44, r=10, b=40),
+            template="plotly_dark", height=FIG_H, width=FIG_W, paper_bgcolor="black", plot_bgcolor="black",
+            margin=MARG,
             title=dict(text=(f"Flyby — {arch_name}<br><sub>{aperture_m:.0f} m emitter · {weather} · "
                              f"{pass_kind} · ±{half/1e3:.0f} km · ▶ play or drag"
                              f"<br>build {stamp}</sub>"),
@@ -965,7 +951,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     else:
         # Headline wrapped to a few lines so it fits the graph width instead of one long line.
         fig.update_layout(
-            template="plotly_dark", height=1550, width=1150, margin=dict(t=140, l=60, r=30, b=55),
+            template="plotly_dark", height=FIG_H, width=FIG_W, margin=MARG,
             title=dict(text=(f"Flyby animation — {arch_name} · {aperture_m:.0f} m emitter · {weather} · {pass_kind}"
                              f"<br><sub>horizon-to-horizon ±{half/1e3:.0f} km · uniform in time · build {stamp}"
                              f"<br>▶ play or drag the slider above</sub>"),
