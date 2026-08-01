@@ -62,6 +62,12 @@ def _build_stamp():
 # badly (RMS ~17 %, peak ~40 % off a converged reference — visible as non-monotone banding);
 # 384 converges (RMS <0.2 %). n≥320 also trips scipy's multi-threaded FFT (see _fft_workers).
 CHANNEL_NGRID = 384
+# Aperture-sample cap for the near-field zoom-DFT (`diffraction.axial_cuts_direct`) that resolves the
+# beam map close to the emitter, below the single-FFT's transverse window. It sets how near the array
+# we compute real diffraction before handing off to the geometric aperture fill: n_ap ∝ 1/z, so this
+# cap ⇒ a first-resolved plane of ~a few hundred m for a compact aperture to ~1 km for the elongated
+# far-frame aperture (both « the ~200-300 km map width). Higher = closer + slower; 3072 is offline-cheap.
+N_AP_MAX_CHANNEL = 3072
 
 # Play button: a custom sequential stepper. Each frame swaps the five baked background images
 # (one `Plotly.relayout`) and restyles the handful of live vector traces (contours, plane slices,
@@ -239,18 +245,31 @@ def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
             lix, _, liy, _ = dfr.axial_cut_xy(
                 local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"], leg["lam"], r_wide,
                 taper_p=leg["taper_p"], n_grid=CHANNEL_NGRID, normalize=False, dtype=np.complex64)
+            lix, liy = np.array(lix, dtype=np.float64), np.array(liy, dtype=np.float64)
+            # NEAR FIELD (Fresnel zoom-DFT): the single-FFT above runs out of transverse window and
+            # returns NaN close to the aperture. Resolve those planes DIRECTLY from the aperture down
+            # to the Fresnel validity floor (~a few aperture diameters) — real converging near-field
+            # cone, no fabricated shape. Below the floor the geometric fill below still takes over, but
+            # over a much thinner sliver. See diffraction.axial_cuts_direct.
+            unresolved = ~np.isfinite(lix).any(axis=1)
+            if unresolved.any():
+                nfx, nfy = dfr.axial_cuts_direct(
+                    local_z[unresolved], leg["focus_m"], leg["ap_major"], leg["ap_minor"],
+                    leg["lam"], r_wide, taper_p=leg["taper_p"], n_ap_max=N_AP_MAX_CHANNEL)
+                lix[unresolved], liy[unresolved] = nfx, nfy
             idx = np.where(sel)[0]
             taper_p = float(leg["taper_p"])
             for inten_w, i_out, e_out, ap_cut in ((lix, ix, ex, leg["ap_major"]),
                                                   (liy, iy, ey, leg["ap_minor"])):
                 Iw = np.abs(np.nan_to_num(np.asarray(inten_w, dtype=np.float64), nan=0.0))
                 filled = np.isfinite(inten_w).any(axis=1)    # planes with a resolved diffraction cut
-                # NEAR-FIELD FILL: planes too close to the aperture come back all-NaN (diffraction's
-                # transform grid would clip the aperture). Synthesize them as the aperture's OWN
-                # illumination — a taper² top-hat of the aperture half-width `ap_cut` in this cut —
-                # crossfaded (∝ z) into the first RESOLVED plane so there is no seam. Honest: at z→0
-                # the field IS the aperture, and the fill only spans the sub-Fresnel near zone that
-                # diffraction can't sample. Closes the black gap between the array face and the beam.
+                # SUB-FRESNEL FILL: planes closer than the Fresnel floor (below what the zoom above can
+                # resolve) come back NaN. There the paraxial field IS ≈ the aperture illumination, so
+                # synthesize them as the aperture's OWN pattern — a taper² top-hat of half-width
+                # `ap_cut` — crossfaded (∝ z) into the first RESOLVED plane so there is no seam. This
+                # honest fill now spans only the thin sub-Fresnel sliver, not the old km-scale gap. (A
+                # rigorous field there — e.g. beside the beam in the aperture plane for an EXPOSURE
+                # estimate — needs an angular-spectrum / Rayleigh–Sommerfeld pass; see axial_cuts_direct.)
                 if filled.any() and (~filled).any():
                     fv = int(np.argmax(filled))              # first resolved plane (planes sort by z)
                     z_h = max(float(local_z[fv]), 1e-9)

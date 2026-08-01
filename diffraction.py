@@ -194,6 +194,78 @@ def focal_intensity_grid(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelen
     return inten / norm if norm > 0 else inten
 
 
+def axial_cuts_direct(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
+                      taper_p=0.0, n_ap_base=384, n_ap_max=3072, fresnel_floor_diam=2.5):
+    """Both principal AXIAL cuts (x = aperture-major axis → NARROW spot; y = minor → WIDE spot) of the
+    scalar-diffraction field, evaluated by a DIRECT zoom-DFT from the aperture — with NO ±λz/d
+    single-FFT observation window. This resolves the NEAR field close to the aperture, where
+    `axial_cut_xy`'s transform grid can no longer hold the aperture and it returns NaN.
+
+    Trick: a cut ALONG a principal axis THROUGH the origin needs only a 1-D transform. With the
+    orthogonal output coordinate pinned at 0 the transverse kernel is unity, so the on-axis field is
+    the 1-D DFT of the aperture's MARGINAL projection onto that axis. The residual focusing phase
+    exp(iπ(1/z−1/f)ρ²/λ) is separable (p(x)·p(y)), so each marginal is `p·(amp·p)` — O(n_ap²) to form
+    the aperture and marginalize, O(n_radial·n_ap) for the transform, cheap even at the large `n_ap`
+    the near field needs. Same Fresnel kernel and power normalisation (∫∫ I dA = 1) as
+    `plane_intensity` / `focal_intensity_grid`, so the cuts splice seamlessly onto `axial_cut_xy`'s
+    in the overlap region.
+
+    Sampling: near the aperture the residual phase forces a fine spacing d ∝ z, and the aperture only
+    fits the grid if n_ap ≳ 2.5·max_semi/d; n_ap is raised per plane to meet that, capped at
+    `n_ap_max`. Planes closer than `fresnel_floor_diam` aperture DIAMETERS — where the paraxial
+    Fresnel approximation itself fails and the true field is ≈ the aperture illumination — OR that
+    would need n_ap > n_ap_max are returned NaN, for the caller to fill geometrically. (The rigorous
+    field in that sub-Fresnel sliver, e.g. to the SIDE of the beam in the aperture plane for an
+    exposure estimate, needs an angular-spectrum / Rayleigh–Sommerfeld pass, not this paraxial tool.)
+
+    Aliasing: sampling the aperture at spacing d band-limits the reconstruction to the window
+    |r| < λz/2d — evaluating beyond it WRAPS (aliases) the spot, NOT a bigger field of view. So the
+    cut is truncated to zero outside that window (as the single-FFT path zero-fills outside its own
+    grid). At the phase-resolving d this window is ≈ ±2·max_semi, which contains the aperture-sized
+    near beam, so only far sidelobes are lost.
+
+    Returns (ix, iy): (len(z), len(radial)) RAW areal intensity (fraction of radiated power / m²,
+    comparable across planes/legs) of the narrow (x) and wide (y) cuts; 0 outside the alias-free
+    window, NaN on planes below the Fresnel/`n_ap_max` floor."""
+    z = np.atleast_1d(np.asarray(z_m, dtype=float))
+    r = np.asarray(radial_m, dtype=float)
+    max_semi = max(float(semi_major_m), float(semi_minor_m))
+    z_floor = fresnel_floor_diam * 2.0 * max_semi
+    ix = np.full((z.size, r.size), np.nan)
+    iy = np.full((z.size, r.size), np.nan)
+    for i, zi in enumerate(z):
+        if not (zi > 0.0) or zi < z_floor:
+            continue
+        inv = 1.0 / zi - 1.0 / max(float(focus_range_m), 1e-9)
+        # n_ap needed to keep the aperture inside the grid at the phase-resolving spacing d_phase =
+        # λ/(4·max_semi·|inv|): n_ap ≥ 2.5·max_semi/d_phase = 10·max_semi²·|inv|/λ.
+        n_need = int(np.ceil(10.0 * max_semi ** 2 * abs(inv) / wavelength_m)) if inv != 0.0 else n_ap_base
+        if n_need > n_ap_max:
+            continue                                        # sub-Fresnel practical floor → caller infills
+        n_ap = int(min(max(n_ap_base, n_need), n_ap_max))
+        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, zi, focus_range_m, n_ap)
+        coord = (np.arange(n_ap) - n_ap // 2) * d
+        X, Y = np.meshgrid(coord, coord, indexing="ij")
+        amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)
+        Ac = amp.astype(np.complex128)
+        p = (np.exp(1j * np.pi / wavelength_m * inv * coord ** 2) if inv != 0.0
+             else np.ones(n_ap, dtype=np.complex128))     # separable residual focusing phase p(x)·p(y)
+        mx = p * (Ac @ p)                                   # marginal onto x → source for E(x, 0)
+        my = p * (p @ Ac)                                   # marginal onto y → source for E(0, y)
+        k = 2.0 * np.pi / (wavelength_m * zi)
+        W = np.exp(-1j * k * np.outer(r, coord))            # shared kernel (symmetric grid)
+        fx, fy = W @ mx, W @ my
+        norm = float((amp ** 2).sum()) * (wavelength_m * zi / d) ** 2
+        if norm > 0.0:
+            outside = np.abs(r) > 0.95 * (wavelength_m * zi) / (2.0 * d)   # beyond the alias-free window
+            gx = (fx.real ** 2 + fx.imag ** 2) / norm
+            gy = (fy.real ** 2 + fy.imag ** 2) / norm
+            gx[outside] = 0.0
+            gy[outside] = 0.0
+            ix[i], iy[i] = gx, gy
+    return ix, iy
+
+
 def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
     """One plane's cut resampled onto radial_m, plus its strip-marginal enclosed-energy row
     E(r) = fraction of the plane's TOTAL power in the strip |coord| < r (∫∫ I dA = 1, so it
