@@ -1,9 +1,11 @@
-"""Physics-review self-tests for the beam-link engine.
+"""Behavioural checks for the beam link model. Run as a script; every `check` prints the
+numbers behind it, so a failure is read off the detail string rather than a message.
 
-Each check encodes a physical expectation and traces one link in the chain, so a
-green run is evidence the engine behaves the way the physics says it should — not
-just that it runs. Run:  uv run python test_beam_link.py
+These are mostly invariants and sanity relations, not regressions against stored values:
+they pin down monotonicity, symmetry, agreement with closed-form limits, and internal
+consistency of the reported efficiency chain.
 """
+
 import numpy as np
 
 import napkin
@@ -27,6 +29,9 @@ def check(name, condition, detail=""):
 # --- Silhouette ---------------------------------------------------------------
 
 def test_silhouette():
+    """Silhouette area behaves like a flat lifting body: belly-on beats edge-on several
+    times over, opposite views agree (closed body), area falls monotonically as the beam
+    moves off the belly, and banking away from the beam costs area."""
     print("\n[silhouette]")
     verts, faces = make_bwb_mesh()
     normals, areas = triangle_normals_areas(verts, faces)
@@ -57,6 +62,9 @@ def test_silhouette():
 # --- Atmosphere ---------------------------------------------------------------
 
 def test_atmosphere():
+    """Gaseous loss is all below cruise altitude (11 km and 20 km zenith paths agree), a
+    30 degree slant path costs 1/sin(30) = 2x the zenith path, and heavy rain is survivable
+    at 5.8 GHz but not at 30 GHz."""
     print("\n[atmosphere — curved-path integration]")
     atmos = bl.Atmosphere()
     S = geo.point(0.0, 0.0, 0.0)
@@ -83,6 +91,9 @@ def test_atmosphere():
 
 
 def test_curvature():
+    """Earth curvature is really in the geometry: elevation falls with downrange, a 600 km
+    link is over the horizon while 300 km is not, and from the aircraft the station is below
+    the local horizontal."""
     print("\n[earth curvature]")
     S = geo.point(0.0, 0.0, 0.0)
     # Elevation of a level plane falls with downrange and eventually goes below horizon.
@@ -110,8 +121,10 @@ def test_curvature():
 # --- Near-field coupling ------------------------------------------------------
 
 def test_coupling():
+    """Aperture sizing follows the Goubau rule: tau=2 collects 98%, required diameter scales
+    with wavelength (so 5.8 GHz needs 30/5.8 times the 30 GHz aperture), and a low-elevation
+    pass needs a bigger aperture than a high one because the slant range is longer."""
     print("\n[near-field coupling]")
-    # τ=2 → the design capture ceiling ~0.98.
     check("collection η(τ=2) ≈ 0.982", abs(napkin.collection_efficiency(2.0) - 0.9817) < 1e-3)
 
     # Sizing to τ=2 at any frequency yields the same capture; the differentiator is
@@ -133,6 +146,10 @@ def test_coupling():
 # --- End-to-end bookkeeping ---------------------------------------------------
 
 def test_end_to_end():
+    """The reported chain is self-consistent for all three architectures: every stage is a
+    factor in (0, 1], their product is exactly eta_end_to_end, and grid/waste power follow
+    from it. Last check: at 30 GHz a passive mirror beats an active relay, i.e. the
+    conversion loss of rectifying and re-transmitting costs more than it buys."""
     print("\n[end-to-end]")
     st, pl = bl.reference_geometry(30.0)
     for arch, cfg in {
@@ -169,6 +186,8 @@ def test_end_to_end():
 # --- Vectorization ------------------------------------------------------------
 
 def test_vectorized():
+    """Array inputs keep their shape and stay monotone: loss rises with frequency, silhouette
+    area falls as the beam moves off the belly."""
     print("\n[vectorization]")
     atmos = bl.Atmosphere()
     freqs = np.array([5.8, 12.0, 20.0, 30.0, 34.8])
@@ -184,11 +203,11 @@ def test_vectorized():
 
 
 def test_pass_profile():
+    """Shape of a single overflight: delivery peaks overhead, is near-symmetric fore and aft
+    (a swept planform is not exactly symmetric, hence the 8% tolerance), and sizing the
+    emitter for a lower reference elevation buys a wider useful window at the price of a
+    bigger aperture. Capture is near-perfect overhead and poor at the edges."""
     print("\n[pass profile / fixed emitter]")
-    # A fixed emitter delivers most overhead and falls off both ways. Defocus + the
-    # density cap + the adaptive profile flatten the top into a PLATEAU over the best part
-    # of the pass (stable delivery), so the exact argmax wanders within it — assert a
-    # central plateau, not a razor peak.
     p = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=60.0)
     peak_idx = int(np.argmax(p["deliverable_mw"]))
     overhead_idx = int(np.argmin(np.abs(p["alongtrack_km"])))
@@ -228,6 +247,14 @@ def test_pass_profile():
 # --- Rasterized silhouette + 2-D overlap capture ------------------------------
 
 def test_overlap():
+    """The raster overlap against cases with known answers.
+
+    On a flat disc receiver it must reproduce the Airy encircled energy, and with the taper
+    free to vary it must at least reach the Goubau prediction. Then on the aircraft: the
+    z-buffer sees less than the convex projected area at grazing angles (self-occlusion), the
+    incidence derate barely bites belly-on but clearly does edge-on, and shaping the aperture
+    to the silhouette never captures less than a round one.
+    """
     print("\n[overlap capture — the 2-D beam × silhouette model]")
 
     # (1) The overlap of a ROUND uniform aperture on a round rectenna must reproduce the
@@ -297,6 +324,9 @@ def test_overlap():
 # --- Trajectory-integrated flyby ----------------------------------------------
 
 def test_gaussian_beam():
+    """Gaussian reference model: the beam is the aperture radius at the aperture, reaches
+    lambda*L/(pi*a) at the focus, and its true waist forms at or short of the focus. The last
+    check pins `focused_spot_waist` at exactly sqrt(2) times that focal radius."""
     print("\n[exact Gaussian beam — aperture → waist → beyond]")
     lam, a = napkin.wavelength(5.8e9), 50.0
     for L in (11e3, 107e3, 213e3):
@@ -314,6 +344,10 @@ def test_gaussian_beam():
 
 
 def test_flyby():
+    """Corridor-level behaviour: the three pass averages order as harmonic <= arithmetic <=
+    peak; a 20 km tether emitter is above the weather so a storm barely touches it; a relay
+    beats going direct through a storm; and a 30 GHz ground station loses the link outright in
+    a storm, which is what makes its constant-delivery energy infinite."""
     print("\n[flyby — trajectory-integrated over a pass]")
     archs = bl.standard_architectures()
 
@@ -343,6 +377,9 @@ def test_flyby():
 
 
 def test_pointing_density():
+    """A 2 m pointing error costs under 2% of end-to-end efficiency; the skin power density
+    respects max_power_density_w_m2 (2% slack); and asking for more delivered power forces a
+    wider spot, since the only way to stay under the density cap is to defocus."""
     print("\n[pointing folded into overlap + power-density cap]")
     st, pl, relay = (0, 0, 0), (0, 0, 11e3), (0, 0, 20e3)
     base = dict(station_pos=st, plane_pos=pl, relay_pos=relay, relay_mode="multiplier",
@@ -371,6 +408,10 @@ def test_pointing_density():
 
 
 def test_taper():
+    """What tapering the aperture buys, on a receiver whose radius is the first Airy null
+    (0.61*lambda*D/a): it moves
+    power out of the sidelobes into the main lobe (capture up) while lowering the peak
+    intensity, which is the lever the density cap pulls on."""
     print("\n[aperture taper — sidelobe spill vs main-lobe width]")
     def disk_raster(r_r, n=400):
         g = np.linspace(-r_r, r_r, n)
@@ -397,6 +438,9 @@ def test_taper():
 
 
 def test_adaptive_taper():
+    """The adaptive search is at least as good as any fixed taper it could have chosen (3e-3
+    slack for the coarse scan grid), stays inside [0, taper_p_max], and switching it off
+    really does use cfg.taper_p."""
     print("\n[adaptive aperture taper — chosen per geometry for max capture under the cap]")
     st, relay = (0, 0, 0), (0, 0, 20e3)
     base = dict(station_pos=st, relay_pos=relay, relay_mode="multiplier", f_emit_relay_ghz=5.8,
@@ -417,6 +461,8 @@ def test_adaptive_taper():
 
 
 def test_energy_balance():
+    """`flyby`'s energy bookkeeping closes: waste is grid minus delivered, energy_eta is the
+    ratio of the two, and the served fraction is a fraction."""
     print("\n[flyby energy balance — plane banks everything]")
     archs = bl.standard_architectures(weather="clear")
     r = bl.flyby(archs["relay ×3 mult 5.8→17.4"], station_spacing_km=200.0)

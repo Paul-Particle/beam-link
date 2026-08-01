@@ -1,31 +1,12 @@
-"""Scalar-diffraction beam fields for the microwave power link.
+"""Scalar diffraction from an elliptical, tapered, focused aperture.
 
-The emitter is a phase-conjugated (focused) phased array of finite extent. The field
-it delivers at the plane is NOT a Gaussian — it is the diffraction pattern of the
-aperture: a main lobe carrying <100 % of the radiated power, surrounded by sidelobe
-rings. This module computes that field exactly (scalar Fresnel/Fraunhofer optics) so
-both the capture integral and the visualization run on the SAME physical field, with
-no effective-spot calibration.
-
-Two routines:
-  • `focal_intensity`      — the field in the TARGET plane (z = focus range), where a
-                             lens-focused aperture forms its Fraunhofer pattern. This is
-                             what the plane actually flies through, and what capture
-                             integrates over the silhouette.
-  • `axial_intensity_cut`  — a (transverse × range) slice of the field along the whole
-                             path, for the visualization (converging cone → waist →
-                             diverging cone, sidelobes and all).
-
-Aperture taper is the single physical knob (the array's amplitude weighting):
-    A(ρ) = (1 − ρ²)^p ,  ρ = elliptical aperture radius ∈ [0, 1]
-p = 0 is a uniform (top-hat) aperture → the Airy pattern (first sidelobe −17.6 dB, 83.8 %
-of the power in the main lobe); larger p lowers the sidelobes at the cost of a wider main
-lobe (p = 1 → −24.6 dB, p = 2 → −30.6 dB). The array picks p per geometry (see the
-adaptive-taper optimizer in beam_link).
-
-Aperture ↔ spot axes are Fourier-inverse: a LONG aperture axis makes a NARROW spot axis.
-The elliptical aperture is described by its own semi-axes; the caller orients it.
+The intensity routines return intensity normalised to unit radiated power: the integral over
+the observation plane is 1, so values have units of m^-2 and W/m^2 comes from multiplying by
+the beam power. `axial_cut`/`axial_cut_xy` are the exception -- they peak-normalise by default
+and are dimensionless; `axial_cuts_direct`, despite the name, is unit-power like the rest. `focus_range_m` is the range the aperture phase is curved for; setting
+it equal to `z_m` means "in focus at z".
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -35,31 +16,26 @@ from scipy.ndimage import map_coordinates
 
 
 def _fft_workers(n_grid):
-    """FFT thread count by grid size: the small channel transforms (n≤256) are fastest
-    single-threaded (thread setup dominates the work); the larger capture/figure grids
-    (n≥320) pay for multi-threading. Measured crossover sits between 256 and 384."""
-    return -1 if n_grid >= 320 else 1
+    return -1 if n_grid >= 320 else 1  # threading only pays off on the larger transforms
 
 
 def aperture_amplitude(x, y, semi_major_m, semi_minor_m, taper_p):
-    """Aperture amplitude A(x,y): (1−ρ²)^p inside the ellipse, 0 outside.
-    Aperture major axis is along x, minor along y (the caller rotates into this frame)."""
+    """Illumination amplitude (1 - rho^2)^p inside the ellipse, 0 outside. p=0 is uniform."""
     rho2 = (x / semi_major_m) ** 2 + (y / semi_minor_m) ** 2
     inside = rho2 <= 1.0
     return np.where(inside, np.clip(1.0 - rho2, 0.0, None) ** float(taper_p), 0.0)
 
 
 def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid=1024):
-    """Aperture-plane sample spacing d for a single-FFT propagation to plane z of an aperture
-    focused at `focus_range_m`. Two Nyquist constraints:
-      • Focal-plane spacing dx = λ·z/(N·d) and extent = λ·z/d, so the SPOT (widest along the
-        SHORT aperture axis) sets d = min_semi/12 → focal window ~12 spot-scales wide. But the
-        aperture-plane window is N·d, so d is floored at 2.5·max_semi/N so the LONG aperture
-        axis always fits the transform grid (else an elongated aperture is spuriously clipped
-        and the plane is dropped by the near-aperture guard in axial_cut).
-      • Off-focus, the aperture carries a residual quadratic phase exp(iπ·(1/z−1/f)·ρ²/λ) whose
-        edge frequency is max_semi·|1/z−1/f|/λ; d must resolve it (d ≤ λ/(4·max_semi·|1/z−1/f|)).
-    The tighter of the two wins (the phase term vanishes at z = f, so the spot term rules there)."""
+    """Aperture-plane sample pitch (m), from two competing constraints.
+
+    A smaller pitch widens the observation window (n*dx = lambda*z/d) at the cost of a coarser
+    pitch within it (dx = lambda*z/(n*d)) and less room for the aperture itself (n*d):
+      d_spot  - min_semi/12, which makes the window exactly 12 spot scales wide; floored at
+                2.5*max_semi/n_grid so the long aperture axis always fits the grid.
+      d_phase - the focusing phase pi/lambda*inv*r^2 must advance < pi/2 per sample at the
+                aperture edge; unconstrained when in focus (inv = 0).
+    """
     min_semi, max_semi = min(semi_major_m, semi_minor_m), max(semi_major_m, semi_minor_m)
     d_spot = max(min_semi / 12.0, 2.5 * max_semi / n_grid)
     inv = abs(1.0 / max(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9))
@@ -69,15 +45,12 @@ def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range
 
 def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
                     taper_p=0.0, n_grid=1024, dtype=np.complex128):
-    """Power-normalized scalar-diffraction intensity in the plane at range `z_m` of an
-    elliptical aperture phase-conjugated to focus at `focus_range_m`. Single-FFT Fresnel:
-    the field at z is the 2-D Fourier transform of the aperture amplitude carrying the
-    residual quadratic phase exp(iπ(1/z − 1/f)ρ²/λ), with aperture frequency mapped to
-    transverse position x = λ·z·f_freq. At z = f this collapses to the Fraunhofer (focal)
-    pattern. Aperture major axis is along x → the spot is NARROW along x (Fourier inverse).
-    Returns (x_m, y_m, intensity) with ∫∫ I dx dy = 1 (fraction of radiated power / m²).
-    `dtype` sets the FFT precision — complex128 for the model, complex64 for the (display-only)
-    channel cuts where the 2× cheaper transform is visually indistinguishable."""
+    """Intensity over a full plane at range z, via one FFT of the aperture field.
+
+    Returns (x_axis, y_axis, intensity) with the axes in metres on the plane. The 1/(lambda z)
+    amplitude factor and the observation-plane quadratic phase are dropped: the explicit
+    normalisation to unit total power absorbs the former, and only |field|^2 is used.
+    """
     d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid)
     coord = (np.arange(n_grid) - n_grid // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
@@ -89,7 +62,7 @@ def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m
     field = sfft.fftshift(sfft.fft2(sfft.ifftshift(A), workers=_fft_workers(n_grid)))
     intensity = np.abs(field) ** 2
 
-    dx = wavelength_m * z_m / (n_grid * d)                # observation-plane sample spacing (m)
+    dx = wavelength_m * z_m / (n_grid * d)  # Fraunhofer/Fresnel scaling of the FFT bins
     x = (np.arange(n_grid) - n_grid // 2) * dx
     total = intensity.sum() * dx * dx
     intensity = intensity / total if total > 0 else intensity
@@ -98,11 +71,8 @@ def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m
 
 def plane_intensity_stack(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
                           taper_ps, n_grid=384):
-    """`plane_intensity` for a whole LIST of aperture tapers at once. The aperture spacing,
-    grid and residual focusing phase depend only on the geometry (not the taper), so all
-    tapers share them and the transform is a SINGLE batched 2-D FFT over the stack — far
-    cheaper than one FFT per taper. Returns (x_m, y_m, stack) with stack[k] the
-    power-normalised intensity (∫∫ I dA = 1) for taper_ps[k]."""
+    """`plane_intensity` batched over taper exponents (one shared aperture grid, one batched
+    FFT, single precision). Used to scan taper cheaply; the winner is then re-evaluated."""
     taper_ps = np.atleast_1d(np.asarray(taper_ps, dtype=float))
     d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_grid)
     coord = (np.arange(n_grid) - n_grid // 2) * d
@@ -135,17 +105,10 @@ def focal_intensity(semi_major_m, semi_minor_m, wavelength_m, focus_range_m,
 
 def focal_intensity_at(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
                        qx, qy, taper_p=0.0, n_ap=512):
-    """Scalar-diffraction focal intensity evaluated DIRECTLY at arbitrary query points (qx, qy) in
-    the plane at range `z_m` (aperture principal frame: x = aperture-major axis → spot-MINOR).
-
-    A direct DFT from the aperture samples to the query points — NOT an FFT on a fixed grid. So the
-    spot is resolved at the QUERY resolution however fine (evaluate on the silhouette's own pixels),
-    and no ±λz/d window is spent computing empty space. `n_ap` sets the aperture sampling grid (the
-    residual focusing phase and taper are carried on it); only its non-zero samples enter the sum.
-    Power-normalised consistently with `plane_intensity` (∫∫ I dA = 1 over all space), verified to
-    match it at shared grid points. `qx`, `qy` are broadcast/flattened together; returns |E|² at each.
-
-    Cost is O(n_query · n_aperture_samples); the query loop is chunked to bound memory."""
+    """Intensity at arbitrary scattered points (qx, qy) on the plane at z, by direct DFT
+    over the illuminated aperture samples only. Same normalisation as `plane_intensity`:
+    `norm` is the analytic total power sum|A|^2 * (lambda z/d)^2, which is what Parseval
+    gives for the FFT route."""
     d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
     coord = (np.arange(n_ap) - n_ap // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
@@ -161,7 +124,7 @@ def focal_intensity_at(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelengt
     k = 2.0 * np.pi / (wavelength_m * z_m)                 # aperture-freq → focal-position kernel
     norm = float((amp ** 2).sum()) * (wavelength_m * z_m / d) ** 2   # Parseval total (∫∫I dA = 1)
     out = np.empty(qx.size, dtype=float)
-    chunk = max(1, int(4.0e6 / max(av.size, 1)))          # cap the (chunk × n_ap) complex block
+    chunk = max(1, int(4.0e6 / max(av.size, 1)))  # cap the outer-product block at ~4M entries
     for s in range(0, qx.size, chunk):
         phase = -k * (np.outer(qx[s:s + chunk], ax) + np.outer(qy[s:s + chunk], ay))
         field = np.exp(1j * phase) @ av
@@ -171,12 +134,9 @@ def focal_intensity_at(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelengt
 
 def focal_intensity_grid(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
                          x_out, y_out, taper_p=0.0, n_ap=512):
-    """Direct scalar-diffraction focal intensity on an axis-aligned OUTPUT grid (x_out × y_out,
-    aperture principal frame: x = aperture-major → spot-MINOR). Because the output is a grid the DFT
-    is SEPARABLE — E = Wx · A · Wy, two matrix products instead of a per-point sum — so it ZOOMS to
-    whatever window/resolution you pass (e.g. the silhouette's own pixel grid, high-res on the spot)
-    for the cost of a couple of BLAS calls, no ±λz/d FFT window wasted on empty space. Power-
-    normalised like `plane_intensity` (∫∫ I dA = 1). Returns intensity[i, j] at (x_out[i], y_out[j])."""
+    """As `focal_intensity_at` but on a caller-chosen separable output grid, so the DFT
+    factorises into two matrix products. intensity[i, j] is at (x_out[i], y_out[j]);
+    x_out corresponds to the semi_major aperture axis."""
     d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
     coord = (np.arange(n_ap) - n_ap // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
@@ -267,9 +227,9 @@ def axial_cuts_direct(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength
 
 
 def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
-    """One plane's cut resampled onto radial_m, plus its strip-marginal enclosed-energy row
-    E(r) = fraction of the plane's TOTAL power in the strip |coord| < r (∫∫ I dA = 1, so it
-    only reaches 1 where the beam is that contained)."""
+    """One plane's contribution to an axial cut: the intensity along a centre line, and the
+    enclosed power. `enclosed` integrates the marginal, so it is the power in the strip
+    |coord| <= r -- not inside a circle of radius r."""
     intensity_row = np.interp(radial_m, coord, line, left=0.0, right=0.0)
     o = np.argsort(np.abs(coord))
     abs_sorted = np.abs(coord)[o]
@@ -283,9 +243,11 @@ def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
 
 
 def _finalize_cut(intensity, enclosed, normalize):
-    """Peak-normalise (when asked) and round for compact serialization. The raw field
-    (normalize=False) is areal intensity ~1e-4 W-fraction/m² and would collapse to 0 at 3
-    decimals, so it is left full-precision for the caller to normalise across legs."""
+    """Peak-normalise if asked, and round for compact serialization into the animation's HTML.
+
+    The un-normalised branch is left full precision on purpose: the raw field is ~1e-4 m^-2 and
+    would round to zero at 3 decimals, and it is the branch that stays comparable across legs.
+    """
     finite = np.isfinite(intensity)
     peak = intensity[finite].max() if finite.any() else 0.0
     if normalize and peak > 0:
@@ -308,17 +270,12 @@ def _cut_from_field(field, dx_ax, radial_m, r_query):
 
 def _axial_cuts(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, radial_m,
                 taper_p, n_grid, dtype):
-    """Core of the axial-cut routines: for every plane z, both principal center-line cuts of the
-    diffraction field, on the common `radial_m` grid, RAW (per-plane ∫∫ I dA = 1, unnormalised).
+    """x and y cuts plus enclosed power for a whole sweep of ranges z_m, shape (n_z, n_r).
 
-    The grid spacing d = min(d_spot, d_phase) (see `_aperture_spacing`) is pinned to the CONSTANT
-    d_spot for every plane except the strongly-defocused near-aperture ones (where the residual
-    quadratic phase forces a finer d_phase). All the d_spot planes therefore share one aperture
-    grid, so they are computed as a SINGLE batched FFT with the aperture amplitude and radius²
-    grid built once — far cheaper than one FFT + one aperture raster per plane, and numerically
-    identical to the per-plane path (only the FFT accumulation order differs, ~1e-7). The few
-    d_phase planes keep the exact per-plane path. Returns (ix, ex, iy, ey), NaN where a plane is
-    too close to the aperture for its width to fit the transform grid."""
+    Ranges where the focusing phase is mild enough that d_spot is the binding pitch share
+    one aperture grid and go through a single batched FFT; the rest fall back to one
+    `plane_intensity` each. Rows the grid cannot span the aperture for are left NaN.
+    """
     z_m = np.asarray(z_m, dtype=float)
     radial_m = np.asarray(radial_m, dtype=float)
     r_query = np.abs(radial_m)
@@ -333,14 +290,15 @@ def _axial_cuts(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m, ra
     d_phase = np.full_like(abs_inv, np.inf)            # exact-focus plane (inv = 0) → d_spot rules
     nonzero = abs_inv > 0.0
     d_phase[nonzero] = wavelength_m / (4.0 * max_semi * abs_inv[nonzero])
-    is_spot = d_phase >= d_spot                        # this plane's spacing is pinned to d_spot
+    is_spot = d_phase >= d_spot
 
-    # --- batched d_spot planes: one aperture raster + radius² grid, one batched FFT ------------
-    # The residual quadratic phase varies plane-to-plane only through the scalar `inv`, and the
-    # aperture masks everything outside the (typically ~few-percent-fill) ellipse, so the phase is
-    # evaluated ONLY at the aperture samples and scattered into the zero-padded transform grid —
-    # the exp() cost then scales with the aperture area, not the whole grid. Phase in complex64
-    # (float32 argument): a ~1e-4 rad rounding, invisible in the display field.
+    # Both branches below check that the grid still contains the aperture. On the d_spot branch
+    # the 2.5*max_semi/n_grid floor in _aperture_spacing guarantees it, so that test never
+    # fires; on the d_phase branch it does, and those near-aperture planes are left NaN rather
+    # than fabricated. `focal_intensity_grid`/`focal_intensity_at` share the d_phase exposure
+    # and make no such test -- they are safe today only because deep defocus needs a short
+    # range while a high aperture aspect only arises at low elevation, i.e. long range, so the
+    # two do not coincide at the geometries this model runs. Nothing enforces that.
     spot_idx = np.nonzero(is_spot)[0]
     if spot_idx.size and n_grid * d_spot >= 2.4 * max_semi:
         coord = (np.arange(n_grid) - n_grid // 2) * d_spot
@@ -419,10 +377,7 @@ def sample_focal_intensity(x_axis, y_axis, intensity, xq, yq):
 
 
 def sample_stack(x_axis, y_axis, stack, xq, yq):
-    """Bilinearly sample a STACK of intensity grids (K, N, N) at the SAME query points
-    (xq, yq) — the taper grid shares one silhouette, so the fractional indices are computed
-    once and applied to every layer with a single vectorized gather. Returns (K, n_query).
-    Out-of-grid points → 0."""
+    """Bilinear sample of every plane in a stack at the same query points; zero outside."""
     dx = x_axis[1] - x_axis[0]
     dy = y_axis[1] - y_axis[0]
     n = stack.shape[1]
@@ -442,9 +397,8 @@ def sample_stack(x_axis, y_axis, stack, xq, yq):
 # --- Analytic references (validation) ----------------------------------------
 
 def airy_encircled_energy(radius_m, aperture_radius_m, wavelength_m, focus_range_m):
-    """Fraction of power within `radius_m` of the axis in the focal plane of a UNIFORM
-    circular aperture (Airy pattern): E(r) = 1 − J0(v)² − J1(v)², v = 2π·R·r/(λ·f).
-    First dark ring at v = 3.8317 (r = 0.610 λf/R); E there = 0.838 (main-lobe power)."""
+    """Closed-form 1 - J0(v)^2 - J1(v)^2 for a uniform circular aperture in focus.
+    Reference for the numerical routines above."""
     v = 2.0 * np.pi * aperture_radius_m * np.asarray(radius_m) / (wavelength_m * focus_range_m)
     v = np.where(v == 0.0, 1e-12, v)
     return 1.0 - j0(v) ** 2 - j1(v) ** 2

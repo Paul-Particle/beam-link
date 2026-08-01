@@ -1,10 +1,10 @@
-"""Napkin math for microwave-powered aviation — pushing on the envelope.
+"""First-order sizing for microwave-beamed aviation: closed-form estimates and tables.
 
-First-order relations behind the 'Premise & target envelope' section of
-research-questions.md. SI units unless a name says otherwise. Every number this
-produces is #(verify)-grade: order-of-magnitude sanity checks, not engineering.
-
-Run:  uv run python napkin.py   → prints tables, writes out/pass_geometry.html
+Not a standalone layer: `beam_link` calls the coupling, rain and rectenna relations here in its
+live chain, so retuning one of those constants moves the engine's numbers too. What is superseded
+is narrower -- `ETA_BEAM`, `silhouette_area_m2`, `effective_rectenna_radius_m` and this module's
+own PAE curves have scenario-driven or diffraction-based replacements there. The economics below
+still runs on the flat placeholders. SI units unless a name says otherwise.
 """
 
 from __future__ import annotations
@@ -20,9 +20,12 @@ GRAVITY = 9.81             # m/s^2
 RHO_AIR_SEA = 1.225        # kg/m^3
 SCALE_HEIGHT = 8500.0      # m; single-exponential atmosphere (approx; ~30% high near 20 km)
 
-GAS_FRACTION = {"hydrogen": 2 / 29, "helium": 4 / 29}   # lifting-gas density / air density
+# lifting-gas molar mass over that of dry air (~29 g/mol): the fraction of displaced air
+# mass the gas itself weighs
+GAS_FRACTION = {"hydrogen": 2 / 29, "helium": 4 / 29}
 
-TETHER_MATERIALS = {  # tensile strength (Pa), density (kg/m^3)
+# (tensile strength Pa, density kg/m^3)
+TETHER_MATERIALS = {
     "Dyneema (UHMWPE)": (3.5e9, 970),
     "Zylon (PBO)": (5.8e9, 1560),
     "Carbon (T1100)": (7.0e9, 1790),
@@ -30,37 +33,42 @@ TETHER_MATERIALS = {  # tensile strength (Pa), density (kg/m^3)
 }
 
 
-# --- Beam coupling ------------------------------------------------------------
+# --- beam coupling (Goubau) ------------------------------------------------------------
 
 def wavelength(frequency_hz):
     return SPEED_OF_LIGHT / frequency_hz
 
 
 def coupling_tau(frequency_hz, distance_m, emitter_radius_m, receiver_radius_m):
-    """Goubau aperture-coupling parameter τ = π·r_t·r_r/(λ·D)."""
+    """Goubau coupling parameter tau = pi*a_t*a_r/(lambda*D), dimensionless. The single
+    number that decides how much of a beam a finite receiver can collect."""
     return np.pi * emitter_radius_m * receiver_radius_m / (wavelength(frequency_hz) * distance_m)
 
 
 def collection_efficiency(tau):
-    """Fraction of radiated power caught by the receiving aperture: η ≈ 1−exp(−τ²)."""
+    """Fraction of radiated power intercepted, 1 - exp(-tau^2). tau=2 gives 0.982."""
     return 1.0 - np.exp(-(tau ** 2))
 
 
 def required_emitter_radius(frequency_hz, distance_m, receiver_radius_m, tau_target=2.0):
-    """r_t = τ·λ·D/(π·r_r); τ≈2 → ~94% collection."""
+    """`coupling_tau` solved for emitter radius; the sizing rule used everywhere."""
     return tau_target * wavelength(frequency_hz) * distance_m / (np.pi * receiver_radius_m)
 
 
 def surface_precision(frequency_hz, fraction=1 / 16):
-    """Element-POSITION knowledge for phase correction (~λ/16) — not mechanical flatness."""
+    """Element-position *knowledge* needed for phase correction (~lambda/16), in m.
+
+    Not a mechanical flatness or rigidity requirement: a retrodirective array may flex freely
+    provided each element's position is known to this accuracy. The distinction is what keeps a
+    78 m tethered or aerostat-borne aperture on the table -- 0.6 mm at 30 GHz is a metrology
+    problem, not a structural one.
+    """
     return wavelength(frequency_hz) * fraction
 
 
 def power_density_limited_diameter(power_w, density_wcm2=25.0):
-    """Min aperture diameter to radiate/collect `power_w` without exceeding a surface
-    power-density limit (~25 W/cm² for solid-state arrays and rectennas alike):
-    d = 2·√(P/(π·S)). Small apertures hit this floor long before the diffraction
-    minimum — which is why the 'diffraction-tiny' feed dish is really power-density-bound."""
+    """Smallest aperture that can radiate `power_w` without exceeding a surface power
+    density limit (W/cm^2)."""
     area_m2 = power_w / (density_wcm2 * 1e4)
     return 2.0 * np.sqrt(area_m2 / np.pi)
 
@@ -71,15 +79,13 @@ def power_density_limited_diameter(power_w, density_wcm2=25.0):
 # 5.8 -> 30 GHz (~x6) is built as a cascade whose per-stage losses compound.
 
 def multiplier_factor_prime(input_ghz=5.8, output_ghz=30.0):
-    """Required integer multiplication order (rounded) to reach `output_ghz`."""
+    """Harmonic order of a frequency-multiplying relay, rounded to an integer."""
     return round(output_ghz / input_ghz)
 
 
 def cascade_efficiency(order, stage_efficiency=0.7):
-    """End-to-end efficiency of a multiplier chain realizing `order` as a product
-    of small prime stages (x2/x3), each at `stage_efficiency`. A x6 = x2·x3 is two
-    stages; x5 (5.8->30, if taken as prime) is one hard high-order stage. Returns
-    (efficiency, [prime stages])."""
+    """A multiplier of the given order is built from one stage per prime factor (x6 = x2
+    then x3), each costing stage_efficiency. Returns (total, stage list)."""
     stages = _prime_stages(order)
     return stage_efficiency ** len(stages), stages
 
@@ -97,10 +103,11 @@ def _prime_stages(n):
     return stages or [1]
 
 
-# --- Atmospheric attenuation (rain) -------------------------------------------
+# --- rain and gaseous attenuation ------------------------------------------------------
 
-# ITU-R P.838-3 curve-fit coefficients (Gaussian sums in log-frequency). Valid
-# 1–1000 GHz. Ported so k, α can be evaluated at ANY frequency, not just 30 GHz.
+# ITU-R P.838-3 curve fits for the rain coefficients k and alpha: a sum of Gaussians in
+# log10(f/GHz) plus a linear term. Reproduces the published table (30 GHz: kh 0.2403,
+# ah 0.9485, kv 0.2291, av 0.9129). Valid 1-1000 GHz.
 _P838 = {
     "kh": dict(aj=[-5.33980, -0.35351, -0.23789, -0.94158],
                bj=[-0.10008, 1.2697, 0.86036, 0.64552],
@@ -118,6 +125,7 @@ _P838 = {
 
 
 def _p838_term(frequency_ghz, coeffs, is_k):
+    """The fit is for log10(k) but for alpha directly, hence `is_k`."""
     log_f = np.log10(frequency_ghz)
     gaussians = sum(a * np.exp(-(((log_f - b) / c) ** 2))
                     for a, b, c in zip(coeffs["aj"], coeffs["bj"], coeffs["cj"]))
@@ -126,8 +134,9 @@ def _p838_term(frequency_ghz, coeffs, is_k):
 
 
 def rain_coefficients(frequency_ghz, elevation_deg=90.0, polarization_tilt_deg=0.0):
-    """ITU-R P.838-3 (k, α) for rain specific attenuation at arbitrary frequency,
-    path elevation, and polarization tilt (τ=0 horizontal, 90 vertical, 45 circular)."""
+    """(k, alpha) for the specific-attenuation law, combining the H and V fits for path
+    elevation and polarisation tilt as in P.838. Both the zenith path (cos^2 el = 0) and
+    circular polarisation (tilt 45 deg) collapse this to the plain H/V mean."""
     kh = _p838_term(frequency_ghz, _P838["kh"], is_k=True)
     kv = _p838_term(frequency_ghz, _P838["kv"], is_k=True)
     ah = _p838_term(frequency_ghz, _P838["ah"], is_k=False)
@@ -139,18 +148,16 @@ def rain_coefficients(frequency_ghz, elevation_deg=90.0, polarization_tilt_deg=0
     return k, alpha
 
 
-RAIN_K, RAIN_ALPHA = rain_coefficients(30.0)   # 30 GHz, vertical path (project reference)
+RAIN_K, RAIN_ALPHA = rain_coefficients(30.0)  # the defaults below are 30 GHz values
 
 
 def specific_rain_attenuation(rain_rate_mmh, k=RAIN_K, alpha=RAIN_ALPHA):
-    """ITU-R P.838 specific attenuation γ = k·R^α [dB/km]. Defaults: 30 GHz, H-pol."""
+    """gamma_R = k*R^alpha in dB/km, R in mm/h (P.838)."""
     return k * rain_rate_mmh ** alpha
 
 
 def rain_fade_db(rain_rate_mmh, rain_height_km, elevation_deg=90.0, k=RAIN_K, alpha=RAIN_ALPHA):
-    """Rain attenuation over a slant path through a rain layer of depth `rain_height_km`
-    at the given elevation: γ·h_R/sin(ε). 90° = vertical hop; low (grazing) elevation
-    blows the path length — and hence the dB — up."""
+    """Total rain loss for a slant path through a uniform layer of the given depth."""
     path_km = rain_height_km / np.sin(np.radians(elevation_deg))
     return specific_rain_attenuation(rain_rate_mmh, k, alpha) * path_km
 
@@ -160,13 +167,12 @@ def db_to_fraction(db):
     return 10.0 ** (-db / 10.0)
 
 
-# --- Flight profile -----------------------------------------------------------
+# --- aircraft power and mass -----------------------------------------------------------
 
-# Lifting body / BWB. The bare AIRFRAME L/D is shared with the fossil comparator
-# (airframe gains are not a beaming benefit — tube-and-wing ~17-19). The BEAMED
-# plane earns a modest bump from its ELECTRIC-PROPULSION INTEGRATION — boundary-
-# layer ingestion, no podded nacelles, distributed fans — which is an energy-path
-# advantage, so it is legitimately credited to the concept (#(verify): ~+5-10%).
+# 22 is the bare lifting-body/BWB airframe, shared with the fossil comparator so that airframe
+# gains are not credited to beaming. The +2 is electric-propulsion integration -- boundary-layer
+# ingestion, no podded nacelles, distributed fans -- which is an energy-path advantage and so is
+# legitimately the concept's. ~+5-10%, unverified.
 AIRFRAME_LIFT_TO_DRAG = 22.0
 BEAMED_LIFT_TO_DRAG = 24.0
 REFERENCE_LIFT_TO_DRAG = BEAMED_LIFT_TO_DRAG   # headline value used downstream
@@ -177,25 +183,27 @@ def glide_range_km(lift_to_drag, altitude_drop_m):
 
 
 def powered_fraction(speed_ms, climb_rate_ms, lift_to_drag):
-    """Fraction of a climb-then-glide sawtooth under power = (v/vc)/(v/vc + L/D)."""
+    """Fraction of a climb-then-glide cycle that needs the beam. Climbing height h covers
+    h*V/climb_rate of ground, gliding it back covers h*L/D, so the powered share is
+    (V/vc)/(V/vc + L/D) -- independent of h, and the same in time as in distance."""
     ratio = speed_ms / climb_rate_ms
     return ratio / (ratio + lift_to_drag)
 
 
 def cruise_power_mw(mass_kg, speed_ms, lift_to_drag, eta_chain=0.78):
-    """Electrical power for level cruise: W·v/(L/D)/η. Drag is altitude-independent."""
+    """Electrical power (MW) for level flight; eta_chain covers rectenna DC to propulsive."""
     thrust = mass_kg * GRAVITY / lift_to_drag
     return thrust * speed_ms / eta_chain / 1e6
 
 
 def climb_power_mw(mass_kg, speed_ms, lift_to_drag, climb_rate_ms, eta_chain=0.78):
-    """Cruise + potential-energy rate (W·climb_rate) while banking altitude for the glide."""
+    """As above plus the potential-energy rate m*g*vc."""
     prop = mass_kg * GRAVITY * speed_ms / lift_to_drag + mass_kg * GRAVITY * climb_rate_ms
     return prop / eta_chain / 1e6
 
 
 def beam_power_mw(electrical_mw, rectenna_eff=0.85, collection_eff=0.90):
-    """What the emitter must put into the beam to deliver a given electrical power on board."""
+    """Radiated power needed for a given onboard electrical power."""
     return electrical_mw / rectenna_eff / collection_eff
 
 
@@ -206,15 +214,9 @@ def mass_buildup(payload_t=40.0, speed_ms=250.0, lift_to_drag=BEAMED_LIFT_TO_DRA
                  systems_fraction=0.10, motor_specific_power_kw_per_kg=5.0,
                  battery_specific_energy_wh_per_kg=250.0, buffer_minutes=5.0,
                  rectenna_mass_t=2.0, max_iter=200, tol=1.0):
-    """No-fuel beamed-electric mass buildup by fixed-point iteration `#(verify)`.
-
-    The point that dooms battery-electric aviation — hours of stored energy at
-    ~250 Wh/kg — does NOT apply here: energy arrives continuously, so the battery is
-    only a *buffer* (minutes; the real reserve is the glide, L/D·Δh). MTOW closes on
-    itself: structure & systems scale with MTOW, the motor with the peak (climb)
-    power that mass demands, the buffer battery with the cruise power. Contrast a
-    fuel burner, whose ~40% takeoff fuel inflates MTOW and hence structure — remove
-    it and the whole aircraft shrinks. Returns component masses (t), MTOW, powers."""
+    """Fixed-point mass loop: structure and systems scale with MTOW, motors with peak power,
+    battery with `buffer_minutes` of cruise power (the beam-dropout reserve). Iterates from
+    2x payload until MTOW moves less than `tol` kg. Masses out in tonnes, power in MW."""
     payload = payload_t * 1e3
     rectenna = rectenna_mass_t * 1e3
     mtow = payload * 2.0
@@ -241,10 +243,9 @@ def mass_buildup(payload_t=40.0, speed_ms=250.0, lift_to_drag=BEAMED_LIFT_TO_DRA
 
 def silhouette_area_m2(semi_span_m, semi_length_m, semi_thickness_m,
                        elevation_deg, azimuth_deg=0.0):
-    """Orthogonal silhouette (shadow) area of a BWB approximated as an ellipsoid with
-    semi-axes (span, length, thickness), viewed from `elevation_deg` above the wing
-    plane and `azimuth_deg` around it (0 = nose-on, 90 = side-on). Exact for an
-    ellipsoid: A = π·√((b·c·nx)² + (c·a·ny)² + (a·b·nz)²)."""
+    """Exact projected area of a triaxial ellipsoid viewed along (elevation, azimuth). The
+    ellipsoid picture used in the narrative figures; no relation to the meshed silhouette path in
+    bwb_model, and nothing routes between them. Azimuth 0 looks along the fuselage."""
     a, b, c = semi_span_m, semi_length_m, semi_thickness_m
     el, az = np.radians(elevation_deg), np.radians(azimuth_deg)
     nx = np.cos(el) * np.sin(az)     # span-ward
@@ -254,10 +255,8 @@ def silhouette_area_m2(semi_span_m, semi_length_m, semi_thickness_m,
 
 
 def effective_rectenna_radius_m(planform_radius_m, elevation_deg):
-    """Effective radius of a flat belly rectenna seen by an emitter at elevation ε:
-    projected area ∝ sin ε (cosine law off the nadir), so radius ∝ √(sin ε). Full
-    value directly overhead (ε=90°); it collapses toward the grazing pass — i.e. the
-    beam-budget r_r ≈ 20 m holds only near nadir."""
+    """Equal-area radius of a flat circular rectenna seen at the given elevation: the
+    projected area is pi*r^2*sin(el), hence the square root."""
     return planform_radius_m * np.sqrt(np.sin(np.radians(elevation_deg)))
 
 
@@ -272,10 +271,12 @@ def flight_hours(route_km=5500.0, speed_ms=250.0):
     return route_km * 1e3 / speed_ms / 3600.0
 
 
-# Delivery-chain efficiencies, grid busbar → rectenna DC output (#(verify)):
-ETA_GRID_TO_RF = 0.55    # AC→DC→RF at the station (GaN PA-dominated, ~40-60% observed)
-ETA_BEAM = 0.80          # transmit aperture → captured at rectenna (atmos + spillover + geometry)
-ETA_RECTENNA = 0.80      # RF→DC rectification (~72-82% demonstrated)
+# --- efficiency chain ------------------------------------------------------------------
+
+ETA_GRID_TO_RF = 0.55
+ETA_BEAM = 0.80       # placeholder for the beam-link engine's computed eta; feeding flyby's
+                      # per-pass eta into econ_comparison in its place is the tracked next step
+ETA_RECTENNA = 0.80
 
 
 def delivery_efficiency(eta_grid_to_rf=ETA_GRID_TO_RF, eta_beam=ETA_BEAM,
@@ -294,8 +295,8 @@ def delivery_efficiency(eta_grid_to_rf=ETA_GRID_TO_RF, eta_beam=ETA_BEAM,
 # rectenna; Ka-band ~40% PAE / ~72% rectenna).
 
 def pae_dc_to_rf(frequency_ghz):
-    """GaN power-amplifier PAE vs frequency, CW/saturated (beaming needs no linearity).
-    Linear between anchors (5.8 GHz → 0.65, 34.8 GHz → 0.40), clipped to a sane band."""
+    """Transmitter power-added efficiency, straight line through 0.65 at 5.8 GHz and 0.40 at
+    34.8 GHz (the band edges used throughout)."""
     slope = (0.40 - 0.65) / (34.8 - 5.8)
     return float(np.clip(0.65 + slope * (frequency_ghz - 5.8), 0.30, 0.72))
 
@@ -306,8 +307,7 @@ def eta_grid_to_rf_band(frequency_ghz, eta_ac_dc=0.98):
 
 
 def rectenna_efficiency_band(frequency_ghz):
-    """RF→DC Schottky rectenna efficiency; ~0.80 demonstrated at 5.8 GHz, lower and
-    less mature at Ka. Anchors (5.8 → 0.80, 34.8 → 0.72)."""
+    """Rectenna RF-to-DC efficiency, same band-edge interpolation: 0.80 at 5.8, 0.72 at 34.8."""
     slope = (0.72 - 0.80) / (34.8 - 5.8)
     return float(np.clip(0.80 + slope * (frequency_ghz - 5.8), 0.65, 0.82))
 
@@ -319,6 +319,8 @@ def emitter_diameter_m(frequency_ghz, slant_km, rectenna_radius_m=20.0, tau_targ
     return 2.0 * required_emitter_radius(frequency_ghz * 1e9, slant_km * 1e3,
                                          rectenna_radius_m, tau_target)
 
+
+# --- economics -------------------------------------------------------------------------
 
 def energy_cost_per_flight(cruise_mw, route_km=5500.0, speed_ms=250.0,
                            electricity_usd_per_mwh=30.0, eta_delivery=None):
@@ -339,10 +341,8 @@ def fuel_cost_per_flight(fuel_tonnes=37.0, fuel_usd_per_tonne=850.0):
 
 
 def station_spacing_km(aircraft_alt_km=11.0, min_elevation_deg=15.0):
-    """Along-track spacing that keeps the aircraft above `min_elevation_deg` from the
-    nearest station: 2·h/tan(ε). Low ε → wide spacing (few stations) but long slant
-    path and collapsed rectenna aperture (√sin ε); high ε → many stations. This single
-    knob dominates station count, and station count dominates the economics."""
+    """Along-track window in which one station stays above `min_elevation_deg`, flat earth:
+    the aircraft is in view for alt/tan(el) either side of overhead."""
     return 2.0 * aircraft_alt_km / np.tan(np.radians(min_elevation_deg))
 
 
@@ -352,7 +352,7 @@ def station_count(route_km=5500.0, aircraft_alt_km=11.0, min_elevation_deg=15.0)
 
 
 def capital_recovery_factor(rate=0.08, years=25):
-    """Annual fraction of a capex to recover principal + interest over `years`."""
+    """Annual payment per unit of capital that amortises it over `years` at `rate`."""
     r = rate
     return r * (1 + r) ** years / ((1 + r) ** years - 1)
 
@@ -365,15 +365,13 @@ def capital_recovery_factor(rate=0.08, years=25):
 # packing: ~2 (one boosting + one coasting) is "minimum-slack" operation.
 
 def corridor_throughput_per_day(airborne_per_station, n_stations, transit_h):
-    """Flights/day the corridor delivers: a fleet of (airborne_per_station·n) planes,
-    each clearing the corridor in transit_h, completes at fleet/transit rate."""
+    """Flights per day the corridor sustains: aircraft in the air at once, over transit time."""
     return airborne_per_station * n_stations / transit_h * 24.0
 
 
 def boost_power_mw(cruise_mw, powered_fraction=0.5):
-    """Instantaneous power a plane must receive while boosting: it takes on all of a
-    cycle's energy during the powered fraction φ, so boost = cruise/φ (the glide returns
-    the climbed potential energy). φ≈0.5 is the one-boost/one-coast sawtooth."""
+    """Beam power needed if the aircraft is only illuminated for part of a climb-glide cycle
+    but must average cruise power over the whole of it."""
     return cruise_mw / powered_fraction
 
 
@@ -388,20 +386,14 @@ def station_capex_musd(deliver_mw, frequency_ghz=34.8, aircraft_alt_km=11.0,
                        min_elevation_deg=15.0, rectenna_radius_m=20.0, fixed_musd=50.0,
                        array_musd_per_rf_mw=2.5, supply_musd_per_grid_mw=1.2,
                        cooling_musd_per_waste_mw=1.0, aperture_musd_per_m2=0.005):
-    """Station cost, now frequency-aware, split by what drives each part:
-      fixed    — platform/siting (mid-ocean pain; exists regardless of power);
-      array    — T/R modules ∝ RF power (element COUNT is ~frequency-invariant);
-      supply   — power provisioning ∝ grid draw (worse at low PAE);
-      cooling  — heat rejection ∝ station waste heat (worse at low PAE → high freq);
-      aperture — structure/platform ∝ EMITTER AREA ∝ λ² (worse at low freq).
-    This makes the aperture penalty (favours high f) fight the PAE/thermal penalty
-    (favours low f). Returns a dict. #(verify) coefficients."""
+    """Cost of one ground station able to deliver `deliver_mw` onboard, working the chain
+    backwards to RF and grid power and charging for array, supply, cooling and aperture."""
     eta_rect = rectenna_efficiency_band(frequency_ghz)
     eta_grid_rf = eta_grid_to_rf_band(frequency_ghz)
     rf_mw = deliver_mw / (ETA_BEAM * eta_rect)
     grid_mw = rf_mw / eta_grid_rf
     waste_mw = grid_mw - rf_mw
-    slant_km = aircraft_alt_km / np.sin(np.radians(min_elevation_deg))
+    slant_km = aircraft_alt_km / np.sin(np.radians(min_elevation_deg))  # worst-case range
     emitter_diam = emitter_diameter_m(frequency_ghz, slant_km, rectenna_radius_m)
     aperture_area_m2 = np.pi * (emitter_diam / 2) ** 2
     musd = (fixed_musd + array_musd_per_rf_mw * rf_mw + supply_musd_per_grid_mw * grid_mw
@@ -437,10 +429,12 @@ def econ_comparison(cruise_mw=None, route_km=5500.0, speed_ms=250.0,
                     frequency_ghz=34.8, airborne_per_station=2.0, powered_fraction=0.5,
                     station_fixed_musd=50.0, beamed_aircraft_musd=100.0,
                     fossil_aircraft_musd=150.0, flights_per_year=500.0):
-    """Per-flight cost difference on the terms that diverge, with the operating concept
-    AND the frequency tradeoff baked in: PAE(f) and rectenna η(f) set the delivery
-    efficiency (→ energy) and station heat/supply, while emitter aperture ∝ λ² sets a
-    station structure cost. `verdict_usd` = beamed − fossil (neg = win)."""
+    """Per-flight cost of a beamed corridor against a fossil aircraft, USD.
+
+    Only the terms that differ between the two are counted (energy, aircraft ownership,
+    beam infrastructure), so the totals are not full operating costs and only
+    `verdict_usd` = beamed - fossil is meaningful.
+    """
     if cruise_mw is None:
         cruise_mw = mass_buildup()["cruise_mw"]
     n = station_count(route_km, aircraft_alt_km, min_elevation_deg)
@@ -531,10 +525,11 @@ def econ_sensitivity():
     return pd.DataFrame(rows, columns=["lever", "value", "n_stations", "per_day", "verdict_usd"])
 
 
-# --- Pass geometry & dwell ----------------------------------------------------
+# --- pass geometry (flat earth) --------------------------------------------------------
 
 def pass_geometry(plane_alt_m, station_alt_m, alongtrack_m, lateral_offset_m=0.0):
-    """Projected-area FRACTIONS (=beam direction cosines) for belly/sail/frontal surfaces."""
+    """(slant m, elevation deg, then the three direction cosines of the beam in body axes:
+    belly, side and frontal). The cosines say which face of the aircraft the beam sees."""
     height_gap = plane_alt_m - station_alt_m
     slant = np.sqrt(alongtrack_m**2 + lateral_offset_m**2 + height_gap**2)
     elevation = np.degrees(np.arcsin(height_gap / slant))
@@ -542,10 +537,7 @@ def pass_geometry(plane_alt_m, station_alt_m, alongtrack_m, lateral_offset_m=0.0
 
 
 def dwell_seconds(speed_ms, plane_alt_m, station_alt_m, lateral_offset_m, max_slant_m):
-    """Seconds in usable range (slant < max_slant) as the plane transits at cruise speed.
-
-    Zero if the closest approach already exceeds max_slant.
-    """
+    """Time inside a maximum slant range; 0 if the closest approach is already outside it."""
     fixed = (plane_alt_m - station_alt_m) ** 2 + lateral_offset_m**2
     if fixed >= max_slant_m**2:
         return 0.0
@@ -553,17 +545,21 @@ def dwell_seconds(speed_ms, plane_alt_m, station_alt_m, lateral_offset_m, max_sl
     return 2.0 * half_window / speed_ms
 
 
-# --- Tether: strength vs buoyancy vs emitter mass -----------------------------
+# --- tethered aerostat relay -----------------------------------------------------------
 
 def air_density(altitude_m):
+    """Isothermal exponential atmosphere, kg/m^3."""
     return RHO_AIR_SEA * np.exp(-altitude_m / SCALE_HEIGHT)
 
 
 def breaking_length_km(sigma_pa, density_kgm3, safety_factor=1.0):
+    """Length of its own material a cable can hang before failing -- the figure of merit
+    for whether a tether to a given altitude is possible at all."""
     return sigma_pa / (density_kgm3 * GRAVITY * safety_factor) / 1e3
 
 
 def net_lift_per_m3(altitude_m, gas="hydrogen"):
+    """Buoyant lift in kg per m^3 of envelope at altitude (displaced air minus the gas)."""
     return air_density(altitude_m) * (1.0 - GAS_FRACTION[gas])
 
 
@@ -572,6 +568,8 @@ def emitter_mass_t(aperture_diam_m, areal_density_kgm2):
 
 
 def aerostat_diameter_m(altitude_m, cable_kg_per_m, payload_kg, gas="hydrogen"):
+    """Diameter of the sphere whose buoyancy at `altitude_m` just carries payload plus the
+    full length of cable. Envelope mass is ignored here (`tether_blowover` includes it)."""
     total_mass = cable_kg_per_m * altitude_m + payload_kg
     volume = total_mass / net_lift_per_m3(altitude_m, gas)
     return (6.0 * volume / np.pi) ** (1 / 3)
@@ -580,15 +578,13 @@ def aerostat_diameter_m(altitude_m, cable_kg_per_m, payload_kg, gas="hydrogen"):
 # --- Curvature, wind, and tether blow-over ------------------------------------
 
 def line_of_sight_km(alt1_m, alt2_m, earth_radius_m=6.371e6):
-    """Geometric line-of-sight range between two altitudes over a spherical Earth:
-    √(2R·h1)+√(2R·h2). Caps ground-station reach; quantifies the reach benefit of a relay."""
+    """Geometric horizon-to-horizon range between two altitudes, no refraction."""
     return (np.sqrt(2 * earth_radius_m * alt1_m) + np.sqrt(2 * earth_radius_m * alt2_m)) / 1e3
 
 
 def wind_profile(altitude_m, v_jet=40.0, v_strato=20.0, v_surface=8.0,
                  jet_center_m=11000.0, jet_sigma_m=2500.0):
-    """Stylized wind speed vs altitude: a Gaussian jet-stream bump at the tropopause over a
-    background rising from surface to stratosphere. Napkin only — real profiles vary widely."""
+    """Wind speed m/s: a Gaussian jet stream over a surface-to-stratosphere ramp."""
     jet = v_jet * np.exp(-0.5 * ((altitude_m - jet_center_m) / jet_sigma_m) ** 2)
     background = v_surface + (v_strato - v_surface) * np.clip(altitude_m / 20000.0, 0, 1)
     return np.maximum(jet, background)
@@ -597,18 +593,23 @@ def wind_profile(altitude_m, v_jet=40.0, v_strato=20.0, v_surface=8.0,
 def tether_blowover(aerostat_diam_m, payload_kg, target_alt_m=20000.0, gas="hydrogen",
                     v_jet=40.0, v_strato=20.0, v_surface=8.0, tether="Dyneema (UHMWPE)",
                     safety_factor=2.0, cd_cable=1.1, cd_sphere=0.5, envelope_kgm2=0.15, steps=800):
-    """Static blow-over of a tethered stratospheric aerostat under a wind profile.
+    """Static tether shape for a moored aerostat in a wind profile.
 
-    Net buoyancy/free lift tensions the cable; the aerostat's bluff-body drag plus the tether's
-    distributed drag tilt it. Returns free lift, the two drag terms, tilt at the anchor, downwind
-    excursion, the altitude actually reached on a target-length cable, and the breaking/peak-tension
-    margin. STATIC only — no vortex-induced vibration, gusts, or dynamics (the real open risk).
+    Walks up the cable accumulating the drag carried above each height; the local tilt from
+    vertical follows the ratio of horizontal to vertical tension. `excursion` is the downwind
+    displacement of the aerostat, `tension_margin` the cable's breaking load over the peak
+    tension it actually sees.
+
+    `altitude_reached_km` is meant to be the height reached when the *cable length* is held at
+    target_alt_m. KNOWN BUG, not fixed here: the expression applies the tilt penalty twice, and
+    for constant tilt evaluates to H*cos^2(tilt) where H*cos(tilt) is wanted -- 1.4% low at the
+    default wind, ~9% at a 160 m/s jet. Nothing in the tree calls this function.
     """
     sigma, rho_cable = TETHER_MATERIALS[tether]
     volume = np.pi / 6 * aerostat_diam_m ** 3
     gross_lift = volume * net_lift_per_m3(target_alt_m, gas) * GRAVITY          # net-of-gas lift, N
     envelope_mass = np.pi * aerostat_diam_m ** 2 * envelope_kgm2
-    cable_diam = 2 * np.sqrt(gross_lift * safety_factor / sigma / np.pi)
+    cable_diam = 2 * np.sqrt(gross_lift * safety_factor / sigma / np.pi)  # sized on lift alone
     cable_weight_per_m = rho_cable * np.pi * (cable_diam / 2) ** 2 * GRAVITY
     cable_mass = cable_weight_per_m / GRAVITY * target_alt_m
     free_lift = gross_lift - GRAVITY * (payload_kg + envelope_mass + cable_mass)
@@ -616,14 +617,19 @@ def tether_blowover(aerostat_diam_m, payload_kg, target_alt_m=20000.0, gas="hydr
     dh = h[1] - h[0]
     v = wind_profile(h, v_jet, v_strato, v_surface)
     drag_per_len = 0.5 * air_density(h) * v ** 2 * cd_cable * cable_diam
-    drag_above = np.cumsum(drag_per_len[::-1])[::-1] * dh                       # drag from h up to top
+    drag_above = np.cumsum(drag_per_len[::-1])[::-1] * dh  # cable drag above each height
     v_top = wind_profile(np.array([target_alt_m]), v_jet, v_strato, v_surface)[0]
     aero_drag = 0.5 * air_density(target_alt_m) * v_top ** 2 * cd_sphere * (np.pi / 4 * aerostat_diam_m ** 2)
     tension_x = aero_drag + drag_above
+    # (target_alt_m - h) is the cable ABOVE h, which is what the vertical tension at h supports,
+    # so tension_z is smallest at the anchor and the tilt largest there. SECOND KNOWN BUG, not
+    # fixed here: free_lift has already netted out the whole cable weight, so subtracting the
+    # cable above h again leaves tension_z low by one full cable weight at every height, which
+    # over-tilts the entire profile.
     tension_z = free_lift - cable_weight_per_m * (target_alt_m - h)
     tilt = np.clip(np.arctan2(tension_x, np.maximum(tension_z, 1.0)), 0, np.radians(88))
     excursion = np.trapezoid(np.tan(tilt), h)
-    arc = np.trapezoid(1.0 / np.cos(tilt), h)
+    arc = np.trapezoid(1.0 / np.cos(tilt), h)  # deployed cable length for this tilt profile
     tension = np.sqrt(tension_x ** 2 + tension_z ** 2)
     return dict(free_lift_t=free_lift / GRAVITY / 1e3, aero_drag_kn=aero_drag / 1e3,
                 tether_drag_kn=drag_above[0] / 1e3, tilt_deg=np.degrees(tilt[0]),
@@ -633,12 +639,11 @@ def tether_blowover(aerostat_diam_m, payload_kg, target_alt_m=20000.0, gas="hydr
 
 
 def station_keeping_power_mw(horizontal_force_n, wind_ms, eta=0.6):
-    """Power to hold station against a steady wind = thrust·wind/η, and thrust = the horizontal
-    drag → the power scales as wind³. Must be delivered aloft. η optimistic for thin-air props."""
+    """Propulsive power to hold position against a drag force in wind (free-flying relay)."""
     return horizontal_force_n * wind_ms / eta / 1e6
 
 
-# --- Tables & figure ----------------------------------------------------------
+# --- tables and figures ----------------------------------------------------------------
 
 def emitter_table():
     rows = [("baseline 5.8 GHz", 5.8, 300, 20), ("30 GHz", 30.0, 300, 25),

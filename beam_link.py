@@ -1,34 +1,15 @@
-"""Beam-link engine for microwave-powered aviation.
+"""End-to-end efficiency of a microwave power link from a ground station (or a relay) to an
+aircraft, and the pass/corridor sweeps built on it.
 
-Given the 3-D positions and orientations of a ground/sea STATION, an optional
-RELAY, and the PLANE, plus the link frequencies and the delivered power the plane
-needs, this computes the end-to-end power-transfer efficiency and the grid power a
-station must draw — tracing every loss in the chain so the physics can be audited
-stage by stage. Everything is vectorized: pass numpy arrays for any input to sweep.
+Positions are (downrange_m, crossrange_m, altitude_m) triples, converted to earth-frame
+cartesian by geo.point. Every "efficiency" here is a dimensionless factor in a single
+multiplicative chain; `evaluate` returns the factors and their product, and `waterfall`
+lists them in the order they apply.
 
-The chain (grid busbar → shaft-input DC at the plane):
-
-  grid ──DC→RF (PAE)──▶ emitter aperture (errors, scan) ──▶ radiated RF
-       ──atmosphere (gas+rain+cloud)──▶ ──near-field capture τ──▶ RF on receiver
-       ──[relay: rx-capture · convert · re-emit]──▶ ──atmosphere──▶ capture
-       ──rectenna: RF→DC · silhouette-match · incidence · polarization──▶ delivered
-
-Two architectures, chosen by `relay=None` (direct) or a relay position:
-  • direct   station → plane at f_emit_plane
-  • relayed  station → relay at f_emit_relay, then relay → plane at f_relay_plane
-    with the relay either an ACTIVE frequency-converting repeater (default) or a
-    PASSIVE reflectarray (then f_relay_plane is forced equal to f_emit_relay).
-Direct and relayed are ALTERNATIVES — the engine evaluates whichever you ask for;
-`best_path()` runs both and picks the better under the given weather.
-
-Physical models are #(verify)-grade and reuse napkin.py wherever it already has the
-relation. Near-field capture is the real 2-D overlap of the emitter's SCALAR-DIFFRACTION
-field (diffraction.py — exact Fresnel optics of the focused finite aperture, sidelobes and
-main-lobe power cap included) with the self-occluded airframe silhouette; sidelobe power
-that misses the airframe is a counted loss. Atmospheric absorption is
-integrated from the ITU-R standard-atmosphere table built by
-generate_atmosphere_profile.py; rain/cloud are layered on per weather scenario.
+Layers: Atmosphere (table lookup) -> per-stage efficiency terms -> spot/silhouette overlap
+(via diffraction + bwb_model) -> architectures -> pass and corridor sweeps -> reporting.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -44,10 +25,9 @@ from bwb_model import (BWBSilhouette, beta_alpha_from_enu, direction_from_beta_a
                        get_mesh, rasterize_silhouette_zbuffer)
 
 
-# --- Weather scenarios --------------------------------------------------------
-# rain_rate mm/h, rain_top m (melting layer), cloud liquid-water g/m³ over a band.
-# #(verify) representative values; "stratospheric" is implicit — any path segment
-# above the rain/cloud bands and the (dry) tropopause simply picks up ~nothing.
+# Weather presets. Rain fills everything below rain_top_m at a uniform rate; cloud fills
+# the altitude band at a uniform liquid water content. Rain rates are the usual
+# light/heavy/storm brackets (mm/h) and the layer tops rise with intensity.
 WEATHER = {
     "clear":      dict(rain_rate_mmh=0.0,  rain_top_m=0.0,    cloud_lwc_gm3=0.0, cloud_band_m=(0.0, 0.0)),
     "cloudy":     dict(rain_rate_mmh=0.0,  rain_top_m=0.0,    cloud_lwc_gm3=0.5, cloud_band_m=(1000.0, 3000.0)),
@@ -60,27 +40,22 @@ WEATHER = {
 # --- Atmosphere ---------------------------------------------------------------
 
 class Atmosphere:
-    """Path attenuation from the altitude-resolved ITU-R absorption table.
-
-    Gaseous, rain, and cloud losses are integrated along the actual (curved) slant
-    path sampled by geo.sample_altitudes: at each point the altitude above the sphere
-    sets the local specific attenuation, so the 'surface falls away' effect and the
-    stratospheric dry-out are intrinsic. All methods are vectorized over the batch and
-    over frequency."""
+    """Path loss from a precomputed profile: gaseous specific attenuation on an
+    (altitude, frequency) grid plus a frequency-only cloud coefficient."""
 
     def __init__(self, path="data/atmosphere_profile.npz"):
         p = Path(path) if Path(path).is_absolute() else Path(__file__).parent / path
         d = np.load(p)
-        self.freq = d["frequency_ghz"]            # (Nf,)
-        self.alt = d["altitude_m"]                # (Nh,)
-        self.gamma = d["gamma_gas_db_km"]         # (Nh, Nf) specific gaseous atten
-        self.kl = d["cloud_kl_db_km_per_gm3"]     # (Nf,) cloud liquid coeff
+        self.freq = d["frequency_ghz"]          # GHz
+        self.alt = d["altitude_m"]              # m
+        self.gamma = d["gamma_gas_db_km"]       # dB/km, indexed [altitude, frequency]
+        self.kl = d["cloud_kl_db_km_per_gm3"]   # dB/km per g/m^3 of liquid water
 
     def _bilinear_alt_freq(self, table, freq_ghz, altitude_m):
         """Bilinear interp of a (Nh, Nf) table at (altitude, freq); broadcasts."""
         f, h = np.broadcast_arrays(np.asarray(freq_ghz, dtype=float),
                                    np.asarray(altitude_m, dtype=float))
-        h = np.clip(h, self.alt[0], self.alt[-1])
+        h = np.clip(h, self.alt[0], self.alt[-1])  # hold the top row above the table (30 km)
         fi = np.clip(np.searchsorted(self.freq, f) - 1, 0, self.freq.size - 2)
         hi = np.clip(np.searchsorted(self.alt, h) - 1, 0, self.alt.size - 2)
         f0, f1 = self.freq[fi], self.freq[fi + 1]
@@ -94,10 +69,11 @@ class Atmosphere:
         return np.interp(np.asarray(freq_ghz, dtype=float), self.freq, self.kl)
 
     def path_loss_db(self, freq_ghz, from_ecef, to_ecef, weather="clear", n_path=64):
-        """Total path attenuation (dB) integrated along the curved slant path."""
-        alt, ds = geo.sample_altitudes(from_ecef, to_ecef, n_path)      # (...,n), (...)
+        """One-way loss in dB along the straight path, integrated over the altitudes it
+        crosses. Vectorised over frequency (add an axis) as well as over endpoints."""
+        alt, ds = geo.sample_altitudes(from_ecef, to_ecef, n_path)
         f = np.asarray(freq_ghz, dtype=float)
-        f_col = f[..., None] if f.ndim else f
+        f_col = f[..., None] if f.ndim else f  # broadcast frequency against the path samples
         ds_km = ds / 1e3
 
         gamma = self._bilinear_alt_freq(self.gamma, f_col, alt)          # (...,n) dB/km
@@ -106,9 +82,11 @@ class Atmosphere:
         w = WEATHER[weather] if isinstance(weather, str) else weather
         rain = np.zeros_like(gaseous)
         if w["rain_rate_mmh"] > 0:
-            # circular pol (tilt 45°) → P.838 coeffs elevation-independent
+            # 45 deg tilt = circular polarisation, so k and alpha are the H/V mean
             k, a = napkin.rain_coefficients(f, elevation_deg=90.0, polarization_tilt_deg=45.0)
-            specific = napkin.specific_rain_attenuation(w["rain_rate_mmh"], k, a)   # dB/km
+            specific = napkin.specific_rain_attenuation(w["rain_rate_mmh"], k, a)
+            # count whole steps with both ends in the layer: quantises the wet path length
+            # to ds and biases it low by up to one step
             seg_in = (alt[..., 1:] < w["rain_top_m"]) & (alt[..., :-1] < w["rain_top_m"])
             rain = specific * np.sum(seg_in, axis=-1) * ds_km
         cloud = np.zeros_like(gaseous)
@@ -155,27 +133,30 @@ def _to_ecef(pos):
 
 
 def geometry(from_pos, to_pos):
-    """Slant range (m), elevation of `to` above `from`'s local horizon (deg), and the
-    from→to unit direction expressed in `from`'s LOCAL ENU. Spherical earth."""
+    """(slant m, elevation deg, unit direction in `from`'s local ENU) for a position pair."""
     a, b = _to_ecef(from_pos), _to_ecef(to_pos)
     slant, elevation = geo.link(a, b)
     return slant, elevation, geo.direction_in_local_enu(a, b)
 
 
-# --- Emitter / rectenna / relay efficiency pieces -----------------------------
+# --- per-stage efficiency terms ---------------------------------------------------------
 
 def emitter_aperture_efficiency(scan_deg=0.0, error_efficiency=0.95, scan_rolloff=1.2):
-    """Aperture efficiency beyond the optimal near-field taper (already in the
-    Goubau capture law): random phase/amplitude errors (Ruze, lumped into
-    `error_efficiency`) × electronic scan loss ∝ cos(scan)^rolloff when steering off
-    the array boresight (0 for a mechanically-pointed aperture)."""
+    """Illumination/phase-error efficiency of the emitter, times a cos^p roll-off for steering
+    off array boresight.
+
+    OPEN: every call site passes scan_deg=0, which is only correct for a mechanically-pointed
+    aperture -- and the baseline emitter is a phased array, so this is an unjustified omission
+    rather than a modelled choice. It flatters the low-elevation ends of a pass, where the scan
+    angle is largest. `scan_rolloff = 1.2` has no derivation on record either.
+    """
     scan = np.clip(np.cos(np.radians(scan_deg)), 0.0, 1.0) ** scan_rolloff
     return error_efficiency * scan
 
 
 def polarization_efficiency(polarization="circular", roll_deg=0.0, axial_ratio_loss=0.95):
-    """Circular pol: orientation-robust, a flat axial-ratio penalty. Linear pol:
-    cos²(roll) mismatch as the airframe banks relative to the beam's E-field."""
+    """Circular polarisation pays a fixed axial-ratio penalty but is roll-independent;
+    anything else is treated as linear and loses cos^2 of the aircraft roll."""
     if polarization == "circular":
         return np.full_like(np.asarray(roll_deg, dtype=float), axial_ratio_loss) if np.ndim(roll_deg) else axial_ratio_loss
     return np.cos(np.radians(roll_deg)) ** 2
@@ -183,24 +164,15 @@ def polarization_efficiency(polarization="circular", roll_deg=0.0, axial_ratio_l
 
 def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
                     spot_match=0.90, incidence_floor=0.70):
-    """The whole receive-side derate on a fully-conformal rectenna, folded into one
-    factor (each piece can only LOWER efficiency, per the design brief):
-
-      RF→DC(f)  · spot_match · incidence(β) · polarization
-
-    • RF→DC(f)   Schottky-rectifier conversion, from napkin's frequency band.
-    • spot_match how well a shaped beam fills the (irregular) silhouette + soft-edge
-                 (beam-edge) taper — a single settable overlap efficiency.
-    • incidence  off-normal incidence over the curved skin detunes elements; mild
-                 roll-off with β (angle from belly): 1 overhead → `incidence_floor`
-                 edge-on. (The area foreshortening itself is already in the
-                 silhouette, so this is only the impedance/scan penalty on top.)
-    • polarization  see polarization_efficiency."""
+    """Lumped receive-side derate -- the closed-form alternative to the raster overlap below,
+    superseded by it and not called by `evaluate`. Its `incidence_floor=0.70` is the fixed-patch
+    rectenna value, left behind when this stopped being called; the live default is 0.90."""
     conv = napkin.rectenna_efficiency_band(freq_ghz) if np.ndim(freq_ghz) == 0 else \
         np.array([napkin.rectenna_efficiency_band(f) for f in np.atleast_1d(freq_ghz)]).reshape(np.shape(freq_ghz))
     # Fold topside (β>90) onto the equivalent belly angle — the airframe is
     # symmetric, so a beam 47° off the top normal is as good as 47° off the belly.
     beta_folded = np.where(np.asarray(beta_deg) > 90.0, 180.0 - np.asarray(beta_deg), beta_deg)
+    # cos-weighted between full efficiency face-on and `incidence_floor` edge-on
     incidence = incidence_floor + (1.0 - incidence_floor) * np.cos(np.radians(beta_folded))
     pol = polarization_efficiency(polarization, roll_deg)
     return conv * spot_match * incidence * pol, dict(rf_to_dc=conv, spot_match=spot_match,
@@ -208,30 +180,24 @@ def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
 
 
 def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
-    """1/e² intensity waist of a focused aperture at range D: w = √2·λ·D/(π·r_t).
+    """Gaussian 1/e^2 waist inflated by sqrt(2) over the true delivered radius lambda*L/(pi*a).
 
-    Chosen so that a ROUND spot on a uniform round rectenna of radius r_r reproduces
-    the Goubau capture 1−e^(−τ²) exactly (τ = π·r_t·r_r/(λD)) — the overlap model is a
-    strict generalisation of the near-field coupling law to real silhouette shapes."""
+    That factor is exactly what makes a round Gaussian spot on a round rectenna of radius r_r
+    reproduce the Goubau law: 1 - exp(-2*r_r^2/w^2) == 1 - exp(-tau^2), identically. So this is a
+    coupling proxy from the pre-diffraction model, not a field radius, and the only caller left
+    is `test_gaussian_beam`. `stages["spot_waist_m"]` is `effective_waist`, a different measure.
+    """
     return np.sqrt(2.0) * wavelength_m * slant_m / (np.pi * np.maximum(emitter_radius_m, 1e-6))
 
 
 def gaussian_beam_radius(z_m, aperture_radius_m, wavelength_m, focus_range_m):
-    """Physically exact 1/e² field radius w(z) of a Gaussian beam radiating from an aperture of
-    1/e² radius `aperture_radius_m`, phase-conjugated to focus at range `focus_range_m` (a
-    converging wavefront, curvature −focus_range at the aperture plane z=0). Exact ABCD /
-    q-parameter propagation:
+    """Gaussian beam of waist `aperture_radius_m` at the aperture, focused at `focus_range_m`.
 
-        zR = π·a²/λ ;  u = L/zR ;  w0 = a·u/√(1+u²) ;  z_waist = L/(1+u²) ;  zR' = π·w0²/λ
-        w(z) = w0·√(1 + ((z − z_waist)/zR')²)
-
-    The beam fills the aperture at z=0 (w(0)=a), converges to a diffraction-limited waist w0 at
-    z_waist ≤ L, and diverges beyond it. Vectorized in z; returns (w(z), w0, z_waist).
-
-    Relationship to `focused_spot_waist`: the spot delivered AT the target is w(L)=λ·L/(π·a) —
-    a factor √2 SMALLER than `focused_spot_waist`, which is deliberately inflated by √2 so the
-    round-spot OVERLAP reproduces the Goubau near-field COUPLING law (a coupling proxy, not the
-    literal field). Use THIS for the true beam geometry; `focused_spot_waist` for capture."""
+    Returns (radius at z_m, waist radius, range at which the waist forms). Standard
+    thin-lens result: with u = L/zR the waist shrinks to a*u/sqrt(1+u^2) and forms short of
+    the nominal focus, at L/(1+u^2). Reference model only -- the link budget uses the
+    diffraction integrals instead.
+    """
     a = float(aperture_radius_m)
     lam = float(wavelength_m)
     L = max(float(focus_range_m), 1e-9)
@@ -245,10 +211,9 @@ def gaussian_beam_radius(z_m, aperture_radius_m, wavelength_m, focus_range_m):
 
 
 def effective_waist(peak_intensity):
-    """Report-only Gaussian-equivalent 1/e² waist of a field with peak areal intensity
-    `peak_intensity` (fraction of radiated power per m²): the waist a Gaussian spot of unit
-    power would need to have the SAME peak, w = 1/√(π·peak). The diffraction field has no
-    single waist; this is a convenience scalar for logging and the density bookkeeping."""
+    """Single length scale for a spot of any shape: the radius of the uniform disc that would
+    carry all the power at the observed peak intensity (pi*r^2*I_peak = 1). Takes the
+    unit-power normalised intensity from `diffraction`, so 1/m^2 in, m out."""
     return float(1.0 / np.sqrt(np.pi * peak_intensity)) if peak_intensity > 0 else np.inf
 
 
@@ -256,42 +221,37 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
                     incidence_floor=0.90, aspect_cap=8.0, taper_p=0.0,
                     focus_range_m=None, pointing_offset_m=0.0, fixed_aspect=None,
                     n_grid=384, return_field=False):
-    """Capture as the 2-D overlap of the emitter's SCALAR-DIFFRACTION field with the true
-    (self-occluded) silhouette — a Monte-Carlo integral over the visible surface samples.
+    """Fraction of radiated power the aircraft silhouette actually intercepts.
 
-    The field in the target plane is computed exactly from the focused aperture
-    (`diffraction.plane_intensity`): a main lobe carrying <100 % of the radiated power plus
-    sidelobe rings, power-normalised to ∫∫ I dA = 1. Each visible sample covers `proj_area`
-    of the view plane, so intercepted fraction = Σ I·proj_area — and sidelobe power that
-    misses the airframe is a real, counted loss. No effective-spot (√2) calibration.
+    Integrates the diffracted intensity over the receiver elements of a raster from
+    bwb_model. Returns (geometric capture, capture including the incidence derate, peak
+    intensity in 1/m^2), all per unit radiated power, so the first two are fractions <= 1.
 
-    A ROUND emitter paints an Airy-like round pattern; a SHAPED (elliptical phased-array)
-    emitter of the SAME AREA paints an elliptical pattern aligned to the silhouette — its
-    long aperture axis makes the NARROW spot axis (Fourier inverse). `taper_p` is the
-    aperture amplitude taper (0 = uniform → Airy, first sidelobe −17.6 dB; higher lowers the
-    sidelobes and widens the main lobe). `focus_range_m` (default = slant → focus on the
-    plane) shorter than the slant DEFOCUSES, spreading the spot for the W/m² density cap.
-    `pointing_offset_m` shifts the beam centre off the centroid (worst case, along the
-    silhouette minor axis) and re-integrates.
-
-    Returns:
-      geom  — fraction of radiated power intercepted by the airframe outline
-      eff   — same, weighted by the rectenna incidence response (floor + (1−floor)·cosθ)
-      peak  — peak areal intensity of the field (fraction of radiated power per m²), for
-              the density cap."""
+    With `shaped`, the emitter aperture is made elliptical and aligned with the silhouette:
+    the aperture is stretched along whichever direction the target is *narrow* in, because
+    spot width scales as 1/aperture width, giving a spot elongated the same way as the
+    target. `aspect_cap` bounds how far that is pushed.
+    """
     u, v, inc, proj = raster["u"], raster["v"], raster["incidence"], raster["proj_area"]
     focus = float(slant_m if focus_range_m is None else focus_range_m)
     if u.size == 0:
         empty = dict(u=u, v=v, beam=np.array([]), incidence=inc, proj_area=proj)
         return (0.0, 0.0, 0.0, empty) if return_field else (0.0, 0.0, 0.0)
 
+    # Rectenna angular response only -- the cos(theta) area foreshortening is already in
+    # proj_area. The 0.90 default is a conformal phased-array rectenna, whose elements re-phase
+    # toward the arrival angle and so keep most of their off-normal match; a fixed patch array
+    # would sit nearer 0.70.
     inc_eff = incidence_floor + (1.0 - incidence_floor) * inc
     # Principal axes of the silhouette (for the shaped-ellipse orientation AND the pointing
     # offset — a pointing error across the thin minor axis is the worst case).
     if u.size >= 3:
+        # principal axes of the silhouette, weighted by the area each element presents
         evals, evecs = np.linalg.eigh(np.cov(np.vstack([u, v]), aweights=np.maximum(proj, 1e-12)))
     else:
         evals, evecs = np.array([1.0, 1.0]), np.eye(2)
+    # eigh sorts ascending, so column 0 is the least-spread (narrow) direction. Offsetting
+    # the target along it is the worst case for a pointing error.
     minor_axis = evecs[:, 0]
     du, dv = pointing_offset_m * minor_axis[0], pointing_offset_m * minor_axis[1]
     pc = evecs.T @ np.vstack([u - du, v - dv])         # rows: [along minor, along major]
@@ -302,16 +262,13 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
         aspect = max(float(fixed_aspect), 1.0)
     else:                                               # adaptive: aspect = silhouette elongation
         aspect = float(np.clip(np.sqrt(max(evals[1], 1e-12) / max(evals[0], 1e-12)), 1.0, aspect_cap))
-    # Long aperture axis (along the diffraction grid's x) → narrow spot along x; the emitter
-    # is oriented so that narrow spot axis lands on the silhouette MINOR axis.
+    # aperture semi-axes at constant area: major along pc[0], the silhouette's narrow axis
     ap_major, ap_minor = emitter_radius_m * np.sqrt(aspect), emitter_radius_m / np.sqrt(aspect)
 
-    # Evaluate the focal intensity on a FINE grid MATCHED to the silhouette region (a direct separable
-    # zoom-DFT, `focal_intensity_grid`) and integrate the beam over the plane's area there — NOT the
-    # ±λz/d single-FFT window (`plane_intensity`), which spends its resolution on empty space and
-    # leaves the tiny focused spot only ~5 px across (undersampled → capture error). The zoom resolves
-    # the spot at the silhouette's own scale, so capture is the beam integrated over the silhouette
-    # pixels at high accuracy. grid x = spot minor ↔ pc[0]; grid y = spot major ↔ pc[1].
+    # Sampling grid spans the silhouette with 15% slack. The floors only stop it degenerating
+    # when the target subtends almost nothing; each axis takes 5% of the *conjugate* aperture
+    # semi-axis, which carries the same aspect scaling as the spot on that axis (the spot on x
+    # goes as 1/ap_major, i.e. aspect^-1/2, and so does ap_minor).
     rx = max(float(np.abs(pc[0]).max()), ap_minor * 0.05, 1.0) * 1.15
     ry = max(float(np.abs(pc[1]).max()), ap_major * 0.05, 1.0) * 1.15
     x_ax = np.linspace(-rx, rx, n_grid)
@@ -333,13 +290,10 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     return geom, eff, peak
 
 
-# --- Device-efficiency scenarios ---------------------------------------------
-# The DC→RF PAE falls with frequency partly from device physics (smaller high-band
-# devices, lower breakdown, more parasitic loss — a REAL floor) and partly from market
-# maturity (few efficient 10–30 GHz PAs today). We can't assume the physics away, but
-# the maturity gap could close, so treat the high-band PAE as a scenario. All three
-# share the SAME low-frequency anchor (0.65 @ 5.8 GHz — mature GaN/magnetron); only the
-# 34.8 GHz anchor moves, so the scenarios differ ONLY in the high-band slope. #(verify)
+# --- source, relay and receiver efficiency ---------------------------------------------
+
+# Transmitter power-added efficiency at (5.8 GHz, 34.8 GHz). "today" is the observed
+# roll-off with frequency; "flat" assumes it is engineered away, "medium" splits the two.
 PAE_SCENARIOS = {
     "today":  (0.65, 0.40),   # current saturated-CW GaN literature
     "medium": (0.65, 0.53),   # a decade of dedicated high-band development
@@ -348,7 +302,7 @@ PAE_SCENARIOS = {
 
 
 def pae_dc_to_rf(frequency_ghz, scenario="today"):
-    """GaN power-amplifier PAE vs frequency under a named device scenario."""
+    """Linear in frequency between the two band edges above, extrapolated with a floor."""
     lo, hi = PAE_SCENARIOS[scenario]
     slope = (hi - lo) / (34.8 - 5.8)
     return np.clip(lo + slope * (np.asarray(frequency_ghz, dtype=float) - 5.8),
@@ -363,17 +317,13 @@ def eta_grid_to_rf(frequency_ghz, scenario="today", eta_ac_dc=0.98):
 def relay_convert_efficiency(f_in_ghz, f_out_ghz, mode="active", reflectarray_reflectivity=0.90,
                              surface_error_frac=1 / 50, stage_efficiency=0.70,
                              pae_scenario="today"):
-    """Relay conversion efficiency.
-      active     : rectify the incoming RF (RF→DC at f_in) then re-amplify (DC→RF PAE
-                   at f_out). Runs off its own rectified DC, so only the PA's PAE
-                   applies on re-emit — NOT the grid AC/DC stage.
-      multiplier : a (more-or-less) PASSIVE nonlinear-reactance harmonic multiplier
-                   (Manley-Rowe permits ~100% for an ideal reactance; realized as ×2 /
-                   ×2·×3 stages at `stage_efficiency` each, from napkin.cascade_efficiency)
-                   × an aperture/coupling factor. Up-converts 5.8→n·5.8 with NO
-                   rectify+re-amp cliff. f_out sets the harmonic order.
-      passive    : reflectarray reflectivity × Ruze surface-tolerance loss; no frequency
-                   change (caller must set f_out = f_in)."""
+    """RF-in to RF-out efficiency of the three relay types.
+
+    active      rectify to DC and re-transmit at f_out, so both conversions are paid
+    multiplier  harmonic multiplier chain behind a reflectarray, one stage per prime factor
+    passive     reflect only; the loss is Ruze, exp(-(4*pi*eps)^2) for an rms surface error
+                of eps wavelengths -- so it does not change frequency and f_out is ignored
+    """
     if mode == "active":
         return napkin.rectenna_efficiency_band(f_in_ghz) * pae_dc_to_rf(f_out_ghz, pae_scenario)
     if mode == "multiplier":
@@ -387,7 +337,8 @@ def relay_convert_efficiency(f_in_ghz, f_out_ghz, mode="active", reflectarray_re
 # --- Aperture sizing ----------------------------------------------------------
 
 def receiver_radius_from_silhouette(silhouette_area_m2):
-    """Effective circular-aperture radius of the conformal rectenna = √(A_sil/π)."""
+    """Equal-area circular radius, so a silhouette can be fed to the circular-aperture
+    coupling formulas in napkin."""
     return np.sqrt(silhouette_area_m2 / np.pi)
 
 
@@ -396,7 +347,7 @@ def size_emitter_diameter(freq_ghz, slant_m, receiver_radius_m, tau_target=2.0):
     return 2.0 * napkin.required_emitter_radius(freq_ghz * 1e9, slant_m, receiver_radius_m, tau_target)
 
 
-# --- One hop ------------------------------------------------------------------
+# --- architectures ----------------------------------------------------------------------
 
 @dataclass
 class HopResult:
@@ -419,10 +370,10 @@ class HopResult:
 def hop(atmos, freq_ghz, from_pos, to_pos, receiver_radius_m, weather="clear",
         tau_target=2.0, emitter_diam_m=None, scan_deg=0.0, error_efficiency=0.95,
         n_path=64):
-    """One emitter→receiver hop on the spherical earth: size (or accept) the emitter
-    aperture, compute near-field capture, curved-path atmospheric transmittance (zeroed
-    if the path is blocked by the horizon), and emitter aperture efficiency.
-    `from_pos`/`to_pos` are (downrange, crossrange, altitude) triples."""
+    """One aperture-to-aperture hop, used for ground-to-relay where both ends are circular
+    discs. Coupling comes from the analytic Goubau formula, not the raster overlap, so
+    taper, focusing and pointing error do not enter. Sizes the emitter for `tau_target`
+    unless a diameter is given."""
     a, b = _to_ecef(from_pos), _to_ecef(to_pos)
     slant, elevation = geo.link(a, b)
 
@@ -445,58 +396,42 @@ def hop(atmos, freq_ghz, from_pos, to_pos, receiver_radius_m, weather="clear",
 
 @dataclass
 class LinkConfig:
-    """Everything needed to evaluate one link geometry + tech set."""
-    station_pos: tuple = (0.0, 0.0, 0.0)          # ENU metres (sea level station)
-    plane_pos: tuple = (150_000.0, 0.0, 11_000.0)  # 150 km downrange at 11 km
-    plane_attitude: tuple = (0.0, 0.0, 0.0)        # heading, pitch, roll (deg)
-    relay_pos: tuple | None = None                 # None → direct link
+    """One link case. `relay_pos = None` selects the direct architecture, in which case only
+    f_emit_plane_ghz and emitter_diam_m matter; with a relay the plane-side emitter is the
+    relay aperture and emitter_diam_m is unused."""
 
-    f_emit_plane_ghz: float = 30.0                 # direct station→plane
-    f_emit_relay_ghz: float = 5.8                  # station→relay (weather-robust up)
-    f_relay_plane_ghz: float = 30.0                # relay→plane (small plane aperture)
+    station_pos: tuple = (0.0, 0.0, 0.0)          # (downrange, crossrange, altitude) m
+    plane_pos: tuple = (150_000.0, 0.0, 11_000.0)  # may be an (n, 3) array; see `evaluate`
+    plane_attitude: tuple = (0.0, 0.0, 0.0)        # heading, pitch, roll in degrees
+    relay_pos: tuple | None = None
 
-    relay_mode: str = "active"                     # "active" | "multiplier" | "passive"
-    relay_aperture_diam_m: float = 60.0            # relay receive/transmit aperture
-    relay_stage_efficiency: float = 0.70           # per-stage eff of a multiplier relay
+    f_emit_plane_ghz: float = 30.0
+    f_emit_relay_ghz: float = 5.8
+    f_relay_plane_ghz: float = 30.0
+
+    relay_mode: str = "active"
+    relay_aperture_diam_m: float = 60.0
+    relay_stage_efficiency: float = 0.70
     weather: str = "clear"
     pae_scenario: str = "today"                    # "today" | "medium" | "flat"
 
-    # Emitter aperture: fixed physical diameter (m) if given, else sized to tau_target
-    # per geometry. A real station's emitter is FIXED, so capture DROPS at low
-    # elevation instead of the emitter growing — set this for realistic pass profiles.
-    emitter_diam_m: float | None = None
-    tau_target: float = 2.0
+    emitter_diam_m: float | None = None  # None sizes it from tau_target at this geometry
+    tau_target: float = 2.0              # 2 == 98% Goubau collection
     polarization: str = "circular"
     shaped_spot: bool = True                        # phased-array elliptical spot (vs round aperture)
     # If set, the emitter is a FIXED elliptical aperture of THIS aspect ratio (major:minor),
     # same area as the round one, aligned to the silhouette axes — a single built array, NOT
     # reshaped per geometry. None → the adaptive per-geometry aspect (silhouette elongation).
     fixed_emitter_aspect: float | None = None
-    spot_match: float = 0.90                        # deprecated: overlap_capture supersedes it
-    # Rectenna element angular-response floor: the conversion still standing at grazing
-    # incidence (eff = floor + (1−floor)·cosθ). 0.90 assumes a PHASED-ARRAY / CONFORMAL
-    # rectenna that re-phases and re-matches its elements toward the beam's arrival angle,
-    # recovering most of the off-normal impedance-detuning loss. (The cosθ AREA
-    # foreshortening is separate and stays — it lives in the silhouette projection.) A
-    # fixed patch-element rectenna would sit nearer ~0.6–0.7. #(verify)
-    incidence_floor: float = 0.90
-    # Aperture amplitude taper of the phased array: A(ρ) = (1−ρ²)^p over the aperture. p=0 is
-    # uniform (Airy pattern, first sidelobe −17.6 dB, 83.8 % of the power in the main lobe);
-    # higher p lowers the sidelobes at the cost of a wider main lobe. Used directly when
-    # adaptive_taper is off; otherwise the fallback. #(verify)
+    spot_match: float = 0.90       # dead: overlap_capture counts spill directly, so this would
+                                   # double-count. Nothing reads it.
+    incidence_floor: float = 0.90  # conformal phased-array rectenna; see overlap_capture
     taper_p: float = 1.0
-    # Like the spot's elliptical shape and its defocus, the taper is a continuous phased-array
-    # knob: pick it per geometry over [0, taper_p_max] to maximise capture (trade sidelobe
-    # spill against main-lobe width), optimised rather than snapped to a discrete set.
-    adaptive_taper: bool = True
-    taper_p_max: float = 4.0                        # upper bound of the optimised taper range
+    adaptive_taper: bool = True          # if set, taper_p is chosen per geometry, not used
+    taper_p_max: float = 4.0
     emitter_error_efficiency: float = 0.95
     pointing_error_m: float = 2.0
-    # Cap on incident beam power density at the plane (W/m²). The emitter must spread the
-    # spot to stay under it — so at high delivered power the spot is forced larger and
-    # capture drops. Default 25 W/cm² (2.5e5 W/m²), the usual solid-state array/rectenna
-    # handling limit. Set None to disable. #(verify)
-    max_power_density_w_m2: float | None = 2.5e5
+    max_power_density_w_m2: float | None = 2.5e5  # 25 W/cm^2 at the aircraft skin
 
     _silhouette: BWBSilhouette = field(default=None, repr=False)
 
@@ -513,6 +448,8 @@ _RASTER_CACHE = {}
 
 
 def _cached_raster(beta_deg, alpha_deg, n_grid=200):
+    """Rasterising a view costs far more than the rest of a case, so views are cached --
+    which quantises every result to 0.1 degrees of arrival angle."""
     key = (round(float(beta_deg), 1), round(float(alpha_deg), 1), n_grid)
     raster = _RASTER_CACHE.get(key)
     if raster is None:
@@ -524,9 +461,18 @@ def _cached_raster(beta_deg, alpha_deg, n_grid=200):
 
 
 def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=200):
-    """Shared receive-side geometry: rasterize the (self-occluded) silhouette toward the
-    emitter, size the emitter to τ_target on the equal-area disk if not fixed, and collect
-    the look geometry. Returns (raster, slant, wavelength, emitter_diam_m, shared_fields)."""
+    """Everything the overlap needs for one (emitter, aircraft) pair: the silhouette raster
+    as seen from the emitter, the equal-area receiver radius, and the emitter diameter.
+
+    The geometry is taken from the *aircraft* outwards, so `shared["elevation"]` -- which
+    becomes `stages["elevation_deg"]` -- is the angle to the emitter as seen from the aircraft:
+    negative for a ground emitter, -90 deg overhead, positive for a relay above.
+
+    UNRESOLVED: the relay branch also reports `elevation_up_deg`, measured at the station, so two
+    keys in the same dict carry opposite sign conventions, and `pass_profile` passes this one
+    through as a bare `elevation_deg`. Whether that is the intended convention or a sign error is
+    a decision nobody has taken.
+    """
     plane = np.asarray(cfg.plane_pos, dtype=float)
     emitter = np.asarray(emitter_pos, dtype=float)
     slant, elevation, unit_plane_to_emitter = geometry(plane, emitter)
@@ -578,10 +524,12 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
 def _overlap_taper_grid(raster, emitter_radius_m, wavelength_m, slant_m, shaped,
                         incidence_floor, aspect_cap, taper_ps, pointing_offset_m,
                         fixed_aspect, n_grid=256):
-    """Batched `overlap_capture` over a LIST of tapers (focused on the plane): shared
-    geometry and one batched FFT (`diffraction.plane_intensity_stack`) instead of one FFT per
-    taper. Used to SEARCH for the best taper (argmax is robust to grid resolution, so this
-    runs at a coarser n_grid than the final winner). Returns (geoms, effs, peaks) arrays."""
+    """`overlap_capture` for a whole set of taper exponents at once, in focus.
+
+    Same geometry setup, but one batched FFT on a shared grid instead of a per-case DFT on a
+    grid fitted to the target: cheap enough to scan taper, accurate enough to pick a winner,
+    which is then re-evaluated properly.
+    """
     u, v, inc, proj = raster["u"], raster["v"], raster["incidence"], raster["proj_area"]
     taper_ps = np.atleast_1d(np.asarray(taper_ps, dtype=float))
     if u.size == 0:
@@ -612,8 +560,12 @@ def _overlap_taper_grid(raster, emitter_radius_m, wavelength_m, slant_m, shaped,
 
 
 def _peak_density(delivered_mw, capture, rect_total, peak_intensity):
-    """Peak incident areal power density (W/m²) at the plane: the RF power in the spot,
-    delivered/(capture·rectenna), times the field's peak areal intensity (fraction/m²)."""
+    """Peak power density (W/m^2) on the aircraft skin for a given delivered DC power.
+
+    Dividing the delivered DC power by capture and the rectenna terms gives the beam power
+    crossing the aircraft, and `peak_intensity` is normalised per unit power, so the
+    atmospheric and transmitter losses upstream of this point drop out of the ratio.
+    """
     if delivered_mw is None or capture <= 0:
         return 0.0
     p_spot_w = delivered_mw * 1e6 / max(capture * rect_total, 1e-9)
@@ -622,11 +574,12 @@ def _peak_density(delivered_mw, capture, rect_total, peak_intensity):
 
 def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
                        taper_p, pc=None, return_field=False):
-    """`plane_capture` at a given aperture taper, DEFOCUSED (focus short of the plane) only
-    as much as the W/m² density cap requires. Defocusing spreads the spot → lower peak, at
-    some cost in capture, so we binary-search for the LEAST defocus (largest focus range)
-    whose peak sits under the cap. `pc` is an optional already-computed focused capture at
-    this taper (reused to skip the initial FFT); `return_field` attaches the winner's field."""
+    """Capture at a fixed taper, deliberately defocused if the skin power density would
+    otherwise exceed cfg.max_power_density_w_m2.
+
+    Focusing short of the target spreads the spot, so the bisection looks for the longest
+    (least defocused, highest capture) focus range that still complies.
+    """
     if pc is None:
         pc = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
                            return_field=return_field)
@@ -636,7 +589,13 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     if _peak_density(delivered_mw, pc["capture"], rect_total, pc["peak_intensity"]) <= cap:
         return pc
     slant = pc["slant"]
-    lo, hi = slant / 8.0, slant                        # focus range: hi = on the plane (hottest)
+    # OPEN: `lo` is meant to hold a compliant focus range, but slant/8 is assumed compliant and
+    # never tested. It is not always: whenever that much defocus still cannot spread the spot
+    # enough -- a function of delivered power, aperture, range and frequency together, not of
+    # emitter size alone (400 MW through the 40 m relay aperture overhead reports 1.30x the cap)
+    # -- an over-limit density is returned unflagged, no caller checks it, and
+    # `stages["feasible"]` ignores it. What should happen instead is undecided.
+    lo, hi = slant / 8.0, slant
     for _ in range(16):
         mid = 0.5 * (lo + hi)
         pcm = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p, focus_range_m=mid)
@@ -650,15 +609,13 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
 
 def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
                        n_taper=9, return_field=False):
-    """Pick the aperture TAPER per geometry and enforce the W/m² cap, returning the winning
-    `plane_capture` dict. The taper is a continuous phased-array degree of freedom (like the
-    spot's elliptical SHAPE and its defocus SIZE): a uniform aperture (p=0) has the tightest
-    main lobe but −17.6 dB sidelobes that spill off the airframe, while a heavier taper trades
-    main-lobe width for lower sidelobes. A single BATCHED FFT scans the taper grid [0,
-    taper_p_max] for the capture-optimal p (the curve is smooth/unimodal, so a grid + argmax
-    matches a sequential search at a fraction of the cost). The W/m² cap (defocus) is then
-    applied at the winner; if it binds, the heavier tapers — which need less defocus — are
-    re-checked so the cap can't lock in a suboptimal choice."""
+    """Pick the aperture taper, then satisfy the power-density cap.
+
+    The taper that maximises capture is found on a coarse grid. If that choice breaches the
+    cap it has to be defocused, which costs capture, so heavier tapers -- which lower the
+    peak on their own -- are tried too and the best surviving capture wins. Stops once a
+    taper needs no defocus at all, since heavier ones can then only lose capture.
+    """
     if not cfg.adaptive_taper:
         return _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m,
                                   delivered_mw, rect_total, cfg.taper_p, return_field=return_field)
@@ -696,8 +653,12 @@ def _capture_with_caps(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
 
 
 def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
-    """End-to-end evaluation for ONE plane position (scalar geometry). With `return_field` also
-    returns the winning capture field dict (for the animation), as (stages, field)."""
+    """The efficiency chain for a single aircraft position; see `evaluate`.
+
+    The relay branch reports the down-leg terms under both their own names and the direct
+    branch's generic ones (`capture`, `atmos`, ...) so that sweep code can stay
+    architecture-agnostic.
+    """
     atmos = get_atmosphere()
     station = np.asarray(cfg.station_pos, dtype=float)
     plane = np.asarray(cfg.plane_pos, dtype=float)
@@ -734,7 +695,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
         relay = np.asarray(cfg.relay_pos, dtype=float)
         r_relay = cfg.relay_aperture_diam_m / 2.0
         f1 = cfg.f_emit_relay_ghz
-        f2 = f1 if cfg.relay_mode == "passive" else cfg.f_relay_plane_ghz
+        f2 = f1 if cfg.relay_mode == "passive" else cfg.f_relay_plane_ghz  # a mirror cannot retune
 
         # up-leg: emitter → relay is a plain circular aperture (Goubau τ-capture).
         h1 = hop(atmos, f1, station, relay, r_relay, cfg.weather, cfg.tau_target,
@@ -777,6 +738,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
     stages["eta_end_to_end"] = eta
     stages["feasible"] = (not stages["blocked"]) and eta > 1e-4
     if delivered_mw is not None:
+        # `delivered_mw` is onboard DC; grid_mw is what the station must draw for it
         stages["delivered_mw"] = delivered_mw
         stages["grid_mw"] = delivered_mw / eta if eta > 0 else np.inf
         stages["waste_mw"] = stages["grid_mw"] - delivered_mw
@@ -786,13 +748,10 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
 
 
 def evaluate(cfg: LinkConfig, delivered_mw=None):
-    """Evaluate a link end to end (grid busbar → DC at the rectenna terminals).
-
-    Capture is the real 2-D overlap of the focused beam spot with the rasterized,
-    self-occluded silhouette (see `plane_capture`/`overlap_capture`) — the incidence
-    penalty and the spot-vs-silhouette shape mismatch are computed, not assumed. If
-    `plane_pos` is an (N,3) array the scalar core is mapped over the N positions and
-    every array-valued field is stacked (silhouette rasterization is per-geometry)."""
+    """Efficiency chain for the configured link, as a dict of named stage factors plus
+    `eta_end_to_end`. An (n, 3) `plane_pos` is looped over and the results stacked, so every
+    numeric entry becomes an array of length n.
+    """
     plane = np.asarray(cfg.plane_pos, dtype=float)
     if plane.ndim == 1:
         return _evaluate_scalar(cfg, delivered_mw)
@@ -820,8 +779,7 @@ def evaluate_with_field(cfg: LinkConfig, delivered_mw=None):
 
 
 def best_path(cfg: LinkConfig, delivered_mw=None):
-    """Evaluate direct and relayed (given the relay position) and return the better,
-    plus both, so weather-driven path selection is explicit."""
+    """Better of going direct or through the configured relay, plus both for comparison."""
     direct_cfg = LinkConfig(**{**cfg.__dict__, "relay_pos": None, "_silhouette": cfg.silhouette()})
     direct = evaluate(direct_cfg, delivered_mw)
     if cfg.relay_pos is None:
@@ -831,13 +789,21 @@ def best_path(cfg: LinkConfig, delivered_mw=None):
     return dict(chosen=chosen, direct=direct, relayed=relayed)
 
 
-# --- Pass profile (the boost-over-station window) ------------------------------
+# --- pass and corridor sweeps -----------------------------------------------------------
 
 def emitter_for_reference(frequency_ghz, station_pos, plane_alt_m=11_000.0,
                           reference_elevation_deg=60.0, tau_target=2.0,
                           silhouette=None):
-    """Physical emitter diameter that hits `tau_target` at a chosen reference
-    elevation (e.g. near overhead) — the FIXED aperture a station is built with."""
+    """Emitter diameter sized once, for the aircraft seen at `reference_elevation_deg`.
+
+    A real station cannot resize per position, so a whole pass is flown with one aperture; the
+    reference elevation is the design point that choice is made at.
+
+    Uses the convex silhouette table rather than the occluded raster, which is safe here because
+    this call site only ever evaluates tail-on: the aircraft is placed downrange at zero
+    crossrange and zero attitude, so alpha comes out at 180 deg for every reference elevation,
+    and along alpha=180 the table and the raster agree to a few parts in a thousand.
+    """
     downrange = float(geo.downrange_for_elevation(reference_elevation_deg, plane_alt_m))
     plane = (station_pos[0] + downrange, station_pos[1], plane_alt_m)
     slant, _, unit = geometry(plane, station_pos)
@@ -850,12 +816,11 @@ def emitter_for_reference(frequency_ghz, station_pos, plane_alt_m=11_000.0,
 def pass_profile(frequency_ghz=30.0, plane_alt_m=11_000.0, lateral_offset_m=0.0,
                  alongtrack_m=None, weather="clear", delivered_mw=10.0,
                  emitter_diam_m=None, reference_elevation_deg=60.0):
-    """Sweep a plane along a straight over-flight past a fixed-emitter station and
-    return per-position link metrics — the realistic 'how big is the powering
-    window' picture behind the boost-over-station concept. Fully vectorized.
+    """One straight overflight of a single station, direct architecture.
 
-    The emitter is FIXED (built for `reference_elevation_deg`), so capture and hence
-    delivered-power capability fall away from overhead. Returns a dict of arrays."""
+    The station is rated so that `delivered_mw` arrives at the best point of the pass;
+    `deliverable_mw` is then what that same fixed grid draw delivers everywhere else.
+    """
     if alongtrack_m is None:
         alongtrack_m = np.linspace(-120_000.0, 120_000.0, 241)
     station = (0.0, 0.0, 0.0)
@@ -885,20 +850,13 @@ def standard_architectures(station_pos=(0.0, 0.0, 0.0), weather="clear", pae_sce
                            relay_alt_m=20_000.0, tether_alt_m=20_000.0,
                            emitter_5p8_m=78.0, relay_aperture_m=40.0, emitter_tether_m=15.0,
                            relay_multiplier_out_ghz=17.4, include_reference=True):
-    """The realistic contenders + labelled reference cases, as {name: cfg-kwargs} with
-    plane_pos left OUT (the flyby fills it per point). Emitters are FIXED apertures.
+    """The architectures compared throughout, as LinkConfig keyword sets.
 
-    Contenders:
-      • 5.8 direct              — weatherproof low-f from the ground (big emitter).
-      • relay ×N mult 5.8→hi-f  — ground 5.8→relay aloft→passive multiplier→hi-f down
-                                  (keeps the hi-f leg in dry stratospheric air).
-      • tether hi-f direct      — hi-f emitter lofted on a tether (no relay, no
-                                  frequency conversion; short dry path). No altitude
-                                  restriction here — a modelling probe, not yet costed.
-    Reference (not real contenders, kept for contrast):
-      • 30 direct (ground)      — rains out; illustrative only.
-      • relay active 5.8→30     — dominated by the passive multiplier in every weather."""
-    relay = (station_pos[0], station_pos[1], relay_alt_m)          # aloft, above the station
+    Emitter and relay diameters are fixed inputs here, not sized from the geometry, so the
+    same aperture is flown across a whole pass. `include_reference` adds two further cases
+    kept for comparison rather than proposed.
+    """
+    relay = (station_pos[0], station_pos[1], relay_alt_m)
     tether = (station_pos[0], station_pos[1], tether_alt_m)
     common = dict(weather=weather, pae_scenario=pae_scenario)
     contenders = {
@@ -921,28 +879,25 @@ def standard_architectures(station_pos=(0.0, 0.0, 0.0), weather="clear", pae_sce
 
 def flyby(arch_kwargs, plane_alt_m=11_000.0, lateral_offset_m=0.0, station_spacing_km=200.0,
           speed_ms=250.0, delivered_mw=10.0, n_points=81, min_serve_eta=0.02):
-    """Fly the plane through the window a single station serves (±spacing/2 along track,
-    passing overhead at x=0) and evaluate the link at every step — the actual rising-
-    and-falling tooth of the sawtooth, not a snapshot. The emitter is FIXED, so capture
-    falls away from overhead as the geometry (elevation, silhouette, spot-fit) worsens.
+    """Energy accounting for one station's share of a corridor: the aircraft crosses half the
+    station spacing either side of overhead.
 
-    OPERATING MODEL (the plane is an energy SINK, not a constant load): whatever arrives
-    is banked immediately as altitude or speed, so the plane eats all we send up to its
-    absorption ceiling `delivered_mw`. We run the emitter at a FIXED grid power (sized so
-    the plane hits that ceiling at the best point of the pass) and let the delivered power
-    ride the η curve, serving only while η ≥ `min_serve_eta` (below that the grid joules
-    are mostly spilled — not worth spending). No battery is modelled: altitude IS the
-    buffer, and it also bridges the coverage gaps BETWEEN stations.
+    Two accountings, deliberately not the same thing:
+      grid_gj / delivered_gj   station rated for `delivered_mw` at the best point and left at
+                               that draw whenever eta clears min_serve_eta, so energy_eta is
+                               the mean eta over the served window
+      grid_energy_per_pass_gj  the opposite convention -- hold delivered power constant and
+                               let the grid draw chase 1/eta, which diverges if eta ever
+                               reaches zero, hence the inf
 
-    The figure of merit is therefore the pass ENERGY BALANCE, not a harmonic mean:
-      energy_eta        — banked energy / grid energy over the served window = the
-                          delivered-weighted (arithmetic) mean of η at constant grid power.
-                          THIS is "energy doing work vs energy wasted"; waste = 1 − it.
-      delivered_gj / grid_gj / waste_gj — the absolute energy budget of one pass.
-      served_frac       — fraction of the pass actually beamed (η ≥ min_serve_eta).
-    Legacy diagnostics kept: mean_eta, peak_eta, and hmean_eta / grid_energy_per_pass_gj
-    (the pessimistic CONSTANT-delivery bound — only relevant if the plane could NOT bank,
-    which per the operating model it can, so it is a bound, not the operating case)."""
+    The first is the operating model: the aircraft is an energy sink, banking whatever arrives as
+    altitude or speed, so no battery is modelled and altitude is the buffer. The second is a
+    pessimistic bound that would only apply to an aircraft that could not bank.
+
+    `min_serve_eta = 0.02` is not derived from anything, and it sets the headline: for
+    `5.8 direct` in a storm, moving it from 0 to 0.10 takes `energy_eta` 0.090 -> 0.240 and
+    `grid_gj` 23.8 -> 7.4.
+    """
     half = station_spacing_km * 1e3 / 2.0
     x = np.linspace(-half, half, n_points)
     plane = np.stack([x, np.full_like(x, lateral_offset_m), np.full_like(x, plane_alt_m)], axis=1)
@@ -986,10 +941,11 @@ def corridor_table(station_spacing_km=200.0, weather="clear", pae_scenario="toda
                         delivered_mw=delivered_mw) for name, kw in archs.items()}
 
 
-# --- Reporting ----------------------------------------------------------------
+# --- reporting --------------------------------------------------------------------------
 
 def waterfall(stages):
-    """Ordered (stage, efficiency) chain for a result dict — for printing/plotting."""
+    """The stage factors whose product is eta_end_to_end, in the order they apply. Any change
+    to the chain in `_evaluate_scalar` has to be mirrored here."""
     if stages["architecture"] == "direct":
         keys = [("DC→RF (PAE)", "dc_to_rf"), ("emitter aperture", "emitter_aperture"),
                 ("overlap capture", "capture"), ("atmosphere", "atmos"),
@@ -1023,9 +979,7 @@ def print_report(name, stages):
 # --- Named tech cases ---------------------------------------------------------
 
 def reference_geometry(elevation_deg=30.0, plane_alt_km=11.0):
-    """Station at origin (sea level); plane placed downrange (on the sphere) so the
-    station sees it at `elevation_deg`. Returns (station_pos, plane_pos) in
-    (downrange, crossrange, altitude) coordinates."""
+    """(station_pos, plane_pos) placing the aircraft at a chosen elevation from the station."""
     downrange = float(geo.downrange_for_elevation(elevation_deg, plane_alt_km * 1e3))
     return (0.0, 0.0, 0.0), (downrange, 0.0, plane_alt_km * 1e3)
 
