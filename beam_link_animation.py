@@ -76,7 +76,7 @@ function applyFrame(k) {
 function loop() { if (!playing) return; applyFrame((cur + 1) % N).then(function(){ if (playing) timer = setTimeout(loop, 8); }); }
 var btn = document.createElement('button');
 btn.textContent = '\\u25B6 play';
-btn.style.cssText = 'position:absolute;left:6px;top:6px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
+btn.style.cssText = 'position:absolute;left:6px;top:{btn_top}px;z-index:999;font:13px sans-serif;padding:3px 12px;cursor:pointer;background:#2a2a2a;color:#eee;border:1px solid #666;border-radius:3px;';
 function play() { if (playing) return; playing = true; btn.textContent = '\\u275A\\u275A pause'; loop(); }
 function pause() { playing = false; if (timer) clearTimeout(timer); btn.textContent = '\\u25B6 play'; }
 btn.onclick = function(){ playing ? pause() : play(); };
@@ -464,6 +464,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     dt_s = (xs[1] - xs[0]) / 250.0                                       # 250 m/s cruise
     deliverable_mw = (delivered_mw / peak) * (eta_series / 100.0)
     cum_gj = np.cumsum(deliverable_mw * dt_s) / 1e3                      # MW·s = MJ → GJ
+    # "Windowed pass efficiency": if the beam only operates while the plane is within ±d of closest
+    # approach, this is total delivered energy ÷ total input energy over that window. Input power is
+    # fixed (constant grid power), so it reduces to the mean of η over |along-track| ≤ d. At d = 0 it
+    # equals peak η; it falls as the window widens to swallow low-elevation (inefficient) geometry —
+    # i.e. "how good is my average efficiency if I'm willing to beam out to this distance?".
+    _order = np.argsort(np.abs(xs))                                     # frames from closest approach out
+    _cummean = np.cumsum((eta_series / 100.0)[_order]) / np.arange(1, len(xs) + 1)
+    windowed_eta = np.empty_like(eta_series)
+    windowed_eta[_order] = _cummean * 100.0                             # mean η over |x| ≤ |x_k|, in %
     # Panels F/F₂ (beam channel): the along-path axis is normalised to the LONGEST path over the
     # pass, so the plane's position along it encodes actual slant (far = near the far end, close
     # = near the emitter) — that distance cue is what keeps F/F₂ from being redundant with A.
@@ -562,7 +571,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     #               emitter phase directly BELOW (the 90°-rotated view; fits a phone).
     beam_dir = "↑" if portrait else "→"
     if portrait:
-        f_title, f2_title = f"F · major-axis (wide) cut  {beam_dir}", f"F₂ · minor-axis (narrow) cut  {beam_dir}"
+        f_title = f"F · beam channel · top view · wide cut  {beam_dir}"
+        f2_title = f"F₂ · beam channel · side view · narrow cut  {beam_dir}"
         # Size the two emitter rows to their isotropic box aspect (cross-span / radial-span), so F's
         # half-of-the-long-axis panel comes out a lot taller than F₂'s short-axis strip and neither
         # wastes space. Expressed relative to a ~250 px map row at this 402 px phone width.
@@ -572,7 +582,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         _rF, _rF2 = _emit_row(ap_short, ap_long), _emit_row(ap_long, ap_short)
         fig = make_subplots(
             rows=6, cols=1, vertical_spacing=0.05,
-            row_heights=[0.17, 0.11, 0.185, _rF, 0.185, _rF2],
+            row_heights=[0.17, 0.22, 0.185, _rF, 0.185, _rF2],   # D (line graph) 2× taller
             specs=[[{"type": "xy"}], [{"secondary_y": True}], [{"type": "xy"}],
                    [{"type": "xy"}], [{"type": "xy"}], [{"type": "xy"}]],
             subplot_titles=("A · beam spot over silhouette", "D · capture, η & energy",
@@ -582,11 +592,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         A_rc, D_rc = (1, 1), (2, 1)
         F_map, F_emit, F2_map, F2_emit = (3, 1), (4, 1), (5, 1), (6, 1)
     else:
-        f_title = f"F · beam channel, major-axis (wide) cut  (beam {beam_dir})"
-        f2_title = f"F₂ · beam channel, minor-axis (narrow) cut  (beam {beam_dir})"
+        f_title = f"F · beam channel, top view — major-axis (wide) cut  beam {beam_dir}"
+        f2_title = f"F₂ · beam channel, side view — minor-axis (narrow) cut  beam {beam_dir}"
         fig = make_subplots(
-            rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.03,
-            row_heights=[0.24, 0.12, 0.32, 0.32], column_widths=[0.17, 0.83],
+            rows=4, cols=2, vertical_spacing=0.075, horizontal_spacing=0.06,
+            row_heights=[0.24, 0.24, 0.32, 0.32], column_widths=[0.17, 0.83],   # D 2× taller; wider emitter gap
             specs=[[{"type": "xy", "colspan": 2}, None],
                    [{"secondary_y": True, "colspan": 2}, None],
                    [{"type": "xy"}, {"type": "xy"}],
@@ -631,11 +641,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     # ---- Panel D: capture, η (left %) + cumulative energy (right GJ) --------------------------
     # Short legend labels on the phone so the horizontal legend fits one line at 402 px width.
-    nm_eta = "η (%)" if portrait else "η end-to-end (%)"
+    nm_eta = "η now (%)" if portrait else "η end-to-end, instantaneous (%)"
     nm_cap = "capture (%)" if portrait else "overlap capture (%)"
     nm_cum = "energy (GJ)" if portrait else "cumulative energy (GJ)"
+    nm_win = "pass η, ±d (%)" if portrait else "pass η if beaming within ±d (%)"
     fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name=nm_eta,
                              line=dict(color="#1f77b4", width=2), hoverinfo="skip"),
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=windowed_eta, mode="lines", name=nm_win,
+                             line=dict(color="#9467bd", width=2, dash="dash"), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     fig.add_trace(go.Scatter(x=xs / 1e3, y=capture_series, mode="lines", name=nm_cap,
                              line=dict(color="#2ca02c", width=2, dash="dot"), hoverinfo="skip"),
@@ -646,6 +660,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     i_eta_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
                              marker=dict(size=9, color="#1f77b4"), showlegend=False, hoverinfo="skip"),
+                  row=D_rc[0], col=D_rc[1], secondary_y=False)
+    i_win_m = len(fig.data)
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[windowed_eta[0]], mode="markers",
+                             marker=dict(size=9, color="#9467bd"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_cap_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[capture_series[0]], mode="markers",
@@ -723,7 +741,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # Each frame swaps the 5 background images (a cheap relayout) and restyles the live vector
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
-    ANIMATED = [i_contA, i_capA, i_eta_m, i_cap_m, i_cum_m,
+    ANIMATED = [i_contA, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m,
                 F["cont"], F["plane"], F2["cont"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
@@ -741,6 +759,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             data=[go.Scatter(x=cAx, y=cAy),
                   go.Scatter(text=[f"{capture_series[k]:.0f}% captured"]),
                   go.Scatter(x=[cur], y=[eta_series[k]]),
+                  go.Scatter(x=[cur], y=[windowed_eta[k]]),
                   go.Scatter(x=[cur], y=[capture_series[k]]),
                   go.Scatter(x=[cur], y=[cum_gj[k]]),
                   go.Scatter(x=fcx, y=fcy), fpl,
@@ -803,26 +822,36 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                        showarrow=False, font=dict(size=8, color="#8fffd0"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
+    # Legend lives INSIDE panel D (the line graph), anchored to its top-left interior — where every
+    # curve is near zero (far along-track), so it overlaps nothing. Position from D's actual paper
+    # domain (row 2), robust to the row-height / orientation differences.
+    d_xdom, d_ydom = fig.layout["xaxis2"].domain, fig.layout["yaxis2"].domain
+    legend = dict(x=d_xdom[0] + 0.010, y=d_ydom[1] - 0.008, xanchor="left", yanchor="top",
+                  orientation="v", font=dict(size=(8 if portrait else 11)),
+                  bgcolor="rgba(0,0,0,0.4)", bordercolor="rgba(255,255,255,0.18)", borderwidth=1)
+    btn_top = 46 if portrait else 60          # clear of the (now multi-line) headline
     if portrait:
         fig.update_layout(
-            template="plotly_dark", height=1600, width=402, paper_bgcolor="black", plot_bgcolor="black",
-            margin=dict(t=225, l=44, r=10, b=40),
+            template="plotly_dark", height=1750, width=402, paper_bgcolor="black", plot_bgcolor="black",
+            margin=dict(t=150, l=44, r=10, b=40),
             title=dict(text=(f"Flyby — {arch_name}<br><sub>{aperture_m:.0f} m emitter · {weather} · "
                              f"{pass_kind} · ±{half/1e3:.0f} km · ▶ play or drag</sub>"),
-                       y=0.995, yanchor="top", x=0.5, xanchor="center", font=dict(size=12)),
-            legend=dict(orientation="h", y=1.10, x=0.5, xanchor="center", font=dict(size=7)))
+                       y=0.992, yanchor="top", x=0.5, xanchor="center", font=dict(size=12)),
+            legend=legend)
     else:
+        # Headline wrapped to a few lines so it fits the graph width instead of one long line.
         fig.update_layout(
-            template="plotly_dark", height=1450, width=1150, margin=dict(t=230, l=60, r=30, b=55),
-            title=dict(text=(f"Flyby animation — {arch_name}, {aperture_m:.0f} m emitter, {weather} weather, "
-                             f"{pass_kind}, horizon-to-horizon (±{half/1e3:.0f} km; uniform in time — "
-                             f"press ▶ play or drag the slider above)"), y=0.992, yanchor="top"),
-            legend=dict(orientation="h", y=1.13, x=0.5, xanchor="center", font=dict(size=9)))
+            template="plotly_dark", height=1550, width=1150, margin=dict(t=140, l=60, r=30, b=55),
+            title=dict(text=(f"Flyby animation — {arch_name} · {aperture_m:.0f} m emitter · {weather} · {pass_kind}"
+                             f"<br><sub>horizon-to-horizon ±{half/1e3:.0f} km · uniform in time"
+                             f"<br>▶ play or drag the slider above</sub>"),
+                       y=0.988, yanchor="top", x=0.5, xanchor="center", font=dict(size=15)),
+            legend=legend)
     if write:
         os.makedirs(OUT, exist_ok=True)
         # The ▶ play button is the custom sequential stepper (see _PLAYER_JS): it swaps the baked
         # background images + restyles the live vector traces per frame, without a native replay.
-        post = _PLAYER_JS.replace("{n_frames}", str(n_frames))
+        post = _PLAYER_JS.replace("{n_frames}", str(n_frames)).replace("{btn_top}", str(btn_top))
         fig.write_html(path, include_plotlyjs="inline", auto_play=False, post_script=post)
     return fig
 
