@@ -509,38 +509,51 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # winglets and edges render at their true width). Normals are per-face (flat incidence per pixel).
     silA_v, silA_f = m.make_bwb_mesh()
     silA_n, _ = m.triangle_normals_areas(silA_v, silA_f)
-    # To-scale airframe drawn at the plane line: a z-BUFFERED SILHOUETTE (same source/style as panel A —
-    # incidence-filled, crisp), rendered as a fixed orthographic TOP view in F and SIDE view in F₂. Body
-    # frame: x̂=nose, ŷ=starboard, ẑ=belly-down (dorsal-up = −ẑ). Each render fixes the map's radial axis
-    # ← one body axis and the along-beam axis ← another:
-    #   F  (top view):  radial ← span (ŷ); along ← nose-tail (x̂); look from dorsal (−ẑ).
-    #   F₂ (side view): radial ← height (dorsal −ẑ); along ← nose-tail (x̂), so the LONG side (length)
-    #                   runs along the beam axis (vertical in portrait); look from the port side (−ŷ).
-    # (These are FIXED views; if a banking manoeuvre is ever modelled they should follow the attitude.)
-    def _plane_view(u_ax, v_ax, w_ax, n=200):
-        """z-buffer incidence of the airframe for a fixed view: `u_ax`→radial (metres), `v_ax`→along
-        (beam), `w_ax`=look. Returns (incid[row=v, col=u], radial_half_m, along_half_m), the grid fit
-        to the front-facing projection (centred)."""
-        u_ax, v_ax, w_ax = (np.asarray(a, float) for a in (u_ax, v_ax, w_ax))
-        face_inc = silA_n @ w_ax
-        front = face_inc > 1e-6
-        fv = np.unique(silA_f[front])
-        U, V = silA_v @ u_ax, silA_v @ v_ax
-        u_mid, v_mid = 0.5 * (U[fv].min() + U[fv].max()), 0.5 * (V[fv].min() + V[fv].max())
-        u_half = 0.5 * (U[fv].max() - U[fv].min()) * 1.04
-        v_half = 0.5 * (V[fv].max() - V[fv].min()) * 1.04
-        u_lin = np.linspace(u_mid - u_half, u_mid + u_half, n)
-        v_lin = np.linspace(v_mid - v_half, v_mid + v_half, n)
-        incid = m.rasterize_view_zbuffer(u_ax, v_ax, w_ax, silA_v, silA_f, face_inc, u_lin, v_lin)
-        return incid, float(u_half), float(v_half)
-    _pt_incid, plane_top_rhalf, plane_top_ahalf = _plane_view([0, 1, 0], [1, 0, 0], [0, 0, -1])
-    _ps_incid, plane_side_rhalf, plane_side_ahalf = _plane_view([0, 0, -1], [1, 0, 0], [0, -1, 0])
-    # Bake once (incid[row=v=along, col=u=radial] → PNG oriented radial=y/along=x landscape,
-    # radial=x/along=y portrait). transpose swaps the two axes for landscape; flip_rows puts the
-    # top of the image at the high end of the vertical axis.
-    plane_top_png = _field_to_png(_pt_incid, transpose=not portrait, flip_rows=True, cmap="plasma")
-    plane_side_png = _field_to_png(_ps_incid, transpose=not portrait, flip_rows=True, cmap="plasma")
+    # PER-FRAME airframe projection into each beam-cut plane, drawn at the plane line. Unlike a fixed
+    # top/side view, this reflects the aircraft's TRUE orientation relative to the cut we are viewing at
+    # that instant (and would follow a banking manoeuvre if modelled), and it is coloured by BEAM
+    # incidence (n̂·look, exactly like panel A). Each beam map is a cut of the 3-D beam containing the
+    # propagation axis and one transverse axis: F = MAJOR transverse (radial ← major, along ← beam
+    # propagation, VIEWED along the minor transverse), F₂ = MINOR transverse (radial ← minor, viewed
+    # along the major). The transverse axes are the silhouette's principal axes in the panel-A view
+    # plane, so the projection foreshortens/rotates with the geometry. Uses the coarse channel mesh
+    # (fast; the projection is a small on-screen element). `cut` = 'y' (F, major) / 'x' (F₂, minor).
+    proj_v, proj_f, proj_n = coarse_mesh
+    _blank_png = _field_to_png(np.full((2, 2), np.nan))
+    _proj_cache = {}
 
+    def _plane_proj(f, cut):
+        """(png, radial_half_m, along_half_m) for the plane's projection into the F ('y') / F₂ ('x')
+        beam-cut plane at frame `f`, coloured by beam incidence. Cached per (frame, cut)."""
+        key = (id(f), cut)
+        if key not in _proj_cache:
+            look = np.asarray(f["look"], float); look = look / (np.linalg.norm(look) + 1e-30)
+            vu, vv = np.asarray(f["view_u"], float), np.asarray(f["view_v"], float)
+            coords = np.vstack([f["field"]["u"], f["field"]["v"]])
+            if coords.shape[1] >= 3:
+                _, ev = np.linalg.eigh(np.cov(coords))    # cols [minor, major] in the (view_u,view_v) plane
+                major = ev[0, 1] * vu + ev[1, 1] * vv
+                minor = ev[0, 0] * vu + ev[1, 0] * vv
+            else:
+                major, minor = vu, vv
+            radial_ax, view_ax = (major, minor) if cut == "y" else (minor, major)
+            beam_inc = np.clip(proj_n @ look, 0.0, 1.0)   # COLOUR: beam incidence (like panel A)
+            view_inc = proj_n @ view_ax                    # CULL/occlude by the viewing direction
+            front = view_inc > 1e-6
+            if not front.any():
+                return _blank_png, 0.5, 0.5
+            fv = np.unique(proj_f[front])
+            R, A = proj_v @ radial_ax, proj_v @ look       # radial (transverse) & along (propagation)
+            r_half = max(0.5 * (R[fv].max() - R[fv].min()) * 1.05, 0.3)
+            a_half = max(0.5 * (A[fv].max() - A[fv].min()) * 1.05, 0.3)
+            r_mid, a_mid = 0.5 * (R[fv].min() + R[fv].max()), 0.5 * (A[fv].min() + A[fv].max())
+            r_lin = np.linspace(r_mid - r_half, r_mid + r_half, 170)
+            a_lin = np.linspace(a_mid - a_half, a_mid + a_half, 170)
+            incid = m.rasterize_view_zbuffer(radial_ax, look, view_ax, proj_v, proj_f, view_inc,
+                                             r_lin, a_lin, color=beam_inc)
+            png = _field_to_png(incid, transpose=not portrait, flip_rows=True, cmap="plasma")
+            _proj_cache[key] = (png, float(r_half), float(a_half))
+        return _proj_cache[key]
 
     def incidence_grid(f):
         """The silhouette's incidence on the fine panel-A grid, z-BUFFERED: per pixel, the incidence
@@ -874,6 +887,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     axF, axF2, axA = _ax(F["cont"]), _ax(F2["cont"]), _ax(i_contA)
 
     ALONG_GUT = 0.03      # data-space gutter (fraction of the map width) beyond the arc, for the axis
+    ALONG_TOP = 1.2       # along-axis upper bound (> 1): room BEHIND the plane for its projection image
 
     def _panel_px(ax):
         """(along_px, radial_px): the panel's on-screen size in pixels along each map axis, from its
@@ -883,29 +897,19 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         px_w, px_h = (xd[1] - xd[0]) * inner_w, (yd[1] - yd[0]) * inner_h
         return (px_h, px_w) if portrait else (px_w, px_h)
 
-    def _iso_lo(ax, ap_cross_m):
-        """Returns (lo, along_lo): the emitter region's extent `lo` in ALONG-axis (normalised
-        emitter→plane) units so `ap_cross_m` metres render ISOTROPICALLY with the radial-axis metres,
-        and the along-axis lower bound `along_lo` (a small gutter beyond the arc, so the radial axis
-        sits clear of the ellipse). The two axes carry different units, so the pixel-per-data-scale
-        ratio is the distortion: the cross must fill A = ap_cross·(radial_px/2PHASE_L)/along_px of the
-        along axis. Over a range [along_lo, 1] = [−(lo+GUT), 1] that pins lo = A·(1+GUT)/(1−A) — the
-        gutter is folded into the derivation so isotropy stays EXACT, not just approximate."""
-        along_px, radial_px = _panel_px(ax)
-        A = min(0.85, ap_cross_m * (radial_px / (2.0 * PHASE_L)) / along_px)
-        lo = A * (1.0 + ALONG_GUT) / (1.0 - A)
-        return lo, -(lo + ALONG_GUT)
-
-    (lo_F, alo_F), (lo_F2, alo_F2) = _iso_lo(axF, ap_long), _iso_lo(axF2, ap_short)
-
-    def _iso_norm_per_m(ax, along_lo):
-        """Normalised along-axis units per METRE in the beam direction, so a body outline drawn at the
-        plane line renders ISOTROPICALLY (a metre along the beam covers the same screen px as a metre
-        on the radial axis) — the same trick as the emitter, applied to the plane. The along axis
-        spans (1 − along_lo) normalised units over along_px pixels; the radial spans 2·PHASE_L m over
-        radial_px, so along-units/m = (radial_px/2PHASE_L)·(1 − along_lo)/along_px."""
-        along_px, radial_px = _panel_px(ax)
-        return (radial_px / (2.0 * PHASE_L)) * (1.0 - along_lo) / along_px
+    # ONE isotropic layout shared by BOTH beam maps (F and F₂ have the same paper domain → same pixels),
+    # so they get the SAME along-axis range: the emitter face (along=0) lands at the same figure-x, and
+    # the map (0→1) is identical, with room past the plane (1→ALONG_TOP) for the projection images. `k`
+    # converts METRES to normalised-along units PER unit range-width (radial px/m ÷ along px/norm). The
+    # along lower bound is set from the LARGER emitter (ap_long, cross of F) so it renders isotropically
+    # with a gutter; the smaller emitter (ap_short) then occupies a sub-region with empty space beside it.
+    along_px, radial_px = _panel_px(axF)
+    k = (radial_px / (2.0 * PHASE_L)) / along_px
+    B = min(ap_long * k, 0.6)                              # along-fraction the big emitter fills (capped)
+    along_lo = -(B * ALONG_TOP + ALONG_GUT) / (1.0 - B)   # COMMON lower bound for both panels
+    range_w = ALONG_TOP - along_lo
+    lo_F, lo_F2 = ap_long * k * range_w, ap_short * k * range_w   # isotropic emitter half-regions (norm)
+    npm = k * range_w                                     # normalised-along per METRE (isotropic)
 
     def add_emitter(rc, ap_radial_m, ap_cross_m, lo):
         """Emitter half-aperture outline, in the map subplot, pre-distorted so it reads isotropic:
@@ -918,17 +922,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     add_emitter(F_rc, ap_short, ap_long, lo_F)
     add_emitter(F2_rc, ap_long, ap_short, lo_F2)
 
-    # To-scale airframe at the plane line: the baked TOP/SIDE z-buffer silhouettes (above) are placed
-    # as background IMAGES, isotropically pre-distorted (radial 1:1 metres, along stretched via
-    # _iso_norm_per_m) so the shape reads in true proportion despite the along axis being ~150 km. The
-    # image is set BEHIND the plane slice line (on the far side, along > plane) with a gap, so it never
-    # collides with the line; only the along position tracks the plane per frame (fixed shape/size).
-    npm_F, npm_F2 = _iso_norm_per_m(axF, alo_F), _iso_norm_per_m(axF2, alo_F2)
-
-    def _plane_rect(rhalf_m, ahalf_m, d_npm, yy):
-        ahalf = ahalf_m * d_npm                           # along half-extent (isotropic, norm units)
-        gap = max(0.008, 0.35 * ahalf)
-        mid = min(yy + ahalf + gap, 1.0 - ahalf)          # behind the line, kept inside the far edge
+    # The per-frame projection images (see _plane_proj) are placed at the plane line, isotropically
+    # pre-distorted (radial 1:1 metres, along stretched by `npm`) and set BEHIND the slice line (far
+    # side, along > plane) with a gap, into the 1→ALONG_TOP space so even the farthest frame has room.
+    def _plane_rect(rhalf_m, ahalf_m, yy):
+        ahalf = ahalf_m * npm                             # along half-extent (isotropic, norm units)
+        gap = max(0.008, 0.3 * ahalf)
+        mid = min(yy + ahalf + gap, ALONG_TOP - ahalf)    # behind the line, kept inside the top edge
         if portrait:
             return (-rhalf_m, mid - ahalf, 2.0 * rhalf_m, 2.0 * ahalf)   # x=radial, y=along
         return (mid - ahalf, -rhalf_m, 2.0 * ahalf, 2.0 * rhalf_m)       # x=along, y=radial
@@ -947,13 +947,15 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     def frame_images(f):                                  # baked backgrounds for one frame
         yy = f["chan_total"] / max_total
+        pt_png, pt_rh, pt_ah = _plane_proj(f, "y")        # per-frame projection into F  (major cut)
+        ps_png, ps_rh, ps_ah = _plane_proj(f, "x")        # per-frame projection into F₂ (minor cut)
         return [_image(incid_png(f), axA, A_rect),
                 _image(map_png(f, "y"), axF, _map_rect()),
                 _image(map_png(f, "x"), axF2, _map_rect()),
                 _image(phase_png(f, ap_short, ap_long), axF, _em_rect(ap_short, lo_F)),
                 _image(phase_png(f, ap_long, ap_short), axF2, _em_rect(ap_long, lo_F2)),
-                _image(plane_top_png, axF, _plane_rect(plane_top_rhalf, plane_top_ahalf, npm_F, yy)),
-                _image(plane_side_png, axF2, _plane_rect(plane_side_rhalf, plane_side_ahalf, npm_F2, yy))]
+                _image(pt_png, axF, _plane_rect(pt_rh, pt_ah, yy)),
+                _image(ps_png, axF2, _plane_rect(ps_rh, ps_ah, yy))]
 
     fig.update_layout(images=frame_images(frames_phys[0]))
 
@@ -1019,15 +1021,16 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # negative region is the emitter aperture (the isotropically-compressed near-array zone), NOT
     # distance, so it gets no distance ticks. The RADIAL axis (±PHASE_L) carries the metre ticks +
     # title at the plot's far edge (LEFT of the ellipses landscape / BELOW portrait). The two axes are
-    # NOT scale-anchored (different units); emitter + plane isotropy is baked into `lo` / _iso_norm_per_m.
+    # NOT scale-anchored (different units); emitter + plane isotropy is baked into `lo` / `npm`. Both
+    # maps share the SAME along range [along_lo, ALONG_TOP], so the emitter face (0) and the plane
+    # projection space (1→ALONG_TOP) align across F and F₂.
     max_km = max_total / 1e3
     dk = next(d for d in (10, 20, 25, 50, 100, 150, 200, 250) if max_km / d <= 7)
     km_ticks = np.arange(0.0, max_km + 1e-9, dk)
     km_tickvals = (km_ticks * 1e3 / max_total).tolist()          # normalised positions in [0, 1]
     km_ticktext = [f"{v:.0f}" for v in km_ticks]
-    for rc, along_lo in ((F_rc, alo_F), (F2_rc, alo_F2)):
-        along_rng = [along_lo, 1.0]
-        along_kw = dict(title_text="distance from emitter (km)", range=along_rng,
+    for rc in (F_rc, F2_rc):
+        along_kw = dict(title_text="distance from emitter (km)", range=[along_lo, ALONG_TOP],
                         tickvals=km_tickvals, ticktext=km_ticktext, showgrid=False, zeroline=False)
         radial_kw = dict(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
                          showgrid=False, zeroline=False)

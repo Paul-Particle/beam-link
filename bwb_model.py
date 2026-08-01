@@ -311,7 +311,7 @@ def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
 
 
 def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
-                           u_lin, v_lin):
+                           u_lin, v_lin, color=None):
     """Deterministic z-buffered rasterization of the mesh onto a FIXED view-plane grid.
 
     A crisp, resolution-independent alternative to Monte-Carlo point binning: project every
@@ -322,10 +322,13 @@ def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
     occlusion exactly (a winglet behind the wing, the far wing behind the body), thin features render
     at their real width instead of being blurred by a smoothing radius. Pixel (row r, col c) is
     centred at (u_lin[c], v_lin[r]); `u_ax`/`v_ax`/`w_ax` are the (already dorsal-up-rotated) view
-    basis, `face_incidence` = normals @ w_ax (precomputed so callers can reuse it)."""
+    basis, `face_incidence` = normals @ w_ax (precomputed so callers can reuse it). By default each
+    covered pixel stores `face_incidence` (the cull/occlusion cosine); pass `color` (a per-FACE array)
+    to store THAT instead — e.g. cull/occlude by the VIEW direction but colour by BEAM incidence."""
     U = vertices @ u_ax
     V = vertices @ v_ax
     depth = vertices @ w_ax                              # larger = nearer the emitter
+    stored = face_incidence if color is None else np.asarray(color)
     n_u, n_v = u_lin.size, v_lin.size
     du = (u_lin[-1] - u_lin[0]) / (n_u - 1)
     dv = (v_lin[-1] - v_lin[0]) / (n_v - 1)
@@ -333,9 +336,9 @@ def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
     py = (V - v_lin[0]) / dv
     zbuf = np.full((n_v, n_u), -np.inf)
     incid = np.full((n_v, n_u), np.nan, dtype=np.float32)
-    for tri, inc in zip(faces, face_incidence):
+    for tri, inc, col in zip(faces, face_incidence, stored):
         if inc <= 1e-6:
-            continue                                     # back-facing → never visible
+            continue                                     # back-facing (to the cull axis) → not visible
         i0, i1, i2 = tri
         x0, y0, d0 = px[i0], py[i0], depth[i0]
         x1, y1, d1 = px[i1], py[i1], depth[i1]
@@ -361,7 +364,7 @@ def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
         win = di > zbuf[gyi, gxi]                         # nearer than the current occupant
         wy, wx = gyi[win], gxi[win]
         zbuf[wy, wx] = di[win]
-        incid[wy, wx] = inc
+        incid[wy, wx] = col
     return incid
 
 
