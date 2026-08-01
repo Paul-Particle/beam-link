@@ -24,10 +24,10 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import beam_link as bl
-import diffraction as dfr
-import beam_link_animation as anim
-import bwb_model as m
+from beamlink import beam_link as bl
+from beamlink import diffraction as dfr
+from beamlink import beam_link_animation as anim
+from beamlink import bwb_model as m
 
 OUT = "out"
 WEATHER_ORDER = ["clear", "cloudy", "light_rain", "heavy_rain", "storm"]
@@ -173,7 +173,7 @@ def _overlap_snapshot(arch_kwargs, x_along_m, plane_alt_m, shaped):
     slant, elevation, unit = bl.geometry(np.asarray(plane, float), np.asarray(emitter, float))
     beta, alpha = m.beta_alpha_from_enu(unit, *cfg.plane_attitude)
     raster = bl._cached_raster(beta, alpha)
-    lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
+    lam = bl.relations.SPEED_OF_LIGHT / (freq * 1e9)
     geom, eff, peak, field = bl.overlap_capture(raster, diam / 2.0, lam, slant, shaped=shaped,
                                                 incidence_floor=cfg.incidence_floor, return_field=True)
     return field, dict(elevation=float(elevation), geom=geom, eff=eff,
@@ -275,7 +275,7 @@ def figure_spot_shape(path=f"{OUT}/beam_link_spot_shape.html"):
     samples, snorm, swt = m.get_surface_samples()
     betas = np.linspace(0.0, 88.0, 23)
     elevation = 90.0 - betas
-    lam = bl.napkin.SPEED_OF_LIGHT / 30e9
+    lam = bl.relations.SPEED_OF_LIGHT / 30e9
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.12,
                         subplot_titles=("Silhouette elongation vs elevation",
                                         "Overlap capture: round vs shaped emitter (side aspect)"))
@@ -353,7 +353,7 @@ def figure_taper(path=f"{OUT}/beam_link_taper.html"):
     Left: the focal-plane radial intensity (log) for a few tapers — the sidelobes drop and the
     main lobe broadens. Right: fraction of power landing within a main-lobe-sized receiver vs
     taper — the sidelobe-spill vs main-lobe-width tradeoff the engine optimises per geometry."""
-    lam = bl.napkin.SPEED_OF_LIGHT / 5.8e9
+    lam = bl.relations.SPEED_OF_LIGHT / 5.8e9
     R, D = 50.0, 213e3
     r_null = 0.610 * lam * D / R                        # uniform-aperture first Airy null
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.13,

@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection, LineCollection
 import plotly.graph_objects as go
 
-import bwb_model as m
+from beamlink import bwb_model as m
 
 OUT = "out"
 N_WINGLET_FACES = 24          # last 24 faces are the two winglets (12 each) — see make_bwb_mesh

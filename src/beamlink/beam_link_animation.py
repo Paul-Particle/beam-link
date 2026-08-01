@@ -32,10 +32,10 @@ import contourpy
 
 from scipy.ndimage import uniform_filter1d
 
-import beam_link as bl
-import diffraction as dfr
-import bwb_model as m
-import geo
+from beamlink import beam_link as bl
+from beamlink import diffraction as dfr
+from beamlink import bwb_model as m
+from beamlink import geo
 
 OUT = "out"
 
@@ -344,7 +344,7 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     beta, alpha = m.beta_alpha_from_enu(unit, *cfg.plane_attitude)
     look = m.direction_from_beta_alpha(float(beta), float(alpha))
     raster = bl._cached_raster(beta, alpha)
-    lam = bl.napkin.SPEED_OF_LIGHT / (freq * 1e9)
+    lam = bl.relations.SPEED_OF_LIGHT / (freq * 1e9)
     # The engine is the single source of truth: it chooses the aperture TAPER (adaptively) and
     # the spot SHAPE (elliptical) and enforces the density cap (possibly DEFOCUSING to hold the
     # W/m² cap). evaluate_with_field hands back the exact scalar-diffraction field the capture
@@ -407,7 +407,7 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
         L1 = float(bl.geometry(station, np.asarray(cfg.relay_pos, float))[0])   # ground→relay
         r_relay = cfg.relay_aperture_diam_m / 2.0
         r_up = bl.size_emitter_diameter(cfg.f_emit_relay_ghz, L1, r_relay, cfg.tau_target) / 2.0
-        lam_up = bl.napkin.SPEED_OF_LIGHT / (cfg.f_emit_relay_ghz * 1e9)
+        lam_up = bl.relations.SPEED_OF_LIGHT / (cfg.f_emit_relay_ghz * 1e9)
         up_leg = dict(ap_major=float(r_up), ap_minor=float(r_up), focus_m=L1,
                       length_m=L1, lam=lam_up, taper_p=0.0)
         chan_legs = [up_leg, down_leg]

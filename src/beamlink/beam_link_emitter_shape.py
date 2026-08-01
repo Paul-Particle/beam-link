@@ -22,10 +22,10 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import beam_link as bl
-import bwb_model as m
-import geo
-import beam_link_animation as anim
+from beamlink import beam_link as bl
+from beamlink import bwb_model as m
+from beamlink import geo
+from beamlink import beam_link_animation as anim
 
 OUT = "out"
 

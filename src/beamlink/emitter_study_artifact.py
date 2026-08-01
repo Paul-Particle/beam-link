@@ -13,7 +13,7 @@ import json
 import plotly.io as pio
 import plotly.offline as po
 
-import beam_link_animation as bla
+from beamlink import beam_link_animation as bla
 
 # Kept deliberately light so all four 6-panel figures + one shared plotly.js fit under the
 # 16 MB artifact ceiling. Spatial detail (grid) is prioritised over frame count — seeing the

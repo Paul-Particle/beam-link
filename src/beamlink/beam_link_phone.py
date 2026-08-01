@@ -11,11 +11,11 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-import beam_link as bl
-import diffraction as dfr
-import bwb_model as m
-import geo
-import beam_link_animation as anim
+from beamlink import beam_link as bl
+from beamlink import diffraction as dfr
+from beamlink import bwb_model as m
+from beamlink import geo
+from beamlink import beam_link_animation as anim
 
 OUT = "out"
 
@@ -403,7 +403,7 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5, tape
     amplitude taper (0 = uniform → the sharpest sidelobes). Slider = focus distance.
 
     Run:  uv run python beam_link_phone.py   → out/focus_phone.html"""
-    lam = bl.napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
+    lam = bl.relations.SPEED_OF_LIGHT / (freq_ghz * 1e9)
     r = emitter_diam_m / 2.0
     A = float(fixed_aspect)
     ap_long, ap_short = r * np.sqrt(A), r / np.sqrt(A)   # ellipse aperture semi-axes (long, short)

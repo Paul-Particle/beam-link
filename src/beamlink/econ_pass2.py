@@ -17,10 +17,12 @@ Run:  PYTHONPATH=$PWD uv run python econ_pass2.py
 """
 import numpy as np
 
-import beam_link as bl
-import bwb_model as m
-import geo
-import napkin as n
+from beamlink import beam_link as bl
+from beamlink import bwb_model as m
+from beamlink import geo
+from beamlink import airframe
+from beamlink import econ
+from beamlink import relations
 
 ALT_M = 11_000.0
 ROUTE_KM = 5500.0
@@ -35,7 +37,7 @@ SUPPLY_MUSD_PER_GRID_MW = 1.2
 COOLING_MUSD_PER_WASTE_MW = 1.0
 APERTURE_MUSD_PER_M2 = 0.005
 
-mb = n.mass_buildup(payload_t=40.0)
+mb = airframe.mass_buildup(payload_t=40.0)
 CRUISE_MW = mb["cruise_mw"]
 
 # --- static geometry helpers -------------------------------------------------
@@ -51,7 +53,7 @@ def _edge_raster(freq_ghz, min_elev_deg):
     slant, elev, unit = bl.geometry(plane, station)
     beta, alpha = m.beta_alpha_from_enu(unit, 0.0, 0.0)      # level plane, zero heading
     raster = bl._cached_raster(beta, alpha)
-    lam = bl.napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
+    lam = bl.relations.SPEED_OF_LIGHT / (freq_ghz * 1e9)
     r_recv = bl.receiver_radius_from_silhouette(raster["area"])
     return raster, float(slant), lam, float(r_recv)
 
@@ -64,7 +66,7 @@ def size_apertures(freq_ghz, min_elev_deg):
     STABLE sizing reference; the engine itself now optimises the aperture taper per geometry, so
     the aperture sizing here needs its own reconciliation pass against it. #(verify)"""
     raster, slant, lam, r_recv = _edge_raster(freq_ghz, min_elev_deg)
-    D_round = n.emitter_diameter_m(freq_ghz, slant / 1e3, r_recv)
+    D_round = relations.emitter_diameter_m(freq_ghz, slant / 1e3, r_recv)
     eff_round = bl.overlap_capture(raster, D_round / 2.0, lam, slant, shaped=False,
                                    taper_p=0.0, incidence_floor=0.90)[1]
     D_ellip = D_round
@@ -79,7 +81,7 @@ def size_apertures(freq_ghz, min_elev_deg):
 
 def delivery_eta(freq_ghz, diam_m, min_elev_deg, weather):
     """Real grid→drivetrain delivery η over the served window, from a beam-link flyby."""
-    spacing_km = n.station_spacing_km(ALT_M / 1e3, min_elev_deg)
+    spacing_km = econ.station_spacing_km(ALT_M / 1e3, min_elev_deg)
     arch = dict(station_pos=(0.0, 0.0, 0.0), relay_pos=None, f_emit_plane_ghz=freq_ghz,
                 emitter_diam_m=diam_m, shaped_spot=True, weather=weather)
     fb = bl.flyby(arch, plane_alt_m=ALT_M, station_spacing_km=spacing_km,
@@ -90,7 +92,7 @@ def delivery_eta(freq_ghz, diam_m, min_elev_deg, weather):
 def station_musd_elliptical(deliver_mw, energy_eta, freq_ghz, aperture_area_m2):
     """Station cost with the elliptical aperture and beam-link η. grid draw from the real η;
     station-side grid→RF split from napkin's band model."""
-    eta_grid_rf = n.eta_grid_to_rf_band(freq_ghz)
+    eta_grid_rf = relations.eta_grid_to_rf_band(freq_ghz)
     grid_mw = deliver_mw / max(energy_eta, 1e-6)
     rf_mw = grid_mw * eta_grid_rf
     waste_mw = grid_mw - rf_mw
@@ -106,21 +108,21 @@ MIN_FEASIBLE_SERVED = 0.5     # must serve most of the window to bank a pass's e
 def verdict(freq_ghz, min_elev_deg, weather, airborne_per_station):
     D, D_round, eff_round = size_apertures(freq_ghz, min_elev_deg)
     eta, served = delivery_eta(freq_ghz, D, min_elev_deg, weather)
-    n_st = n.station_count(ROUTE_KM, ALT_M / 1e3, min_elev_deg)
-    spacing = n.station_spacing_km(ALT_M / 1e3, min_elev_deg)
+    n_st = econ.station_count(ROUTE_KM, ALT_M / 1e3, min_elev_deg)
+    spacing = econ.station_spacing_km(ALT_M / 1e3, min_elev_deg)
     feasible = (eta >= MIN_FEASIBLE_ETA) and (served >= MIN_FEASIBLE_SERVED)
     if not feasible:                                          # rained/spilled out — no verdict
         return dict(D=D, D_round=D_round, eta=eta, served=served, n_st=n_st, spacing=spacing,
                     feasible=False, st_musd=None, grid_mw=None, infra=None, energy=None, verdict=None)
-    transit_h = n.flight_hours(ROUTE_KM, SPEED_MS)
-    throughput = n.corridor_throughput_per_day(airborne_per_station, n_st, transit_h)
-    deliver_mw = n.station_power_mw(airborne_per_station, CRUISE_MW)
+    transit_h = econ.flight_hours(ROUTE_KM, SPEED_MS)
+    throughput = econ.corridor_throughput_per_day(airborne_per_station, n_st, transit_h)
+    deliver_mw = econ.station_power_mw(airborne_per_station, CRUISE_MW)
     area = np.pi * (D / 2.0) ** 2
     st_musd, grid_mw = station_musd_elliptical(deliver_mw, eta, freq_ghz, area)
-    infra = n.infra_cost_per_flight(n_st, st_musd, throughput)
-    energy = n.energy_cost_per_flight(CRUISE_MW, ROUTE_KM, SPEED_MS, eta_delivery=eta)
-    beamed_ac = n.aircraft_cost_per_flight(100.0)
-    fossil = n.fuel_cost_per_flight()["cost_usd"] + n.aircraft_cost_per_flight(150.0)
+    infra = econ.infra_cost_per_flight(n_st, st_musd, throughput)
+    energy = econ.energy_cost_per_flight(CRUISE_MW, ROUTE_KM, SPEED_MS, eta_delivery=eta)
+    beamed_ac = econ.aircraft_cost_per_flight(100.0)
+    fossil = econ.fuel_cost_per_flight()["cost_usd"] + econ.aircraft_cost_per_flight(150.0)
     beamed_total = energy["cost_usd"] + infra["cost_usd"] + beamed_ac
     return dict(D=D, D_round=D_round, eta=eta, served=served, n_st=n_st, spacing=spacing,
                 feasible=True, throughput=throughput, st_musd=st_musd, grid_mw=grid_mw,
@@ -129,8 +131,8 @@ def verdict(freq_ghz, min_elev_deg, weather, airborne_per_station):
 
 if __name__ == "__main__":
     print(f"MTOW {mb['mtow_t']:.0f} t  cruise {CRUISE_MW:.1f} MW   "
-          f"fossil ref: fuel ${n.fuel_cost_per_flight()['cost_usd']:.0f} + "
-          f"a/c ${n.aircraft_cost_per_flight(150.0):.0f}\n")
+          f"fossil ref: fuel ${econ.fuel_cost_per_flight()['cost_usd']:.0f} + "
+          f"a/c ${econ.aircraft_cost_per_flight(150.0):.0f}\n")
     A = 1.0     # LOW density: one plane per station (conservative)
     for weather in ("clear", "heavy_rain"):
         print(f"################  weather = {weather}   (airborne/station = {A})  ################")

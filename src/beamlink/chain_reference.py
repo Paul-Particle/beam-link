@@ -2,7 +2,7 @@
 import numpy as np
 from scipy.integrate import simpson
 
-from field import C_LIGHT, HankelGrid, matched_waists
+from beamlink.field import C_LIGHT, HankelGrid, matched_waists
 
 N_POINTS = 1024
 PAD = 6.0

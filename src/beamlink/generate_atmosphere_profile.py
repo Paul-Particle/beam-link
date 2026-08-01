@@ -76,7 +76,7 @@ def build_profile():
 
 def main():
     p = build_profile()
-    out = Path("data/atmosphere_profile.npz")
+    out = Path(__file__).with_name("data") / "atmosphere_profile.npz"
     out.parent.mkdir(exist_ok=True)
     np.savez_compressed(
         out,

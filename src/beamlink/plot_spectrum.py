@@ -1,8 +1,8 @@
 """Plot atmospheric microwave attenuation vs frequency: gaseous absorption
 (ITU-R P.676, read from the committed CSV) overlaid with rain (ITU-R P.838,
-computed from napkin.rain_coefficients). Writes a self-contained dark HTML.
+computed from relations.rain_coefficients). Writes a self-contained dark HTML.
 
-    uv run python plot_spectrum.py
+    uv run python -m beamlink.plot_spectrum
 """
 from pathlib import Path
 
@@ -10,10 +10,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-import napkin
+from beamlink import relations
 
 DATA = Path(__file__).parent / "data" / "atmospheric_attenuation.csv"
-OUT = Path(__file__).parent / "figures" / "atmospheric_attenuation.html"
+# the CSV is package data; the rendered figure is a repo artifact, hence the climb out of src/
+OUT = Path(__file__).parents[2] / "figures" / "atmospheric_attenuation.html"
 
 GASEOUS_LABELS = {
     "dry_cold": "Dry / cold (polar, 0.5 g/m³)",
@@ -54,9 +55,9 @@ def main():
         ))
 
     # Rain — frequency-dependent specific attenuation (P.838), dashed.
-    rain_k, rain_alpha = napkin.rain_coefficients(frequency_ghz)
+    rain_k, rain_alpha = relations.rain_coefficients(frequency_ghz)
     for rate_mmh, label in RAIN_RATES:
-        gamma = napkin.specific_rain_attenuation(rate_mmh, rain_k, rain_alpha)
+        gamma = relations.specific_rain_attenuation(rate_mmh, rain_k, rain_alpha)
         figure.add_trace(go.Scatter(
             x=frequency_ghz, y=gamma,
             name=label, mode="lines",

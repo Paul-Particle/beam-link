@@ -17,11 +17,11 @@ from pathlib import Path
 
 import numpy as np
 
-import napkin
-import geo
-import diffraction
-import bwb_model
-from bwb_model import (BWBSilhouette, beta_alpha_from_enu, direction_from_beta_alpha,
+from beamlink import relations
+from beamlink import geo
+from beamlink import diffraction
+from beamlink import bwb_model
+from beamlink.bwb_model import (BWBSilhouette, beta_alpha_from_enu, direction_from_beta_alpha,
                        get_mesh, rasterize_silhouette_zbuffer)
 
 
@@ -83,8 +83,8 @@ class Atmosphere:
         rain = np.zeros_like(gaseous)
         if w["rain_rate_mmh"] > 0:
             # 45 deg tilt = circular polarisation, so k and alpha are the H/V mean
-            k, a = napkin.rain_coefficients(f, elevation_deg=90.0, polarization_tilt_deg=45.0)
-            specific = napkin.specific_rain_attenuation(w["rain_rate_mmh"], k, a)
+            k, a = relations.rain_coefficients(f, elevation_deg=90.0, polarization_tilt_deg=45.0)
+            specific = relations.specific_rain_attenuation(w["rain_rate_mmh"], k, a)
             # count whole steps with both ends in the layer: quantises the wet path length
             # to ds and biases it low by up to one step
             seg_in = (alt[..., 1:] < w["rain_top_m"]) & (alt[..., :-1] < w["rain_top_m"])
@@ -99,7 +99,7 @@ class Atmosphere:
         return gaseous + rain + cloud
 
     def transmittance(self, freq_ghz, from_ecef, to_ecef, weather="clear"):
-        return napkin.db_to_fraction(self.path_loss_db(freq_ghz, from_ecef, to_ecef, weather))
+        return relations.db_to_fraction(self.path_loss_db(freq_ghz, from_ecef, to_ecef, weather))
 
 
 # Shared, lazily-loaded singletons so sweeps don't reload the .npz tables per call.
@@ -167,8 +167,8 @@ def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
     """Lumped receive-side derate -- the closed-form alternative to the raster overlap below,
     superseded by it and not called by `evaluate`. Its `incidence_floor=0.70` is the fixed-patch
     rectenna value, left behind when this stopped being called; the live default is 0.90."""
-    conv = napkin.rectenna_efficiency_band(freq_ghz) if np.ndim(freq_ghz) == 0 else \
-        np.array([napkin.rectenna_efficiency_band(f) for f in np.atleast_1d(freq_ghz)]).reshape(np.shape(freq_ghz))
+    conv = relations.rectenna_efficiency_band(freq_ghz) if np.ndim(freq_ghz) == 0 else \
+        np.array([relations.rectenna_efficiency_band(f) for f in np.atleast_1d(freq_ghz)]).reshape(np.shape(freq_ghz))
     # Fold topside (β>90) onto the equivalent belly angle — the airframe is
     # symmetric, so a beam 47° off the top normal is as good as 47° off the belly.
     beta_folded = np.where(np.asarray(beta_deg) > 90.0, 180.0 - np.asarray(beta_deg), beta_deg)
@@ -325,10 +325,10 @@ def relay_convert_efficiency(f_in_ghz, f_out_ghz, mode="active", reflectarray_re
                 of eps wavelengths -- so it does not change frequency and f_out is ignored
     """
     if mode == "active":
-        return napkin.rectenna_efficiency_band(f_in_ghz) * pae_dc_to_rf(f_out_ghz, pae_scenario)
+        return relations.rectenna_efficiency_band(f_in_ghz) * pae_dc_to_rf(f_out_ghz, pae_scenario)
     if mode == "multiplier":
-        order = napkin.multiplier_factor_prime(f_in_ghz, f_out_ghz)
-        chain, _ = napkin.cascade_efficiency(order, stage_efficiency)
+        order = relations.multiplier_factor_prime(f_in_ghz, f_out_ghz)
+        chain, _ = relations.cascade_efficiency(order, stage_efficiency)
         return reflectarray_reflectivity * chain
     ruze = np.exp(-((4 * np.pi * surface_error_frac) ** 2))
     return reflectarray_reflectivity * ruze
@@ -344,7 +344,7 @@ def receiver_radius_from_silhouette(silhouette_area_m2):
 
 def size_emitter_diameter(freq_ghz, slant_m, receiver_radius_m, tau_target=2.0):
     """Emitter diameter for a target near-field coupling τ (τ=2 → ~98% capture)."""
-    return 2.0 * napkin.required_emitter_radius(freq_ghz * 1e9, slant_m, receiver_radius_m, tau_target)
+    return 2.0 * relations.required_emitter_radius(freq_ghz * 1e9, slant_m, receiver_radius_m, tau_target)
 
 
 # --- architectures ----------------------------------------------------------------------
@@ -380,11 +380,11 @@ def hop(atmos, freq_ghz, from_pos, to_pos, receiver_radius_m, weather="clear",
     if emitter_diam_m is None:
         emitter_diam_m = size_emitter_diameter(freq_ghz, slant, receiver_radius_m, tau_target)
     emitter_radius = np.asarray(emitter_diam_m) / 2.0
-    tau = napkin.coupling_tau(freq_ghz * 1e9, slant, emitter_radius, receiver_radius_m)
-    capture = napkin.collection_efficiency(tau)
+    tau = relations.coupling_tau(freq_ghz * 1e9, slant, emitter_radius, receiver_radius_m)
+    capture = relations.collection_efficiency(tau)
     blocked = geo.horizon_blocked(a, b, n_path)
     loss_db = atmos.path_loss_db(freq_ghz, a, b, weather, n_path)
-    transmittance = napkin.db_to_fraction(loss_db) * np.where(blocked, 0.0, 1.0)
+    transmittance = relations.db_to_fraction(loss_db) * np.where(blocked, 0.0, 1.0)
     ap_eff = emitter_aperture_efficiency(scan_deg, error_efficiency)
     return HopResult(freq_ghz=freq_ghz, slant_m=slant, elevation_deg=elevation,
                      emitter_diam_m=np.asarray(emitter_diam_m), tau=tau, capture=capture,
@@ -482,7 +482,7 @@ def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=200
     r_recv = receiver_radius_from_silhouette(max(raster["area"], 1e-6))
     if emitter_diam_m is None:                     # size to τ_target on the equal-area disk
         emitter_diam_m = float(size_emitter_diameter(freq_ghz, slant, r_recv, cfg.tau_target))
-    wavelength = napkin.SPEED_OF_LIGHT / (freq_ghz * 1e9)
+    wavelength = relations.SPEED_OF_LIGHT / (freq_ghz * 1e9)
     shared = dict(area=raster["area"], r_recv=r_recv, beta=float(beta), roll=float(roll),
                   slant=float(slant), elevation=float(elevation), emitter_diam_m=float(emitter_diam_m))
     return raster, float(slant), wavelength, float(emitter_diam_m), shared
@@ -666,14 +666,14 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
     if cfg.relay_pos is None:
         # ---- direct emitter → plane (emitter at station_pos; lofted for the tether case) ----
         f = cfg.f_emit_plane_ghz
-        conv = float(napkin.rectenna_efficiency_band(f))
+        conv = float(relations.rectenna_efficiency_band(f))
         pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
         # Choose the spot profile per geometry and enforce the W/m² cap.
         pc = _capture_with_caps(cfg, station, f, cfg.emitter_diam_m, delivered_mw, conv * pol,
                                 return_field=return_field)
         a, b = _to_ecef(station), _to_ecef(plane)
         blocked = bool(geo.horizon_blocked(a, b, 64))
-        atmos_t = float(napkin.db_to_fraction(atmos.path_loss_db(f, a, b, cfg.weather))) * (0.0 if blocked else 1.0)
+        atmos_t = float(relations.db_to_fraction(atmos.path_loss_db(f, a, b, cfg.weather))) * (0.0 if blocked else 1.0)
         ap_eff = float(emitter_aperture_efficiency(0.0, cfg.emitter_error_efficiency))
         eta_dc_rf = float(eta_grid_to_rf(f, cfg.pae_scenario))
 
@@ -702,13 +702,13 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
                  error_efficiency=cfg.emitter_error_efficiency)
         # down-leg: relay → plane uses the real silhouette overlap; the emitting
         # aperture is the relay's own (fixed) transmit array.
-        conv = float(napkin.rectenna_efficiency_band(f2))
+        conv = float(relations.rectenna_efficiency_band(f2))
         pol = float(polarization_efficiency(cfg.polarization, cfg.plane_attitude[2]))  # roll
         pc = _capture_with_caps(cfg, relay, f2, cfg.relay_aperture_diam_m, delivered_mw, conv * pol,
                                 return_field=return_field)
         a2, b2 = _to_ecef(relay), _to_ecef(plane)
         blocked2 = bool(geo.horizon_blocked(a2, b2, 64))
-        atmos_dn = float(napkin.db_to_fraction(atmos.path_loss_db(f2, a2, b2, cfg.weather))) * (0.0 if blocked2 else 1.0)
+        atmos_dn = float(relations.db_to_fraction(atmos.path_loss_db(f2, a2, b2, cfg.weather))) * (0.0 if blocked2 else 1.0)
 
         convert = float(relay_convert_efficiency(f1, f2, cfg.relay_mode,
                         stage_efficiency=cfg.relay_stage_efficiency, pae_scenario=cfg.pae_scenario))

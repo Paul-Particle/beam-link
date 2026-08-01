@@ -8,12 +8,12 @@ consistency of the reported efficiency chain.
 
 import numpy as np
 
-import napkin
-import geo
-import beam_link as bl
-import diffraction as dfr
-import bwb_model as m
-from bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
+from beamlink import relations
+from beamlink import geo
+from beamlink import beam_link as bl
+from beamlink import diffraction as dfr
+from beamlink import bwb_model as m
+from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
 
 PASS, FAIL = "  ok ", "FAIL "
@@ -125,7 +125,7 @@ def test_coupling():
     with wavelength (so 5.8 GHz needs 30/5.8 times the 30 GHz aperture), and a low-elevation
     pass needs a bigger aperture than a high one because the slant range is longer."""
     print("\n[near-field coupling]")
-    check("collection η(τ=2) ≈ 0.982", abs(napkin.collection_efficiency(2.0) - 0.9817) < 1e-3)
+    check("collection η(τ=2) ≈ 0.982", abs(relations.collection_efficiency(2.0) - 0.9817) < 1e-3)
 
     # Sizing to τ=2 at any frequency yields the same capture; the differentiator is
     # emitter DIAMETER, which scales as λ (∝ 1/f).
@@ -269,7 +269,7 @@ def test_overlap():
         cell = (g[1] - g[0]) ** 2
         return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
                     proj_area=np.full(int(mask.sum()), cell), area=int(mask.sum()) * cell)
-    lam, D, r_t, r_r = napkin.wavelength(30e9), 200e3, 40.0, 15.0
+    lam, D, r_t, r_r = relations.wavelength(30e9), 200e3, 40.0, 15.0
     airy = float(dfr.airy_encircled_energy(r_r, r_t, lam, D))
     geom, _, _ = bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False,
                                     taper_p=0.0, incidence_floor=1.0)
@@ -278,8 +278,8 @@ def test_overlap():
 
     # (1b) The adaptive taper recovers most of the sidelobe loss, tracking the Goubau
     # optimal-coupling envelope 1−e^(−τ²) to within a couple of points on the same disk.
-    tau = napkin.coupling_tau(30e9, D, r_t, r_r)
-    goubau = napkin.collection_efficiency(tau)
+    tau = relations.coupling_tau(30e9, D, r_t, r_r)
+    goubau = relations.collection_efficiency(tau)
     best = max(bl.overlap_capture(disk_raster(r_r), r_t, lam, D, shaped=False,
                                   taper_p=p, incidence_floor=1.0)[0]
                for p in (0.0, 0.5, 1.0, 1.5, 2.0))
@@ -328,7 +328,7 @@ def test_gaussian_beam():
     lambda*L/(pi*a) at the focus, and its true waist forms at or short of the focus. The last
     check pins `focused_spot_waist` at exactly sqrt(2) times that focal radius."""
     print("\n[exact Gaussian beam — aperture → waist → beyond]")
-    lam, a = napkin.wavelength(5.8e9), 50.0
+    lam, a = relations.wavelength(5.8e9), 50.0
     for L in (11e3, 107e3, 213e3):
         w, w0, z_waist = bl.gaussian_beam_radius(np.array([0.0, L]), a, lam, L)
         check(f"w(0)=aperture radius (L={L/1e3:.0f} km)", abs(w[0] - a) < 1e-6, f"{w[0]:.3f} vs {a}")
@@ -420,7 +420,7 @@ def test_taper():
         cell = (g[1] - g[0]) ** 2
         return dict(u=uu[mask], v=vv[mask], incidence=np.ones(int(mask.sum())),
                     proj_area=np.full(int(mask.sum()), cell), area=int(mask.sum()) * cell)
-    lam, D, r_t = napkin.wavelength(30e9), 200e3, 40.0
+    lam, D, r_t = relations.wavelength(30e9), 200e3, 40.0
     # On a receiver the size of the uniform aperture's main lobe (first Airy null), the
     # uniform pattern spills ~16 % into sidelobes that miss the disk; a taper trades main-lobe
     # width for far lower sidelobes and so lands MORE of the power on the disk.
