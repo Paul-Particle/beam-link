@@ -133,6 +133,67 @@ def focal_intensity(semi_major_m, semi_minor_m, wavelength_m, focus_range_m,
                            wavelength_m, taper_p=taper_p, n_grid=n_grid)
 
 
+def focal_intensity_at(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
+                       qx, qy, taper_p=0.0, n_ap=512):
+    """Scalar-diffraction focal intensity evaluated DIRECTLY at arbitrary query points (qx, qy) in
+    the plane at range `z_m` (aperture principal frame: x = aperture-major axis → spot-MINOR).
+
+    A direct DFT from the aperture samples to the query points — NOT an FFT on a fixed grid. So the
+    spot is resolved at the QUERY resolution however fine (evaluate on the silhouette's own pixels),
+    and no ±λz/d window is spent computing empty space. `n_ap` sets the aperture sampling grid (the
+    residual focusing phase and taper are carried on it); only its non-zero samples enter the sum.
+    Power-normalised consistently with `plane_intensity` (∫∫ I dA = 1 over all space), verified to
+    match it at shared grid points. `qx`, `qy` are broadcast/flattened together; returns |E|² at each.
+
+    Cost is O(n_query · n_aperture_samples); the query loop is chunked to bound memory."""
+    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
+    coord = (np.arange(n_ap) - n_ap // 2) * d
+    X, Y = np.meshgrid(coord, coord, indexing="ij")
+    amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)
+    inside = amp > 0.0
+    ax, ay = X[inside], Y[inside]
+    av = amp[inside].astype(np.complex128)
+    inv = 1.0 / max(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9)
+    if inv != 0.0:                                         # residual quadratic (defocus) phase
+        av = av * np.exp(1j * np.pi / wavelength_m * inv * (ax ** 2 + ay ** 2))
+    qx = np.asarray(qx, dtype=float).ravel()
+    qy = np.asarray(qy, dtype=float).ravel()
+    k = 2.0 * np.pi / (wavelength_m * z_m)                 # aperture-freq → focal-position kernel
+    norm = float((amp ** 2).sum()) * (wavelength_m * z_m / d) ** 2   # Parseval total (∫∫I dA = 1)
+    out = np.empty(qx.size, dtype=float)
+    chunk = max(1, int(4.0e6 / max(av.size, 1)))          # cap the (chunk × n_ap) complex block
+    for s in range(0, qx.size, chunk):
+        phase = -k * (np.outer(qx[s:s + chunk], ax) + np.outer(qy[s:s + chunk], ay))
+        field = np.exp(1j * phase) @ av
+        out[s:s + chunk] = field.real ** 2 + field.imag ** 2
+    return out / norm if norm > 0 else out
+
+
+def focal_intensity_grid(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
+                         x_out, y_out, taper_p=0.0, n_ap=512):
+    """Direct scalar-diffraction focal intensity on an axis-aligned OUTPUT grid (x_out × y_out,
+    aperture principal frame: x = aperture-major → spot-MINOR). Because the output is a grid the DFT
+    is SEPARABLE — E = Wx · A · Wy, two matrix products instead of a per-point sum — so it ZOOMS to
+    whatever window/resolution you pass (e.g. the silhouette's own pixel grid, high-res on the spot)
+    for the cost of a couple of BLAS calls, no ±λz/d FFT window wasted on empty space. Power-
+    normalised like `plane_intensity` (∫∫ I dA = 1). Returns intensity[i, j] at (x_out[i], y_out[j])."""
+    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
+    coord = (np.arange(n_ap) - n_ap // 2) * d
+    X, Y = np.meshgrid(coord, coord, indexing="ij")
+    amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)
+    A = amp.astype(np.complex128)
+    inv = 1.0 / max(z_m, 1e-9) - 1.0 / max(focus_range_m, 1e-9)
+    if inv != 0.0:
+        A = A * np.exp(1j * np.pi / wavelength_m * inv * (X ** 2 + Y ** 2))
+    k = 2.0 * np.pi / (wavelength_m * z_m)
+    Wx = np.exp(-1j * k * np.outer(np.asarray(x_out, float), coord))   # (nx, N)
+    Wy = np.exp(-1j * k * np.outer(coord, np.asarray(y_out, float)))   # (N, ny)
+    field = Wx @ A @ Wy                                               # (nx, ny)
+    norm = float((amp ** 2).sum()) * (wavelength_m * z_m / d) ** 2
+    inten = field.real ** 2 + field.imag ** 2
+    return inten / norm if norm > 0 else inten
+
+
 def _cut_enclosed(line, coord, dcoord, marginal, radial_m, r_query):
     """One plane's cut resampled onto radial_m, plus its strip-marginal enclosed-energy row
     E(r) = fraction of the plane's TOTAL power in the strip |coord| < r (∫∫ I dA = 1, so it

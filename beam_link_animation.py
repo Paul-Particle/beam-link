@@ -63,13 +63,6 @@ def _build_stamp():
 # 384 converges (RMS <0.2 %). n≥320 also trips scipy's multi-threaded FFT (see _fft_workers).
 CHANNEL_NGRID = 384
 
-# Panel-A encircled-energy contours recompute the focal-plane intensity at THIS (finer) grid. The
-# capture grid (384) sizes its window to the elongated APERTURE (~±1 km), so the tiny focused SPOT
-# lands on only ~5 px across its narrow axis — enough for the capture integral, but the iso-energy
-# contours come out jagged. 1024 resolves the spot (~13 px) → smooth contours; it's a display-only
-# recompute (one extra FFT/frame, cached), the capture number stays on the 384 field.
-CONTOUR_NGRID = 1024
-
 # Play button: a custom sequential stepper. Each frame swaps the five baked background images
 # (one `Plotly.relayout`) and restyles the handful of live vector traces (contours, plane slices,
 # curve markers) — no z-grid re-raster and no per-frame contour recompute, so playback stays
@@ -754,22 +747,30 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     _encA_cache = {}
 
     def _panelA_enc(f):
-        """High-res encircled-energy field for panel A, cached per frame. The focal-plane intensity is
-        RECOMPUTED at CONTOUR_NGRID from the winning leg's aperture/focus/taper (the 384 capture grid
-        undersamples the tiny spot → jagged contours). Returns (enc[ix,iy], x_axis, y_axis, evecs);
-        evecs are the silhouette's display principal axes [minor, major] = [x_axis, y_axis] dirs."""
+        """High-res encircled-energy field for panel A, cached per frame. The focal intensity is
+        evaluated by a direct separable ZOOM-DFT (`focal_intensity_grid`) on a window sized to CONTAIN
+        the beam (main lobe + several sidelobe rings) at high resolution: the ±λz/d single-FFT window
+        undersamples the tiny spot (jagged contours) and a panel-sized window truncates a spread beam
+        (edge-clip loops). Returns (enc[ix,iy], x_axis, y_axis, evecs); evecs = display principal axes
+        [minor, major] = [x_axis, y_axis] directions."""
         key = id(f)
         if key not in _encA_cache:
             leg = f["chan_legs"][-1]
-            xa, ya, I = dfr.plane_intensity(f["slant_m"], leg["focus_m"], leg["ap_major"],
-                                            leg["ap_minor"], leg["lam"], taper_p=leg["taper_p"],
-                                            n_grid=CONTOUR_NGRID)
-            flat = np.asarray(I, float).ravel(); order = np.argsort(flat)[::-1]
+            z, foc, lam = f["slant_m"], leg["focus_m"], leg["lam"]
+            apmaj, apmin = leg["ap_major"], leg["ap_minor"]
+            defocus = abs(1.0 - z / max(foc, 1e-9))
+            wx = 6.0 * lam * z / max(apmaj, 1e-3) + 1.5 * apmaj * defocus   # narrow (minor) spot dir
+            wy = 6.0 * lam * z / max(apmin, 1e-3) + 1.5 * apmin * defocus   # wide (major) spot dir
+            n = 640
+            xa = np.linspace(-wx, wx, n)
+            ya = np.linspace(-wy, wy, n)
+            I = dfr.focal_intensity_grid(z, foc, apmaj, apmin, lam, xa, ya, taper_p=leg["taper_p"])
+            flat = I.ravel(); order = np.argsort(flat)[::-1]
             enc = np.empty_like(flat)
             enc[order] = np.clip(np.cumsum(flat[order]) * (xa[1] - xa[0]) * (ya[1] - ya[0]), 0.0, 1.0)
             coords = np.vstack([f["field"]["u"], f["field"]["v"]])
             _, evecs = np.linalg.eigh(np.cov(coords))
-            _encA_cache[key] = (enc.reshape(np.shape(I)), xa, ya, evecs)
+            _encA_cache[key] = (enc.reshape(I.shape), xa, ya, evecs)
         return _encA_cache[key]
 
     def incid_contour(f, levels):

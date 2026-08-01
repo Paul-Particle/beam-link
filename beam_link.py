@@ -306,14 +306,26 @@ def overlap_capture(raster, emitter_radius_m, wavelength_m, slant_m, shaped=Fals
     # is oriented so that narrow spot axis lands on the silhouette MINOR axis.
     ap_major, ap_minor = emitter_radius_m * np.sqrt(aspect), emitter_radius_m / np.sqrt(aspect)
 
-    x_ax, y_ax, intensity = diffraction.plane_intensity(
-        slant_m, focus, ap_major, ap_minor, wavelength_m, taper_p=taper_p, n_grid=n_grid)
-    # grid x = spot minor ↔ silhouette minor coord pc[0]; grid y = spot major ↔ major coord pc[1].
+    # Evaluate the focal intensity on a FINE grid MATCHED to the silhouette region (a direct separable
+    # zoom-DFT, `focal_intensity_grid`) and integrate the beam over the plane's area there — NOT the
+    # ±λz/d single-FFT window (`plane_intensity`), which spends its resolution on empty space and
+    # leaves the tiny focused spot only ~5 px across (undersampled → capture error). The zoom resolves
+    # the spot at the silhouette's own scale, so capture is the beam integrated over the silhouette
+    # pixels at high accuracy. grid x = spot minor ↔ pc[0]; grid y = spot major ↔ pc[1].
+    rx = max(float(np.abs(pc[0]).max()), ap_minor * 0.05, 1.0) * 1.15
+    ry = max(float(np.abs(pc[1]).max()), ap_major * 0.05, 1.0) * 1.15
+    x_ax = np.linspace(-rx, rx, n_grid)
+    y_ax = np.linspace(-ry, ry, n_grid)
+    intensity = diffraction.focal_intensity_grid(slant_m, focus, ap_major, ap_minor, wavelength_m,
+                                                 x_ax, y_ax, taper_p=taper_p)
     beam = diffraction.sample_focal_intensity(x_ax, y_ax, intensity, pc[0], pc[1])
 
     geom = min(float(np.sum(beam * proj)), 1.0)
     eff = min(float(np.sum(beam * proj * inc_eff)), 1.0)
-    peak = float(intensity.max())
+    # Peak areal intensity (for the W/m² density cap) at the spot centre — evaluate it exactly rather
+    # than take the fine-grid max (the centre need not land on a grid node).
+    peak = float(diffraction.focal_intensity_at(slant_m, focus, ap_major, ap_minor, wavelength_m,
+                                                np.zeros(1), np.zeros(1), taper_p=taper_p)[0])
     if return_field:
         return geom, eff, peak, dict(u=u, v=v, beam=beam, incidence=inc, proj_area=proj,
                                      x_axis=x_ax, y_axis=y_ax, intensity=intensity,
