@@ -1,25 +1,10 @@
-"""Blended-wing-body silhouette model for the beam-link engine.
+"""Parametric blended-wing-body geometry and its silhouette area vs viewing direction.
 
-The receiving aperture on the aircraft is NOT constant: with a fully conformal
-rectenna over all surfaces, the geometric power a beam can deliver is set by the
-aircraft's SILHOUETTE (shadow) area toward the emitter — which collapses from the
-full planform (belly-on, emitter overhead) toward a thin edge (side/nose-on, low
-elevation). This module builds a parametric BWB as a closed triangulated surface
-and computes that silhouette area for arbitrary beam-arrival directions.
-
-Method: for a closed, (near-)convex body the projected (shadow) area toward a unit
-direction d is  A(d) = Σ_i max(0, n̂_i·d)·A_i  over outward-facing triangles — the
-standard convex projected-area identity, exact for a convex body and a good
-approximation for the smooth blended lens here (self-occlusion among front faces is
-the only error, small for a shallow body). Fully vectorized over directions.
-
-Body frame:  x̂ = nose (forward), ŷ = starboard (right), ẑ = belly (down).
-A beam-arrival direction (aircraft → emitter) is described by
-  β  = polar angle from the belly axis +ẑ  (β=0 → belly-on, maximum area),
-  α  = azimuth from the nose +x̂ toward starboard +ŷ.
-
-Run:  uv run python bwb_model.py   → builds data/bwb_silhouette.npz + a 3-view figure.
+Body frame throughout: +x nose, +y starboard, +z belly (so "down" for level flight). A
+look direction is given as (beta, alpha): beta is the angle off the belly axis (0 = straight
+below the aircraft) and alpha the azimuth about it, from the nose towards starboard.
 """
+
 from __future__ import annotations
 
 import os
@@ -31,9 +16,8 @@ import numpy as np
 # --- Parametric mesh ----------------------------------------------------------
 
 def _cuboid(center, size):
-    """Axis-aligned closed box (8 verts, 12 triangles) — used for winglets/fins.
-    Returned as a thin closed slab so the convex projected-area identity gives its
-    correct |n̂·d|·A projection."""
+    """Dead: no caller anywhere in the tree. Only its 12-triangle face table survives, copied
+    into `_winglet_prism`."""
     cx, cy, cz = center
     sx, sy, sz = np.array(size) / 2.0
     v = np.array([[cx - sx, cy - sy, cz - sz], [cx + sx, cy - sy, cz - sz],
@@ -47,11 +31,8 @@ def _cuboid(center, size):
 
 def _winglet_prism(tip_center_x, y_tip, root_chord, tip_chord, height,
                    fin_sweep, cant_deg, thickness):
-    """A realistic wingtip winglet: a thin, tapered, swept, canted-outward DORSAL fin
-    (root chord > tip chord, leading edge swept aft, canted `cant_deg` off vertical toward
-    the tip, rising in −ẑ = up in the z-down body frame). Returned as a closed thin prism
-    (8 verts, 12 triangles) so the projected-area/rasteriser see its real |n̂·d|·A. Far
-    smaller than a full fin — the big side-area radiator is the (future) sail/stabiliser."""
+    """Flat tapered fin at a wing tip, canted outboard by cant_deg and rising away from the
+    belly (-z), swept aft by fin_sweep. Same 12-triangle topology as `_cuboid`."""
     side = 1.0 if y_tip >= 0 else -1.0
     cant = np.radians(cant_deg)
     rise = np.array([0.0, side * np.sin(cant), -np.cos(cant)])       # up-and-outboard
@@ -74,15 +55,12 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
                   body_fraction=0.25, n_span=71, n_theta=40,
                   winglet_height_m=3.0, winglet_root_chord_m=3.0, winglet_tip_chord_m=1.2,
                   winglet_sweep_m=1.5, winglet_cant_deg=20.0, winglet_thickness_m=0.3):
-    """A blended-wing-body as a closed lofted lens, optionally with wingtip winglets.
+    """Closed triangle mesh: elliptical cross-sections lofted along the span.
 
-    Spanwise the chord and thickness are constant over the centre body
-    (`body_fraction` of the half-span) then taper to the tip; the leading edge
-    sweeps aft by `sweep_m` from root to tip. Each spanwise station's cross-section
-    (in the length–thickness plane) is an ellipse, so the body is a smooth closed
-    surface. Vertical winglets at the tips (set `winglet_height_m=0` to omit) present
-    receiving area at low elevation, exactly where the belly silhouette collapses.
-    Returns (vertices (N,3), faces (M,3) int)."""
+    Chord and thickness are constant over the centre body (|u| < body_fraction of the
+    half-span) and taper linearly to the tip beyond it; section centres move aft with |u|
+    to give the sweep. Returns (vertices Nx3 m, faces Mx3 indices).
+    """
     half_span = full_span_m / 2.0
     u = np.linspace(-1.0, 1.0, n_span)              # spanwise fraction (−1..1)
     au = np.abs(u)
@@ -92,7 +70,7 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
     y_center = -sweep_m * au                          # nose forward at centre, tips aft
     x_span = u * half_span
 
-    psi = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    psi = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)  # around each section
     cos_psi, sin_psi = np.cos(psi), np.sin(psi)
 
     # Vertex grid: (n_span, n_theta, 3) in body axes x̂=nose, ŷ=starboard, ẑ=vertical.
@@ -113,8 +91,7 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
             faces.append((a, b, c))
             faces.append((a, c, d))
 
-    # Cap the two spanwise ends (fan to the ring centroid) so the surface is closed.
-    for i in (0, n_span - 1):
+    for i in (0, n_span - 1):  # cap both wing tips with a fan, wound to face outboard
         ring = verts[i]
         center = ring.mean(axis=0)
         c_idx = len(vertices)
@@ -141,7 +118,8 @@ def make_bwb_mesh(full_span_m=80.0, root_chord_m=40.0, tip_chord_m=3.0,
 
 
 def _connected_components(vertices, faces):
-    """Component id (0..k-1) per vertex, via shared-vertex union-find over the faces."""
+    """Union-find label per vertex. Needed because the mesh is three disjoint bodies
+    (centre body plus two winglets) and each must be oriented about its own centroid."""
     parent = np.arange(len(vertices))
 
     def find(x):
@@ -162,15 +140,7 @@ def _connected_components(vertices, faces):
 
 
 def triangle_normals_areas(vertices, faces):
-    """Outward unit normals and areas for each triangle.
-
-    Each normal is oriented to point away from the centroid of the triangle's own
-    connected component, not the whole-mesh centroid. A global centroid mis-orients a
-    thin appendage that sits far off-centre (e.g. a wingtip winglet): both of its faces
-    lie to one side of the body centre, so the global test flips the inboard face
-    outward too, leaving both faces pointing the same way. A per-component centroid,
-    which the lofted body and each winglet are each star-convex about, orients both
-    faces of every part correctly."""
+    """Per-face unit normals (forced outward) and areas in m^2, ignoring winding order."""
     v0, v1, v2 = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
     cross = np.cross(v1 - v0, v2 - v0)
     area = 0.5 * np.linalg.norm(cross, axis=1)
@@ -183,16 +153,15 @@ def triangle_normals_areas(vertices, faces):
     ref = comp_centroid[comp[faces[:, 0]]]                 # each face's own-part centroid
 
     tri_centroid = (v0 + v1 + v2) / 3.0
-    outward = np.sum(normal * (tri_centroid - ref), axis=1) < 0
+    outward = np.sum(normal * (tri_centroid - ref), axis=1) < 0  # i.e. currently inward
     normal[outward] *= -1.0
     return normal, area
 
 
 def projected_area(view_dirs, normals, areas):
-    """Silhouette area toward each unit direction: Σ max(0, n̂·d)·A.
-
-    `view_dirs` may be (3,) or (...,3); returns scalar or (...) matching the lead
-    dimensions. Fully vectorized."""
+    """Sum of area*max(n.v, 0) in m^2 -- the silhouette area for a convex closed body.
+    Self-occlusion is not modelled, so concave shadowing is overcounted (see the
+    z-buffer rasterisers below)."""
     view = np.asarray(view_dirs, dtype=float)
     view = view / (np.linalg.norm(view, axis=-1, keepdims=True) + 1e-30)
     dots = view @ normals.T                              # (..., M)
@@ -210,9 +179,8 @@ def direction_from_beta_alpha(beta_deg, alpha_deg):
 
 
 def silhouette_aspect(beta_deg, alpha_deg, mesh_kwargs=None):
-    """Aspect ratio (major/minor extent) of the projected silhouette outline for a
-    beam-arrival direction — the shape-elongation the emitter's spot must match.
-    PCA on the projected vertices; scalar inputs. Returns (aspect, major_m, minor_m)."""
+    """(major/minor, major, minor) extents in m of the outline projected on the view plane,
+    measured along the principal axes of the projected vertex cloud."""
     verts, _ = make_bwb_mesh(**(mesh_kwargs or {}))
     d = direction_from_beta_alpha(float(beta_deg), float(alpha_deg))
     d = d / np.linalg.norm(d)
@@ -236,9 +204,8 @@ def silhouette_aspect(beta_deg, alpha_deg, mesh_kwargs=None):
 # the incidence angle of the skin the beam actually reaches, cell by cell.
 
 def surface_samples(mesh_kwargs=None, target_points=120_000, seed=0):
-    """Dense surface point cloud with per-point outward normal and area weight,
-    sampled uniformly over the mesh (points-per-triangle ∝ area). Cached by the
-    caller; this is the geometry the rasterizer projects."""
+    """Area-weighted uniform point cloud over the skin: (points, per-point normal,
+    per-point surface area m^2). Weights sum to the total wetted area."""
     vertices, faces = make_bwb_mesh(**(mesh_kwargs or {}))
     normals, areas = triangle_normals_areas(vertices, faces)
     counts = np.maximum(1, np.round(target_points * areas / areas.sum()).astype(int))
@@ -256,7 +223,8 @@ def surface_samples(mesh_kwargs=None, target_points=120_000, seed=0):
 
 
 def _view_basis(look_dir):
-    """Orthonormal (û, v̂, ŵ) with ŵ = look direction (body→emitter)."""
+    """Orthonormal (u, v, w) with w along the look direction, i.e. towards the emitter, so
+    that depth along w increases towards it. u, v span the illuminated plane."""
     w = np.asarray(look_dir, dtype=float)
     w = w / (np.linalg.norm(w) + 1e-30)
     ref = np.array([0.0, 0.0, 1.0]) if abs(w[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
@@ -267,20 +235,15 @@ def _view_basis(look_dir):
 
 def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
                          n_grid=150, depth_tol_m=1.0):
-    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter), as a set
-    of VISIBLE surface samples — a Monte-Carlo estimate, not a cell-count.
+    """Visible-surface point cloud as seen from `look_dir`, occlusion by depth-sorting the
+    surface samples into view-plane cells.
 
-    Each front-facing sample carries its surface-area weight; its projected-area
-    contribution is `weight·(n̂·ŵ)`. A sample is *occluded* (dropped) if another
-    front-facing sample in its view-plane grid cell is nearer the emitter by more than
-    `depth_tol_m` — so a winglet behind the wing, or the far wing behind the body, is
-    removed, while co-located skin at the same depth is kept. The grid is only an
-    occlusion hash, so the returned area/overlap are **grid-independent** (they
-    converge with sample count, unlike counting covered cells × cell area).
-
-    Returns view-plane coords (u, v, metres, centred on the projected-area centroid),
-    per-sample incidence cosine, per-sample projected area `proj_area`, and the total
-    self-occluded silhouette area (= Σ proj_area)."""
+    Returns the receiver-element description consumed by beam_link.overlap_capture:
+      u, v         in-plane offsets (m) from the projected-area centroid
+      incidence    cos of the angle between the local normal and the look direction
+      proj_area    area (m^2) each element presents to the beam, i.e. skin area * incidence
+      area         sum of proj_area == illuminated silhouette area (m^2)
+    """
     u_ax, v_ax, w_ax = _view_basis(look_dir)
     incidence = sample_normals @ w_ax
     front = incidence > 1e-6                          # skin facing the emitter
@@ -301,6 +264,7 @@ def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
 
     cell_max_depth = np.full(n_grid * n_grid, -np.inf)
     np.maximum.at(cell_max_depth, cell, depth)
+    # keep whatever is within depth_tol_m of the nearest-to-emitter sample in its cell
     visible = depth >= cell_max_depth[cell] - depth_tol_m
 
     U, V, inc, proj = U[visible], V[visible], inc[visible], (wt[visible] * inc[visible])
@@ -312,19 +276,9 @@ def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
 
 def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
                            u_lin, v_lin, color=None):
-    """Deterministic z-buffered rasterization of the mesh onto a FIXED view-plane grid.
-
-    A crisp, resolution-independent alternative to Monte-Carlo point binning: project every
-    front-facing triangle onto the (`u_ax`, `v_ax`) view plane, scan-convert it with barycentric
-    coverage, and keep — per pixel — the triangle NEAREST the emitter (depth along `w_ax`, larger =
-    nearer). Returns `incid`, the incidence cosine (n̂·ŵ, = `face_incidence`) of the winning triangle
-    at each pixel (NaN where uncovered — the true self-occluded outline). Because depth resolves
-    occlusion exactly (a winglet behind the wing, the far wing behind the body), thin features render
-    at their real width instead of being blurred by a smoothing radius. Pixel (row r, col c) is
-    centred at (u_lin[c], v_lin[r]); `u_ax`/`v_ax`/`w_ax` are the (already dorsal-up-rotated) view
-    basis, `face_incidence` = normals @ w_ax (precomputed so callers can reuse it). By default each
-    covered pixel stores `face_incidence` (the cull/occlusion cosine); pass `color` (a per-FACE array)
-    to store THAT instead — e.g. cull/occlude by the VIEW direction but colour by BEAM incidence."""
+    """Barycentric z-buffer rasteriser over the front-facing triangles. Returns an image of
+    face incidence (or of `color`), NaN where nothing was drawn. Depth increases towards the
+    emitter, so the largest depth wins."""
     U = vertices @ u_ax
     V = vertices @ v_ax
     depth = vertices @ w_ax                              # larger = nearer the emitter
@@ -369,16 +323,10 @@ def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
 
 
 def rasterize_silhouette_zbuffer(look_dir, vertices, faces, face_normals, n_grid=200, margin=1.06):
-    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter) via a DETERMINISTIC
-    z-buffer — a drop-in replacement for the Monte-Carlo `rasterize_silhouette`, same return dict.
-
-    Rasterizes the mesh onto an n_grid×n_grid view-plane grid fitted to the front-facing projection
-    (square cells, small `margin`), then returns the COVERED pixels as 'samples': centre (u, v) in
-    metres (centred on the projected-area centroid), per-pixel incidence cosine, and a CONSTANT
-    per-pixel projected area `proj_area = dA`. The pixel IS the projected-area element, so
-    Σ beam·proj_area = Σ beam·dA is the overlap integral with NO separate incidence factor (unlike
-    the MC weights, which carry n̂·ŵ). Deterministic ⇒ no sampling noise; the area and overlap
-    converge with n_grid. The grid here IS the resolution at which the capture integral is taken."""
+    """Same output schema as `rasterize_silhouette`, but from the mesh instead of a point
+    cloud: each covered pixel is one receiver element of area du*dv, already a projected
+    area, and `area` is the pixel-counted silhouette area. The square window is fitted to
+    the front-facing vertices with `margin` slack."""
     u_ax, v_ax, w_ax = _view_basis(look_dir)
     U = vertices @ u_ax
     V = vertices @ v_ax
@@ -419,6 +367,7 @@ def get_mesh(mesh_kwargs=None):
     any body resolution. This is the capture-path mesh; panel-A DISPLAY uses a finer mesh."""
     global _MESH
     if _MESH is None or mesh_kwargs is not None:
+        # coarser than make_bwb_mesh's default: this mesh is re-rasterised per view angle
         v, f = make_bwb_mesh(**(mesh_kwargs or dict(n_span=41, n_theta=26)))
         n, _ = triangle_normals_areas(v, f)
         _MESH = (v, f, n)
@@ -442,7 +391,8 @@ _TABLE_PATH = Path(__file__).with_name("data") / "bwb_silhouette.npz"
 
 
 def build_table(beta_step_deg=2.0, alpha_step_deg=5.0, mesh_kwargs=None, save=True):
-    """Precompute silhouette area over (β, α) and (optionally) cache to npz."""
+    """Precompute silhouette area (m^2) on a (beta, alpha) grid, plus the belly-on planform
+    area. Convex projected area only -- no occlusion, unlike the rasterisers."""
     vertices, faces = make_bwb_mesh(**(mesh_kwargs or {}))
     normals, areas = triangle_normals_areas(vertices, faces)
     beta = np.arange(0.0, 180.0 + 1e-9, beta_step_deg)
@@ -473,7 +423,9 @@ class BWBSilhouette:
         self.beta, self.alpha, self.table, self.planform_area = load_table()
 
     def area(self, beta_deg, alpha_deg):
-        """Silhouette area (m²) for arrays of (β, α) — bilinear on the cached grid."""
+        """Interpolated silhouette area in m^2. The beta fold is defensive only: every in-tree
+        caller derives beta from an arccos and is therefore already in 0..180, so the fold --
+        and the alpha flip a true polar wrap would also need, which it omits -- never fires."""
         beta_deg = np.mod(np.asarray(beta_deg, dtype=float), 360.0)
         beta_deg = np.where(beta_deg > 180.0, 360.0 - beta_deg, beta_deg)   # fold to 0..180
         alpha_deg = np.mod(np.asarray(alpha_deg, dtype=float), 360.0)
@@ -502,10 +454,9 @@ def _rodrigues(vec, axis, angle_rad):
 
 
 def body_axes_enu(heading_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
-    """Body axes (nose, starboard, belly) expressed in ENU (x=E, y=N, z=up).
-
-    heading: 0 = nose toward North, increasing clockwise from above (toward East).
-    pitch: nose-up positive. roll: right-wing-down positive."""
+    """Body axes expressed in local ENU. Heading is measured from north towards east;
+    positive pitch is nose-up (about starboard), positive roll is right-wing-down
+    (about the nose), applied in that order."""
     psi = np.radians(heading_deg)
     nose = np.array([np.sin(psi), np.cos(psi), 0.0])
     star = np.array([np.cos(psi), -np.sin(psi), 0.0])
@@ -518,7 +469,7 @@ def body_axes_enu(heading_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
 
 
 def beta_alpha_from_enu(dir_enu, heading_deg=0.0, pitch_deg=0.0, roll_deg=0.0):
-    """(β, α) in body frame for a beam-arrival direction given in ENU."""
+    """ENU direction (aircraft -> emitter) to body-frame (beta, alpha) in degrees."""
     nose, star, belly = body_axes_enu(heading_deg, pitch_deg, roll_deg)
     d = np.asarray(dir_enu, dtype=float)
     d = d / (np.linalg.norm(d, axis=-1, keepdims=True) + 1e-30)
