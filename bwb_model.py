@@ -310,6 +310,61 @@ def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
                 area=float(proj.sum()), n_grid=n_grid)
 
 
+def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
+                           u_lin, v_lin):
+    """Deterministic z-buffered rasterization of the mesh onto a FIXED view-plane grid.
+
+    A crisp, resolution-independent alternative to Monte-Carlo point binning: project every
+    front-facing triangle onto the (`u_ax`, `v_ax`) view plane, scan-convert it with barycentric
+    coverage, and keep — per pixel — the triangle NEAREST the emitter (depth along `w_ax`, larger =
+    nearer). Returns `incid`, the incidence cosine (n̂·ŵ, = `face_incidence`) of the winning triangle
+    at each pixel (NaN where uncovered — the true self-occluded outline). Because depth resolves
+    occlusion exactly (a winglet behind the wing, the far wing behind the body), thin features render
+    at their real width instead of being blurred by a smoothing radius. Pixel (row r, col c) is
+    centred at (u_lin[c], v_lin[r]); `u_ax`/`v_ax`/`w_ax` are the (already dorsal-up-rotated) view
+    basis, `face_incidence` = normals @ w_ax (precomputed so callers can reuse it)."""
+    U = vertices @ u_ax
+    V = vertices @ v_ax
+    depth = vertices @ w_ax                              # larger = nearer the emitter
+    n_u, n_v = u_lin.size, v_lin.size
+    du = (u_lin[-1] - u_lin[0]) / (n_u - 1)
+    dv = (v_lin[-1] - v_lin[0]) / (n_v - 1)
+    px = (U - u_lin[0]) / du                             # fractional pixel coords of each vertex
+    py = (V - v_lin[0]) / dv
+    zbuf = np.full((n_v, n_u), -np.inf)
+    incid = np.full((n_v, n_u), np.nan, dtype=np.float32)
+    for tri, inc in zip(faces, face_incidence):
+        if inc <= 1e-6:
+            continue                                     # back-facing → never visible
+        i0, i1, i2 = tri
+        x0, y0, d0 = px[i0], py[i0], depth[i0]
+        x1, y1, d1 = px[i1], py[i1], depth[i1]
+        x2, y2, d2 = px[i2], py[i2], depth[i2]
+        lo_x = max(int(np.floor(min(x0, x1, x2))), 0)
+        hi_x = min(int(np.ceil(max(x0, x1, x2))), n_u - 1)
+        lo_y = max(int(np.floor(min(y0, y1, y2))), 0)
+        hi_y = min(int(np.ceil(max(y0, y1, y2))), n_v - 1)
+        if lo_x > hi_x or lo_y > hi_y:
+            continue                                     # triangle off-grid
+        denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(denom) < 1e-12:
+            continue                                     # degenerate (edge-on) projection
+        gx, gy = np.meshgrid(np.arange(lo_x, hi_x + 1), np.arange(lo_y, hi_y + 1))
+        a = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / denom
+        b = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / denom
+        c = 1.0 - a - b
+        inside = (a >= 0) & (b >= 0) & (c >= 0)
+        if not inside.any():
+            continue
+        gyi, gxi = gy[inside], gx[inside]
+        di = a[inside] * d0 + b[inside] * d1 + c[inside] * d2
+        win = di > zbuf[gyi, gxi]                         # nearer than the current occupant
+        wy, wx = gyi[win], gxi[win]
+        zbuf[wy, wx] = di[win]
+        incid[wy, wx] = inc
+    return incid
+
+
 # Cached sample cloud for the default airframe.
 _SAMPLES = None
 

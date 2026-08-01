@@ -113,6 +113,11 @@ _BEAM_LEVELS = (0.1, 0.5, 0.8)
 _SIL_SOLID = (0.1, 0.5, 0.8)
 _SIL_DOTTED = (0.3, 0.7)
 
+# Beam-map overlay line weight: the emitter half-aperture outline, the white aperture (z=0) line and
+# the plane slice line ALL share this one thin weight (matched to the ellipse border) and are all
+# white, so aperture + plane + ellipse read as a single coherent frame rather than chunky markers.
+_MAP_EDGE_W = 1.0
+
 
 def _field_to_png(field01, transpose=False, flip_rows=False, cmap="plasma"):
     """A 2-D field already scaled to [0, 1] → a base64 PNG data-URI: ONE pixel per sample, with
@@ -187,18 +192,6 @@ def _funnel_contour(enc, dist, radial, levels=_CONTOUR_LEVELS):
             r_out.extend(sign * r_lvl); r_out.append(np.nan)
             z_out.extend(dist);         z_out.append(np.nan)
     return np.asarray(r_out), np.asarray(z_out)
-
-
-def _box_sum(a, r):
-    """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
-    box filter used to fill the gaps between Monte-Carlo silhouette samples."""
-    height, width = a.shape
-    padded = np.pad(a, r)
-    out = np.zeros_like(a)
-    for di in range(2 * r + 1):
-        for dj in range(2 * r + 1):
-            out += padded[di:di + height, dj:dj + width]
-    return out
 
 
 # --- one frame's worth of physics --------------------------------------------
@@ -338,13 +331,16 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     # view — otherwise the view basis is arbitrary and the (small, dorsal) winglets can
     # project downward, disagreeing with panel C. Rotate the silhouette coords in-plane;
     # the beam is re-derived from them downstream, so it rotates consistently.
-    u_ax, v_ax, _ = m._view_basis(look)
+    u_ax, v_ax, w_ax = m._view_basis(look)
     up_u, up_v = float(np.array([0, 0, -1.0]) @ u_ax), float(np.array([0, 0, -1.0]) @ v_ax)
-    if np.hypot(up_u, up_v) > 1e-3 and field["u"].size:
-        phi = np.pi / 2.0 - np.arctan2(up_v, up_u)
-        cph, sph = np.cos(phi), np.sin(phi)
+    phi = (np.pi / 2.0 - np.arctan2(up_v, up_u)) if np.hypot(up_u, up_v) > 1e-3 else 0.0
+    cph, sph = np.cos(phi), np.sin(phi)
+    if phi and field["u"].size:
         U, V = field["u"], field["v"]
         field = dict(field, u=cph * U - sph * V, v=sph * U + cph * V)
+    # The SAME in-plane rotation as an explicit view basis, so the z-buffer rasterizer (panel A)
+    # renders the silhouette in exactly the orientation of the MC field above (dorsal up).
+    view_u, view_v, view_w = cph * u_ax - sph * v_ax, sph * u_ax + cph * v_ax, w_ax
     sil_radial_m = (float(np.abs(np.concatenate([field["u"], field["v"]])).max())
                     if field["u"].size else 0.0)
 
@@ -401,6 +397,7 @@ def _frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
                 chan_relay_radius_m=chan_relay_radius_m, chan_emit_radius_m=chan_emit_radius_m,
                 sil_major_m=sil_major_m, sil_minor_m=sil_minor_m,
                 beta=float(beta), area=raster["area"], look=look, face_incidence=face_incidence,
+                view_u=view_u, view_v=view_v, view_w=view_w,
                 plane_loc=plane_loc, emitter_loc=emitter_loc,
                 phase_d=(np.asarray(plane, float) - emitter), phase_R=float(diam / 2.0),
                 phase_lam=lam, phase_normal_up=(cfg.relay_pos is None),
@@ -429,7 +426,6 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           orientation="landscape", phone=False, beam_full_range=False,
-                          silhouette_smooth_m=None,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the flyby animation (A, D, F, F₂), returning the figure.
 
@@ -488,18 +484,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     PANEL_A_ASPECT = 2.0                             # panel A width:height (spans both columns)
     EXT_H = max_silhouette_extent() / ZOOM_FILL
     EXT_V = EXT_H / PANEL_A_ASPECT
-    # Silhouette gap-fill smoothing radius. `silhouette_smooth_m` pins it in METRES (constant on
-    # screen regardless of grid), so raising grid_nA genuinely SHARPENS — crucial for small features
-    # like winglets, which the default grid-scaled radius (~1.6 m, constant in metres) bloats. Use a
-    # small radius WITH a denser sample cloud (m._SAMPLES) so there are no gaps to fill. None → the
-    # legacy grid-scaled radius.
-    cellA_m = 2.0 * EXT_H / grid_nA
-    box_r = (max(2, round(grid_nA / 75)) if silhouette_smooth_m is None
-             else max(1, round(silhouette_smooth_m / cellA_m)))
     gx = np.linspace(-EXT_H, EXT_H, grid_n)          # contour grid (smooth beam)
     gy = np.linspace(-EXT_V, EXT_V, grid_n)
-    gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the silhouette heatmap
+    gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the z-buffered silhouette image
     gyA = np.linspace(-EXT_V, EXT_V, grid_nA)
+    # Fine mesh for the crisp z-buffered panel-A silhouette (denser than the coarse channel mesh, so
+    # winglets and edges render at their true width). Normals are per-face (flat incidence per pixel).
+    silA_v, silA_f = m.make_bwb_mesh()
+    silA_n, _ = m.triangle_normals_areas(silA_v, silA_f)
 
     def encircled_grid(f):
         """The beam's ENCIRCLED-ENERGY field on the fixed grid: at each cell, the fraction
@@ -518,23 +510,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         return encircled.reshape(beam_grid.shape).astype(np.float32)
 
     def incidence_grid(f):
-        """The silhouette's incidence on the fine panel-A grid, BOX-SMOOTHED to fill the
-        gaps between Monte-Carlo samples: a clean, high-res filled outline instead of
-        per-cell speckle. NaN only where no sample lies within the smoothing radius (so
-        the true outline is preserved). An SVG heatmap so the contour can overlay it (a
-        WebGL scatter would render ABOVE the contour and hide it, and left holes)."""
-        fld = f["field"]
-        if fld["u"].size == 0:
-            return np.full((grid_nA, grid_nA), np.nan)
-        iu = np.clip(((fld["u"] + EXT_H) / (2 * EXT_H) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
-        iv = np.clip(((fld["v"] + EXT_V) / (2 * EXT_V) * (grid_nA - 1)).astype(int), 0, grid_nA - 1)
-        cell = iv * grid_nA + iu                       # z[row=v, col=u]
-        ssum = np.zeros(grid_nA * grid_nA); cnt = np.zeros(grid_nA * grid_nA)
-        np.add.at(ssum, cell, fld["incidence"]); np.add.at(cnt, cell, 1.0)
-        ss = _box_sum(ssum.reshape(grid_nA, grid_nA), box_r)
-        cc = _box_sum(cnt.reshape(grid_nA, grid_nA), box_r)
-        z = np.where(cc > 0.5, ss / np.maximum(cc, 1e-9), np.nan)
-        return z.astype(np.float32)                   # float32 halves the base64 payload
+        """The silhouette's incidence on the fine panel-A grid, z-BUFFERED: per pixel, the incidence
+        cosine (n̂·ŵ) of the nearest visible triangle, NaN where uncovered. A deterministic,
+        resolution-independent, self-occluded outline — raising grid_nA genuinely sharpens (winglets
+        and edges at true width), unlike the old Monte-Carlo point-binning + box-smoothing which
+        blurred small features. An SVG heatmap so the contour overlays it (WebGL would hide it)."""
+        return m.rasterize_view_zbuffer(f["view_u"], f["view_v"], f["view_w"],
+                                        silA_v, silA_f, silA_n @ f["view_w"], gxA, gyA)
 
     half = float(xs.max())
 
@@ -665,7 +647,6 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # the shared radial axis needs no reconciliation. Because that plot's two axes carry DIFFERENT
     # units (along = normalised emitter→plane distance, radial = metres), the aperture's cross extent
     # is pre-distorted (see _iso_lo) so the half-ellipse still renders ISOTROPICALLY on screen.
-    beam_dir = "↑" if portrait else "→"
     if portrait:
         FIG_W, FIG_H, MARG = 402, 1750, dict(t=150, l=54, r=10, b=40)
         f_title = "F · beam channel · top view · wide cut"
@@ -673,8 +654,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         row_heights, vspace = [0.18, 0.24, 0.29, 0.29], 0.05
     else:
         FIG_W, FIG_H, MARG = 1150, 1550, dict(t=140, l=66, r=25, b=55)
-        f_title = f"F · beam channel, top view — major-axis (wide) cut, emitter phase at left  beam {beam_dir}"
-        f2_title = f"F₂ · beam channel, side view — minor-axis (narrow) cut, emitter phase at left  beam {beam_dir}"
+        f_title = "F · beam channel, top view — major-axis (wide) cut, emitter phase at left"
+        f2_title = "F₂ · beam channel, side view — minor-axis (narrow) cut, emitter phase at left"
         row_heights, vspace = [0.22, 0.24, 0.27, 0.27], 0.075
     fig = make_subplots(
         rows=4, cols=1, vertical_spacing=vspace, row_heights=row_heights,
@@ -784,10 +765,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             ap_x, ap_y, pl_x, pl_y = [-ap_radial_m, ap_radial_m], [0.0, 0.0], [-s0, s0], [yy0, yy0]
         else:
             ap_x, ap_y, pl_x, pl_y = [0.0, 0.0], [-ap_radial_m, ap_radial_m], [yy0, yy0], [-s0, s0]
-        fig.add_trace(go.Scatter(x=ap_x, y=ap_y, mode="lines", line=dict(color="white", width=5),
+        fig.add_trace(go.Scatter(x=ap_x, y=ap_y, mode="lines", line=dict(color="white", width=_MAP_EDGE_W),
                                  showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # aperture (static)
         i_plane = len(fig.data)
-        fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="#00e5ff", width=4),
+        fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="white", width=_MAP_EDGE_W),
                                  showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # plane slice
         return dict(cont=i_cont, plane=i_plane)
 
@@ -827,7 +808,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         oc, orad = emitter_outline(ap_radial_m, ap_cross_m)          # (cross ∈ [−ap_cross,0], radial)
         along = oc * (lo / ap_cross_m)
         ox, oy = (orad, along) if portrait else (along, orad)
-        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=1.0),
+        fig.add_trace(go.Scatter(x=ox, y=oy, mode="lines", line=dict(color="white", width=_MAP_EDGE_W),
                                  showlegend=False, hoverinfo="skip"), row=rc[0], col=rc[1])
     add_emitter(F_rc, ap_short, ap_long, lo_F)
     add_emitter(F2_rc, ap_long, ap_short, lo_F2)
@@ -918,12 +899,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         along_rng = [along_lo, 1.0]
         if portrait:
             fig.update_yaxes(title_text="emitter → plane", range=along_rng, tickvals=[0, 0.5, 1.0],
-                             row=rc[0], col=rc[1])
-            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=rc[0], col=rc[1])
+                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
+            fig.update_xaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
+                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
         else:
             fig.update_xaxes(title_text="emitter → plane (norm.)", range=along_rng,
-                             tickvals=[0, 0.5, 1.0], row=rc[0], col=rc[1])
-            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L], row=rc[0], col=rc[1])
+                             tickvals=[0, 0.5, 1.0], showgrid=False, zeroline=False, row=rc[0], col=rc[1])
+            fig.update_yaxes(title_text="radial (m)", range=[-PHASE_L, PHASE_L],
+                             showgrid=False, zeroline=False, row=rc[0], col=rc[1])
     fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=A_rc[0], col=A_rc[1],
                        xanchor="left", yanchor="bottom",
                        text="green = enclosed beam-energy fraction",
