@@ -43,6 +43,38 @@ def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range
     return min(d_spot, d_phase)
 
 
+N_AP_FIT_CAP = 4096
+
+
+def _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap,
+                   cap=N_AP_FIT_CAP):
+    """Sample pitch AND a grid size that actually contains the aperture: (d, n).
+
+    Only `_aperture_spacing`'s d_spot branch carries the 2.5*max_semi/n_grid floor that keeps the
+    aperture inside the grid. When the focusing phase binds instead (d_phase < d_spot — deep
+    defocus, z far from the focus) there is no such guarantee, and building the aperture on an
+    n_ap-wide grid would silently CLIP it: the field returned would be a smaller emitter's, with no
+    error. So grow n until the aperture fits at the pitch chosen for that n (the pitch can shrink as
+    n grows, hence the loop; it converges because d is floored by min(min_semi/12, d_phase)), and
+    refuse past `cap` rather than allocating an n^2 aperture array.
+    """
+    max_semi = max(float(semi_major_m), float(semi_minor_m))
+    n = int(n_ap)
+    for _ in range(8):
+        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n)
+        n_need = int(np.ceil(2.5 * max_semi / d))
+        if n_need <= n:
+            return d, n
+        if n_need > cap:
+            raise ValueError(
+                f"aperture would be clipped: semi-axes ({semi_major_m:.3g}, {semi_minor_m:.3g}) m at "
+                f"z={z_m:.4g} m, focus={focus_range_m:.4g} m need n_ap >= {n_need} (cap {cap}). The "
+                f"focusing phase sets the pitch here; raise the cap or evaluate no closer to the "
+                f"aperture than the Fresnel regime supports.")
+        n = n_need
+    return d, n
+
+
 def plane_intensity(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength_m,
                     taper_p=0.0, n_grid=1024, dtype=np.complex128):
     """Intensity over a full plane at range z, via one FFT of the aperture field.
@@ -108,8 +140,10 @@ def focal_intensity_at(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelengt
     """Intensity at arbitrary scattered points (qx, qy) on the plane at z, by direct DFT
     over the illuminated aperture samples only. Same normalisation as `plane_intensity`:
     `norm` is the analytic total power sum|A|^2 * (lambda z/d)^2, which is what Parseval
-    gives for the FFT route."""
-    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
+    gives for the FFT route.
+
+    `n_ap` is a floor: `_aperture_grid` raises it if the aperture would not fit the grid."""
+    d, n_ap = _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
     coord = (np.arange(n_ap) - n_ap // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
     amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)
@@ -136,8 +170,10 @@ def focal_intensity_grid(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelen
                          x_out, y_out, taper_p=0.0, n_ap=512):
     """As `focal_intensity_at` but on a caller-chosen separable output grid, so the DFT
     factorises into two matrix products. intensity[i, j] is at (x_out[i], y_out[j]);
-    x_out corresponds to the semi_major aperture axis."""
-    d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
+    x_out corresponds to the semi_major aperture axis.
+
+    `n_ap` is a floor: `_aperture_grid` raises it if the aperture would not fit the grid."""
+    d, n_ap = _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap)
     coord = (np.arange(n_ap) - n_ap // 2) * d
     X, Y = np.meshgrid(coord, coord, indexing="ij")
     amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)
@@ -197,13 +233,14 @@ def axial_cuts_direct(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength
         if not (zi > 0.0) or zi < z_floor:
             continue
         inv = 1.0 / zi - 1.0 / max(float(focus_range_m), 1e-9)
-        # n_ap needed to keep the aperture inside the grid at the phase-resolving spacing d_phase =
-        # λ/(4·max_semi·|inv|): n_ap ≥ 2.5·max_semi/d_phase = 10·max_semi²·|inv|/λ.
-        n_need = int(np.ceil(10.0 * max_semi ** 2 * abs(inv) / wavelength_m)) if inv != 0.0 else n_ap_base
-        if n_need > n_ap_max:
-            continue                                        # sub-Fresnel practical floor → caller infills
-        n_ap = int(min(max(n_ap_base, n_need), n_ap_max))
-        d = _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, zi, focus_range_m, n_ap)
+        # Close in, the focusing phase sets the pitch and the aperture only fits a much larger grid;
+        # `_aperture_grid` sizes it. Past n_ap_max that is the practical near-aperture floor — skip the
+        # plane (NaN) and let the caller fill it geometrically rather than pay an n^2 array for it.
+        try:
+            d, n_ap = _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, zi, focus_range_m,
+                                     n_ap_base, cap=n_ap_max)
+        except ValueError:
+            continue
         coord = (np.arange(n_ap) - n_ap // 2) * d
         X, Y = np.meshgrid(coord, coord, indexing="ij")
         amp = aperture_amplitude(X, Y, semi_major_m, semi_minor_m, taper_p)

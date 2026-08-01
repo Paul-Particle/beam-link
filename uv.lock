@@ -52,6 +52,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "contourpy" },
+    { name = "matplotlib" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
@@ -65,22 +66,19 @@ generators = [
     { name = "astropy" },
     { name = "itur" },
 ]
-validation = [
-    { name = "matplotlib" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "astropy", marker = "extra == 'generators'" },
     { name = "contourpy" },
     { name = "itur", marker = "extra == 'generators'" },
-    { name = "matplotlib", marker = "extra == 'validation'", specifier = ">=3.11.1" },
+    { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "plotly" },
     { name = "scipy", specifier = ">=1.17.1" },
 ]
-provides-extras = ["generators", "validation"]
+provides-extras = ["generators"]
 
 [[package]]
 name = "certifi"

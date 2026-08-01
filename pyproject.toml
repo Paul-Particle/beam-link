@@ -9,6 +9,9 @@ dependencies = [
     "plotly",
     "scipy>=1.17.1",
     "contourpy",
+    # The plotly figures bake their heatmaps to PNG through matplotlib's colormaps
+    # (beam_link_animation._field_to_png) — a core render path, not just a diagnostic.
+    "matplotlib>=3.11.1",
 ]
 
 [project.optional-dependencies]
@@ -16,10 +19,6 @@ dependencies = [
 generators = [
     "itur",
     "astropy",
-]
-# winglet_validation draws its diagnostic overlays with matplotlib rather than plotly
-validation = [
-    "matplotlib>=3.11.1",
 ]
 
 [build-system]
