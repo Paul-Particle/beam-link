@@ -6,6 +6,12 @@ Split out of [`microwave-power-transmission`](https://github.com/Paul-Particle/m
 which keeps the research: the literature review, the argument, the papers, the aerostat and
 tether sizing, and the napkin notebook. This repo is the model those depend on.
 
+**If you move or rename this directory, two things break.** The research repo depends on it by
+*relative path* — `[tool.uv.sources] beamlink = { path = "../beam-link", editable = true }` in its
+`pyproject.toml`, resolved against that file's location — so a move needs that line updated and a
+`uv sync` to relock, plus the `../beam-link` links in its README. The import name `beamlink` is
+independent of the directory name and does not have to change with it.
+
     uv sync
     uv run python -m beamlink.test_beam_link      # ALL CHECKS PASSED
     uv run python -m beamlink.econ_pass2
