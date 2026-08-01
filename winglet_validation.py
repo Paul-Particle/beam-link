@@ -93,12 +93,16 @@ def render_headon_png(path=f"{OUT}/winglet_headon.png"):
 
 
 def _mesh3d_traces(verts, faces):
+    # Plot the VERTICAL axis as −ẑ (body z is belly-DOWN) so "up" on screen = dorsal (winglets point
+    # up). Setting only the camera `up` vector doesn't do it — Plotly keeps +z screen-up regardless —
+    # so we flip the data instead, which is unambiguous.
+    z_up = -verts[:, 2]
     is_wing = np.zeros(len(faces), bool); is_wing[-N_WINGLET_FACES:] = True
     out = []
     for mask, color, opacity, name in ((~is_wing, "#4a7fb5", 0.45, "body"),
                                        (is_wing, "#00d5e0", 1.0, "winglets")):
         f = faces[mask]
-        out.append(go.Mesh3d(x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+        out.append(go.Mesh3d(x=verts[:, 0], y=verts[:, 1], z=z_up,
                              i=f[:, 0], j=f[:, 1], k=f[:, 2],
                              color=color, opacity=opacity, name=name, showscale=False,
                              flatshading=True, hoverinfo="name"))
@@ -106,19 +110,20 @@ def _mesh3d_traces(verts, faces):
 
 
 def render_3d_html(projection, path):
-    """Interactive 3D Mesh3d viewed from in front of the nose. `projection` ∈ {orthographic,
-    perspective}. z is belly-down, so up = −z: we set the camera's up vector to (0,0,-1)."""
+    """Interactive 3D Mesh3d, dorsal-up (vertical axis = −ẑ), default camera looking at the nose from
+    slightly front-above-port so the winglets read as upright fins. `projection` ∈ {orthographic,
+    perspective}. Drag to rotate; spin it nose-toward-you to see the winglets edge-on."""
     verts, faces = m.make_bwb_mesh()
     fig = go.Figure(_mesh3d_traces(verts, faces))
-    # Camera in FRONT of the nose (+x̂), looking back toward −x̂; up = −ẑ.
-    cam = dict(eye=dict(x=2.2, y=0.0, z=-0.15), center=dict(x=0, y=0, z=0),
-               up=dict(x=0, y=0, z=-1), projection=dict(type=projection))
+    # Nose (+x̂) toward the viewer, a little port and above (screen-up is now +z = −ẑ_body = dorsal).
+    cam = dict(eye=dict(x=2.0, y=-1.1, z=0.7), center=dict(x=0, y=0, z=0),
+               projection=dict(type=projection))
     fig.update_layout(
-        title=f"BWB winglet check — 3D {projection} · drag to rotate "
-              f"(x̂=nose, ŷ=starboard, ẑ=belly-down)",
+        title=f"BWB winglet check — 3D {projection} · drag to rotate; spin nose-toward-you "
+              f"for edge-on winglets (x̂=nose, ŷ=starboard, up=−ẑ)",
         scene=dict(camera=cam, aspectmode="data",
                    xaxis_title="x̂ nose (m)", yaxis_title="ŷ starboard (m)",
-                   zaxis_title="ẑ down (m)"),
+                   zaxis_title="up  −ẑ (m)"),
         margin=dict(l=0, r=0, t=40, b=0), height=800)
     os.makedirs(OUT, exist_ok=True)
     fig.write_html(path, include_plotlyjs="inline")

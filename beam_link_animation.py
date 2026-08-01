@@ -429,6 +429,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
                           orientation="landscape", phone=False, beam_full_range=False,
+                          silhouette_smooth_m=None,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the flyby animation (A, D, F, F₂), returning the figure.
 
@@ -487,7 +488,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     PANEL_A_ASPECT = 2.0                             # panel A width:height (spans both columns)
     EXT_H = max_silhouette_extent() / ZOOM_FILL
     EXT_V = EXT_H / PANEL_A_ASPECT
-    box_r = max(2, round(grid_nA / 75))              # smoothing radius scales with resolution
+    # Silhouette gap-fill smoothing radius. `silhouette_smooth_m` pins it in METRES (constant on
+    # screen regardless of grid), so raising grid_nA genuinely SHARPENS — crucial for small features
+    # like winglets, which the default grid-scaled radius (~1.6 m, constant in metres) bloats. Use a
+    # small radius WITH a denser sample cloud (m._SAMPLES) so there are no gaps to fill. None → the
+    # legacy grid-scaled radius.
+    cellA_m = 2.0 * EXT_H / grid_nA
+    box_r = (max(2, round(grid_nA / 75)) if silhouette_smooth_m is None
+             else max(1, round(silhouette_smooth_m / cellA_m)))
     gx = np.linspace(-EXT_H, EXT_H, grid_n)          # contour grid (smooth beam)
     gy = np.linspace(-EXT_V, EXT_V, grid_n)
     gxA = np.linspace(-EXT_H, EXT_H, grid_nA)        # fine grid for the silhouette heatmap
