@@ -136,6 +136,35 @@ def _contour_xy(z, xs, ys, levels=_CONTOUR_LEVELS):
     return np.asarray(xo), np.asarray(yo)
 
 
+def _funnel_contour(enc, dist, radial, levels=_CONTOUR_LEVELS):
+    """Enclosed-energy funnel contours by DIRECT per-plane inversion, not 2-D marching squares. At
+    each plane the enclosed fraction E(|r|) rises monotonically from 0 (on axis) to its window
+    total, so the level-L contour radius is simply r_L = E⁻¹(L) — one 1-D interpolation per plane.
+    This yields a smooth r_L(z) with no cell-quantised staircase and no spurious segments along the
+    data boundary (both artefacts of running a contour generator over a discretised, partly-NaN
+    grid). Where the beam is wider than the window (E never reaches L) or the plane is near-field
+    NaN, r_L is left as a gap. `enc` is (len(dist), len(radial)); returns (r_vals, z_vals) flat
+    arrays (metres, normalised-distance) with NaN gaps — the +side then the −side of each level."""
+    pos = np.argsort(radial[radial >= 0])
+    rp = radial[radial >= 0][pos]                     # 0 → +max, ascending
+    r_out, z_out = [], []
+    for level in levels:
+        r_lvl = np.full(enc.shape[0], np.nan)
+        for i in range(enc.shape[0]):
+            e = enc[i, radial >= 0][pos]
+            fin = np.isfinite(e)
+            if fin.sum() < 2:
+                continue
+            ei, ri = e[fin], rp[fin]
+            if ei[-1] < level:                        # beam overspills the window at this plane
+                continue
+            r_lvl[i] = np.interp(level, ei, ri)       # E is monotonic ↑ in r → invert
+        for sign in (1.0, -1.0):
+            r_out.extend(sign * r_lvl); r_out.append(np.nan)
+            z_out.extend(dist);         z_out.append(np.nan)
+    return np.asarray(r_out), np.asarray(z_out)
+
+
 def _box_sum(a, r):
     """Sum over a (2r+1)² neighbourhood at each cell (zero-padded) — a fast separable-ish
     box filter used to fill the gaps between Monte-Carlo silhouette samples."""
@@ -581,7 +610,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                                                       / (2.0 * PHASE_L) * _col_w_px) / 250.0)
         _rF, _rF2 = _emit_row(ap_short, ap_long), _emit_row(ap_long, ap_short)
         fig = make_subplots(
-            rows=6, cols=1, vertical_spacing=0.05,
+            rows=6, cols=1, vertical_spacing=0.062,               # room so 'radial (m)' clears the ellipse
             row_heights=[0.17, 0.22, 0.185, _rF, 0.185, _rF2],   # D (line graph) 2× taller
             specs=[[{"type": "xy"}], [{"secondary_y": True}], [{"type": "xy"}],
                    [{"type": "xy"}], [{"type": "xy"}], [{"type": "xy"}]],
@@ -611,10 +640,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     LV = _CONTOUR_LEVELS
     def map_png(f, cut):                                   # beam intensity → background image
         return _field_to_png(channel(f, cut), transpose=not portrait, flip_rows=portrait)
-    def map_contour(f, cut):                               # encircled-energy vector polylines
+    def map_contour(f, cut):                               # encircled-energy funnel (per-plane inversion)
         ze = _dejitter_along_path(channel_enc(f, cut), path_axis=0)   # (dist, radial); smooth along dist
-        return (_contour_xy(ze, radial, dist_norm, LV) if portrait
-                else _contour_xy(ze.T, dist_norm, radial, LV))
+        r_vals, z_vals = _funnel_contour(ze, dist_norm, radial, LV)   # r_L(z) by E⁻¹, no staircase
+        return (r_vals, z_vals) if portrait else (z_vals, r_vals)     # portrait x=radial; landscape x=dist
     def phase_png(f, ar, ac):                              # emitter zone-plate → background image
         lo, hi = _cross_window(ar, ac)
         cross_lin = np.linspace(lo, hi, 220)
