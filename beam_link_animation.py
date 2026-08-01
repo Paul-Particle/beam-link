@@ -502,6 +502,11 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     _cummean = np.cumsum((eta_series / 100.0)[_order]) / np.arange(1, len(xs) + 1)
     windowed_eta = np.empty_like(eta_series)
     windowed_eta[_order] = _cummean * 100.0                             # mean η over |x| ≤ |x_k|, in %
+    # Companion (same ±d window): TOTAL energy delivered if the beam only operates within ±d —
+    # the delivered energy summed over |x| ≤ d. Rises monotonically to the full-pass total. Reads
+    # "how much energy do I actually land if I'm willing to beam out to this distance?".
+    windowed_gj = np.empty_like(eta_series)
+    windowed_gj[_order] = np.cumsum((deliverable_mw * dt_s)[_order]) / 1e3   # GJ within |x| ≤ |x_k|
     # Panels F/F₂ (beam channel): the along-path axis is normalised to the LONGEST path over the
     # pass, so the plane's position along it encodes actual slant (far = near the far end, close
     # = near the emitter) — that distance cue is what keeps F/F₂ from being redundant with A.
@@ -600,8 +605,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     #               emitter phase directly BELOW (the 90°-rotated view; fits a phone).
     beam_dir = "↑" if portrait else "→"
     if portrait:
-        f_title = f"F · beam channel · top view · wide cut  {beam_dir}"
-        f2_title = f"F₂ · beam channel · side view · narrow cut  {beam_dir}"
+        f_title = "F · beam channel · top view · wide cut"
+        f2_title = "F₂ · beam channel · side view · narrow cut"
         # Size the two emitter rows to their isotropic box aspect (cross-span / radial-span), so F's
         # half-of-the-long-axis panel comes out a lot taller than F₂'s short-axis strip and neither
         # wastes space. Expressed relative to a ~250 px map row at this 402 px phone width.
@@ -674,6 +679,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     nm_cap = "capture (%)" if portrait else "overlap capture (%)"
     nm_cum = "energy (GJ)" if portrait else "cumulative energy (GJ)"
     nm_win = "pass η, ±d (%)" if portrait else "pass η if beaming within ±d (%)"
+    nm_weg = "energy, ±d (GJ)" if portrait else "energy delivered if beaming within ±d (GJ)"
     fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name=nm_eta,
                              line=dict(color="#1f77b4", width=2), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
@@ -685,6 +691,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     fig.add_trace(go.Scatter(x=xs / 1e3, y=cum_gj, mode="lines", name=nm_cum,
                              line=dict(color="#ff7f0e", width=2), hoverinfo="skip"),
+                  row=D_rc[0], col=D_rc[1], secondary_y=True)
+    fig.add_trace(go.Scatter(x=xs / 1e3, y=windowed_gj, mode="lines", name=nm_weg,
+                             line=dict(color="#e377c2", width=2, dash="dash"), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
     i_eta_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
@@ -701,6 +710,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     i_cum_m = len(fig.data)
     fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cum_gj[0]], mode="markers",
                              marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
+                  row=D_rc[0], col=D_rc[1], secondary_y=True)
+    i_wgj_m = len(fig.data)
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[windowed_gj[0]], mode="markers",
+                             marker=dict(size=9, color="#e377c2"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
 
     yy0 = frames_phys[0]["chan_total"] / max_total
@@ -770,7 +783,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # Each frame swaps the 5 background images (a cheap relayout) and restyles the live vector
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
-    ANIMATED = [i_contA, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m,
+    ANIMATED = [i_contA, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
                 F["cont"], F["plane"], F2["cont"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
@@ -791,6 +804,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                   go.Scatter(x=[cur], y=[windowed_eta[k]]),
                   go.Scatter(x=[cur], y=[capture_series[k]]),
                   go.Scatter(x=[cur], y=[cum_gj[k]]),
+                  go.Scatter(x=[cur], y=[windowed_gj[k]]),
                   go.Scatter(x=fcx, y=fcy), fpl,
                   go.Scatter(x=f2cx, y=f2cy), f2pl],
             layout=go.Layout(images=frame_images(f))))
