@@ -38,6 +38,24 @@ import bwb_model as m
 import geo
 
 OUT = "out"
+
+
+def _build_stamp():
+    """Short git commit + dirty flag + timestamp, stamped on every HTML so we can be sure which
+    build a figure came from when discussing it."""
+    import subprocess, datetime
+    here = os.path.dirname(os.path.abspath(__file__)) or "."
+    try:
+        h = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True).stdout.strip() or "?"
+        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip()
+        h += "+dirty" if dirty else ""
+    except Exception:
+        h = "?"
+    return f"{h} · {datetime.datetime.now():%Y-%m-%d %H:%M}"
+
+
 # Diffraction transform grid for the beam-channel panels (F/F₂). 384 (not 192): the shaped
 # emitter's elongated aperture (semi-major ≈ √aspect · r_emit, ~141 m at aspect 8) only fits
 # the transform window with adequate margin at this size. At 192 the far/defocused frames alias
@@ -865,6 +883,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                        showarrow=False, font=dict(size=8, color="#8fffd0"))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
+    stamp = _build_stamp()
     # Legend lives INSIDE panel D (the line graph), anchored to its top-left interior — where every
     # curve is near zero (far along-track), so it overlaps nothing. Position from D's actual paper
     # domain (row 2), robust to the row-height / orientation differences.
@@ -878,7 +897,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             template="plotly_dark", height=1750, width=402, paper_bgcolor="black", plot_bgcolor="black",
             margin=dict(t=150, l=44, r=10, b=40),
             title=dict(text=(f"Flyby — {arch_name}<br><sub>{aperture_m:.0f} m emitter · {weather} · "
-                             f"{pass_kind} · ±{half/1e3:.0f} km · ▶ play or drag</sub>"),
+                             f"{pass_kind} · ±{half/1e3:.0f} km · ▶ play or drag"
+                             f"<br>build {stamp}</sub>"),
                        y=0.992, yanchor="top", x=0.5, xanchor="center", font=dict(size=12)),
             legend=legend)
     else:
@@ -886,7 +906,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         fig.update_layout(
             template="plotly_dark", height=1550, width=1150, margin=dict(t=140, l=60, r=30, b=55),
             title=dict(text=(f"Flyby animation — {arch_name} · {aperture_m:.0f} m emitter · {weather} · {pass_kind}"
-                             f"<br><sub>horizon-to-horizon ±{half/1e3:.0f} km · uniform in time"
+                             f"<br><sub>horizon-to-horizon ±{half/1e3:.0f} km · uniform in time · build {stamp}"
                              f"<br>▶ play or drag the slider above</sub>"),
                        y=0.988, yanchor="top", x=0.5, xanchor="center", font=dict(size=15)),
             legend=legend)
