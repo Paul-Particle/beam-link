@@ -237,15 +237,36 @@ def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
     shp = (dist_norm.size, radial.size)
     ix = np.full(shp, np.nan); ex = np.full(shp, np.nan)
     iy = np.full(shp, np.nan); ey = np.full(shp, np.nan)
+    # Enclosed-energy is integrated on ONE common wide radial grid, NOT each plane's native
+    # diffraction grid (spacing λz/(N·d), which jumps along z and put a numerical STAIRCASE in
+    # E(z) — the steps in the funnel contours). Sampling every plane's intensity onto the same
+    # grid and integrating there makes E(z) smooth (only real Fresnel structure survives); the
+    # grid is 3× the display half-extent so it captures the beam and E normalises to the true
+    # total (a beam overspilling the display window then correctly shows no high-level contours).
+    half = float(radial.max())
+    r_wide = np.linspace(-3.0 * half, 3.0 * half, 3 * radial.size)
+    o = np.argsort(np.abs(r_wide)); dw = r_wide[1] - r_wide[0]
     cum = 0.0
     for leg in legs:
         sel = (s >= cum) & (s < cum + leg["length_m"]) & (s <= current_total_m)
         if leg["length_m"] > 0 and np.any(sel):
             local_z = s[sel] - cum                           # distance from this leg's emitter
-            lix, lex, liy, ley = dfr.axial_cut_xy(
-                local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"], leg["lam"], radial,
+            lix, _, liy, _ = dfr.axial_cut_xy(
+                local_z, leg["focus_m"], leg["ap_major"], leg["ap_minor"], leg["lam"], r_wide,
                 taper_p=leg["taper_p"], n_grid=CHANNEL_NGRID, normalize=False, dtype=np.complex64)
-            ix[sel] = lix; ex[sel] = lex; iy[sel] = liy; ey[sel] = ley
+            idx = np.where(sel)[0]
+            for inten_w, i_out, e_out in ((lix, ix, ex), (liy, iy, ey)):
+                allnan = ~np.isfinite(inten_w).any(axis=1)   # near-field planes stay NaN (the gap)
+                Iw = np.abs(np.nan_to_num(np.asarray(inten_w, dtype=np.float64), nan=0.0))
+                c = np.cumsum(Iw[:, o] * dw, axis=1)         # enclosed from the axis outward
+                tot = c[:, -1:]
+                Ew = np.divide(c, tot, out=np.full_like(c, np.nan), where=tot > 0)
+                Ew_r = np.empty_like(Ew); Ew_r[:, o] = Ew    # undo the |r| sort → r_wide order
+                for a, zi in enumerate(idx):
+                    if allnan[a]:
+                        continue
+                    i_out[zi] = np.interp(radial, r_wide, Iw[a])     # display intensity (common grid)
+                    e_out[zi] = np.interp(radial, r_wide, Ew_r[a])   # smooth enclosed fraction
         cum += leg["length_m"]
 
     def _norm(inten):
@@ -664,8 +685,9 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     def map_png(f, cut):                                   # beam intensity → background image
         return _field_to_png(channel(f, cut), transpose=not portrait, flip_rows=portrait)
     def map_contour(f, cut):                               # encircled-energy funnel (per-plane inversion)
-        ze = _dejitter_along_path(channel_enc(f, cut), path_axis=0)   # (dist, radial); smooth along dist
-        r_vals, z_vals = _funnel_contour(ze, dist_norm, radial, LV)   # r_L(z) by E⁻¹, no staircase
+        # Enclosed field is now integrated on a common grid (see _channel_field) so it's smooth
+        # along the path — no dejitter needed; the surviving waviness is real Fresnel structure.
+        r_vals, z_vals = _funnel_contour(channel_enc(f, cut), dist_norm, radial, LV)  # r_L(z) by E⁻¹
         return (r_vals, z_vals) if portrait else (z_vals, r_vals)     # portrait x=radial; landscape x=dist
     def phase_png(f, ar, ac):                              # emitter zone-plate → background image
         lo, hi = _cross_window(ar, ac)
