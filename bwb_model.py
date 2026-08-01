@@ -413,13 +413,15 @@ _MESH = None
 
 
 def get_mesh(mesh_kwargs=None):
-    """Cached (verts, faces, normals). A MODERATE body loft (41×26) by default: the z-buffered
-    silhouette area is grid-limited, not mesh-limited (identical area to the 71×40 mesh, ~2.6×
-    fewer triangles ⇒ ~2.6× faster rasterization), and the winglets are separate faces present at
-    any body resolution. This is the capture-path mesh; panel-A DISPLAY uses a finer mesh."""
+    """Cached (verts, faces, normals) at the FULL body loft (71×40, `make_bwb_mesh` default). This
+    is the capture-path mesh AND the panel-A display mesh — they are deliberately the SAME so the
+    on-screen silhouette is a faithful picture of exactly the surface the capture integral sums over
+    (integration cells = displayed pixels). The silhouette AREA is grid-limited, not mesh-limited, so
+    the finer body loft is cosmetic for capture magnitude; it is worth the ~2.6× rasterization cost
+    to keep the displayed and integrated silhouettes identical (winglets/edges at their true width)."""
     global _MESH
     if _MESH is None or mesh_kwargs is not None:
-        v, f = make_bwb_mesh(**(mesh_kwargs or dict(n_span=41, n_theta=26)))
+        v, f = make_bwb_mesh(**(mesh_kwargs or {}))
         n, _ = triangle_normals_areas(v, f)
         _MESH = (v, f, n)
     return _MESH
