@@ -310,6 +310,123 @@ def rasterize_silhouette(look_dir, samples, sample_normals, sample_weights,
                 area=float(proj.sum()), n_grid=n_grid)
 
 
+def rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_incidence,
+                           u_lin, v_lin, color=None):
+    """Deterministic z-buffered rasterization of the mesh onto a FIXED view-plane grid.
+
+    A crisp, resolution-independent alternative to Monte-Carlo point binning: project every
+    front-facing triangle onto the (`u_ax`, `v_ax`) view plane, scan-convert it with barycentric
+    coverage, and keep — per pixel — the triangle NEAREST the emitter (depth along `w_ax`, larger =
+    nearer). Returns `incid`, the incidence cosine (n̂·ŵ, = `face_incidence`) of the winning triangle
+    at each pixel (NaN where uncovered — the true self-occluded outline). Because depth resolves
+    occlusion exactly (a winglet behind the wing, the far wing behind the body), thin features render
+    at their real width instead of being blurred by a smoothing radius. Pixel (row r, col c) is
+    centred at (u_lin[c], v_lin[r]); `u_ax`/`v_ax`/`w_ax` are the (already dorsal-up-rotated) view
+    basis, `face_incidence` = normals @ w_ax (precomputed so callers can reuse it). By default each
+    covered pixel stores `face_incidence` (the cull/occlusion cosine); pass `color` (a per-FACE array)
+    to store THAT instead — e.g. cull/occlude by the VIEW direction but colour by BEAM incidence."""
+    U = vertices @ u_ax
+    V = vertices @ v_ax
+    depth = vertices @ w_ax                              # larger = nearer the emitter
+    stored = face_incidence if color is None else np.asarray(color)
+    n_u, n_v = u_lin.size, v_lin.size
+    du = (u_lin[-1] - u_lin[0]) / (n_u - 1)
+    dv = (v_lin[-1] - v_lin[0]) / (n_v - 1)
+    px = (U - u_lin[0]) / du                             # fractional pixel coords of each vertex
+    py = (V - v_lin[0]) / dv
+    zbuf = np.full((n_v, n_u), -np.inf)
+    incid = np.full((n_v, n_u), np.nan, dtype=np.float32)
+    for tri, inc, col in zip(faces, face_incidence, stored):
+        if inc <= 1e-6:
+            continue                                     # back-facing (to the cull axis) → not visible
+        i0, i1, i2 = tri
+        x0, y0, d0 = px[i0], py[i0], depth[i0]
+        x1, y1, d1 = px[i1], py[i1], depth[i1]
+        x2, y2, d2 = px[i2], py[i2], depth[i2]
+        lo_x = max(int(np.floor(min(x0, x1, x2))), 0)
+        hi_x = min(int(np.ceil(max(x0, x1, x2))), n_u - 1)
+        lo_y = max(int(np.floor(min(y0, y1, y2))), 0)
+        hi_y = min(int(np.ceil(max(y0, y1, y2))), n_v - 1)
+        if lo_x > hi_x or lo_y > hi_y:
+            continue                                     # triangle off-grid
+        denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(denom) < 1e-12:
+            continue                                     # degenerate (edge-on) projection
+        gx, gy = np.meshgrid(np.arange(lo_x, hi_x + 1), np.arange(lo_y, hi_y + 1))
+        a = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / denom
+        b = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / denom
+        c = 1.0 - a - b
+        inside = (a >= 0) & (b >= 0) & (c >= 0)
+        if not inside.any():
+            continue
+        gyi, gxi = gy[inside], gx[inside]
+        di = a[inside] * d0 + b[inside] * d1 + c[inside] * d2
+        win = di > zbuf[gyi, gxi]                         # nearer than the current occupant
+        wy, wx = gyi[win], gxi[win]
+        zbuf[wy, wx] = di[win]
+        incid[wy, wx] = col
+    return incid
+
+
+def rasterize_silhouette_zbuffer(look_dir, vertices, faces, face_normals, n_grid=200, margin=1.06):
+    """Occlusion-aware projected silhouette toward `look_dir` (body→emitter) via a DETERMINISTIC
+    z-buffer — a drop-in replacement for the Monte-Carlo `rasterize_silhouette`, same return dict.
+
+    Rasterizes the mesh onto an n_grid×n_grid view-plane grid fitted to the front-facing projection
+    (square cells, small `margin`), then returns the COVERED pixels as 'samples': centre (u, v) in
+    metres (centred on the projected-area centroid), per-pixel incidence cosine, and a CONSTANT
+    per-pixel projected area `proj_area = dA`. The pixel IS the projected-area element, so
+    Σ beam·proj_area = Σ beam·dA is the overlap integral with NO separate incidence factor (unlike
+    the MC weights, which carry n̂·ŵ). Deterministic ⇒ no sampling noise; the area and overlap
+    converge with n_grid. The grid here IS the resolution at which the capture integral is taken."""
+    u_ax, v_ax, w_ax = _view_basis(look_dir)
+    U = vertices @ u_ax
+    V = vertices @ v_ax
+    face_inc = face_normals @ w_ax
+    front = face_inc > 1e-6
+    empty = dict(u=np.array([]), v=np.array([]), incidence=np.array([]),
+                 proj_area=np.array([]), area=0.0, n_grid=n_grid)
+    if not front.any():
+        return empty
+    fv = np.unique(faces[front])
+    u_mid, v_mid = 0.5 * (U[fv].min() + U[fv].max()), 0.5 * (V[fv].min() + V[fv].max())
+    half = 0.5 * margin * max(U[fv].max() - U[fv].min(), V[fv].max() - V[fv].min(), 1e-6)
+    u_lin = np.linspace(u_mid - half, u_mid + half, n_grid)
+    v_lin = np.linspace(v_mid - half, v_mid + half, n_grid)
+    incid = rasterize_view_zbuffer(u_ax, v_ax, w_ax, vertices, faces, face_inc, u_lin, v_lin)
+    covered = np.isfinite(incid)
+    if not covered.any():
+        return empty
+    du = (u_lin[-1] - u_lin[0]) / (n_grid - 1)
+    dv = (v_lin[-1] - v_lin[0]) / (n_grid - 1)
+    uu, vv = np.meshgrid(u_lin, v_lin)
+    u_c, v_c, inc_c = uu[covered], vv[covered], incid[covered].astype(float)
+    cu, cv = float(u_c.mean()), float(v_c.mean())          # projected-area centroid (uniform dA)
+    return dict(u=u_c - cu, v=v_c - cv, incidence=inc_c,
+                proj_area=np.full(u_c.size, du * dv), area=float(covered.sum() * du * dv),
+                n_grid=n_grid)
+
+
+# Cached mesh (verts, faces, per-face normals) for the default airframe — used by the z-buffer
+# silhouette rasterizer (the capture path). Separate from the point cloud `_SAMPLES`.
+_MESH = None
+
+
+def get_mesh(mesh_kwargs=None):
+    """Cached (verts, faces, normals) at the FULL body loft (71×40, `make_bwb_mesh` default). This
+    is the capture-path mesh AND the panel-A display mesh — they are deliberately the SAME so the
+    on-screen silhouette is a faithful picture of exactly the surface the capture integral sums over
+    (integration cells = displayed pixels). The silhouette AREA is grid-limited, not mesh-limited, so
+    the finer body loft is cosmetic for capture magnitude; it is worth the ~2.6× rasterization cost
+    to keep the displayed and integrated silhouettes identical (winglets/edges at their true width)."""
+    global _MESH
+    if _MESH is None or mesh_kwargs is not None:
+        v, f = make_bwb_mesh(**(mesh_kwargs or {}))
+        n, _ = triangle_normals_areas(v, f)
+        _MESH = (v, f, n)
+    return _MESH
+
+
 # Cached sample cloud for the default airframe.
 _SAMPLES = None
 

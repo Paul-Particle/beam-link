@@ -21,7 +21,6 @@ import beam_link_animation as bla
 # The full-resolution 81-frame versions live in out/ from beam_link_animation.py.
 N_FRAMES = 15
 GRID_NA = 82
-GRID_N = 62
 OUT_PATH = "out/emitter_study_artifact.html"
 
 # Dark-only by design: the embedded figures are plotly_dark, so the chrome commits to the
@@ -111,7 +110,7 @@ def build():
     for label, arch, diam, _tag in bla.STUDY_CASES:
         fig = bla.build_flyby_animation(
             arch_name=arch, weather=bla.STUDY_WEATHER, lateral_offset_km=bla.STUDY_LATERAL_KM,
-            emitter_diam_m=diam, n_frames=N_FRAMES, grid_nA=GRID_NA, grid_n=GRID_N, write=False)
+            emitter_diam_m=diam, n_frames=N_FRAMES, grid_nA=GRID_NA, write=False)
         figs_js.append('{"name": %s, "fig": %s}' % (json.dumps(label), pio.to_json(fig)))
     figs_array = "[\n" + ",\n".join(figs_js) + "\n]"
 
