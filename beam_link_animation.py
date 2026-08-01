@@ -106,6 +106,12 @@ gd.on('plotly_sliderchange', function(e){ if (e && e.slider) cur = e.slider.acti
 
 
 _CONTOUR_LEVELS = (0.1, 0.3, 0.5, 0.7, 0.9)
+# Beam maps (F/F₂): three enclosed-energy rings. The outer ring is 0.8, NOT 0.9 — the 0.9 contour
+# rides the physical (but visually noisy) sidelobe skirt, so we stop just inside it.
+_BEAM_LEVELS = (0.1, 0.5, 0.8)
+# Panel A (spot over silhouette): the same three as SOLID rings, plus 0.3/0.7 as DOTTED in-betweens.
+_SIL_SOLID = (0.1, 0.5, 0.8)
+_SIL_DOTTED = (0.3, 0.7)
 
 
 def _field_to_png(field01, transpose=False, flip_rows=False, cmap="plasma"):
@@ -422,7 +428,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0, grid_n=110,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
-                          orientation="landscape", phone=False,
+                          orientation="landscape", phone=False, beam_full_range=False,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the flyby animation (A, D, F, F₂), returning the figure.
 
@@ -524,12 +530,22 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
 
     half = float(xs.max())
 
-    eta_series = np.array([f["eta"] for f in frames_phys]) * 100
-    capture_series = np.array([f["geom"] for f in frames_phys]) * 100   # intensity-weighted overlap
+    # Panel-D curves are sampled MUCH more finely than the animation frames. The frames are limited
+    # by the per-frame diffraction + image-baking cost, but each point of the η/capture/energy curve
+    # is only a scalar link evaluation (no field baked), so a dense grid is cheap — and it removes
+    # the visible kinks (notably in the delivered-energy curve) from drawing a smooth quantity as a
+    # coarse polyline. One vectorized evaluate() maps the scalar core over the whole dense grid.
+    n_curve = max(n_frames, 400)
+    xs_curve = np.linspace(-half, half, n_curve)
+    plane_arr = np.column_stack([xs_curve, np.full(n_curve, lateral_m), np.full(n_curve, plane_alt_m)])
+    s_curve = bl.evaluate(bl.LinkConfig(plane_pos=plane_arr, **kw), delivered_mw)
+    eta_series = np.asarray(s_curve["eta_end_to_end"], float) * 100
+    _geom = s_curve.get("capture_geom", s_curve.get("capture_down_geom", s_curve["capture"]))
+    capture_series = np.asarray(_geom, float) * 100                     # intensity-weighted overlap
     # Cumulative delivered energy over the pass ("eat everything": emitter at a fixed grid
     # power sized to hit delivered_mw at the best point; plane banks grid·η each instant).
     peak = max(eta_series.max() / 100.0, 1e-9)
-    dt_s = (xs[1] - xs[0]) / 250.0                                       # 250 m/s cruise
+    dt_s = (xs_curve[1] - xs_curve[0]) / 250.0                          # 250 m/s cruise
     deliverable_mw = (delivered_mw / peak) * (eta_series / 100.0)
     cum_gj = np.cumsum(deliverable_mw * dt_s) / 1e3                      # MW·s = MJ → GJ
     # "Windowed pass efficiency": if the beam only operates while the plane is within ±d of closest
@@ -537,8 +553,8 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # fixed (constant grid power), so it reduces to the mean of η over |along-track| ≤ d. At d = 0 it
     # equals peak η; it falls as the window widens to swallow low-elevation (inefficient) geometry —
     # i.e. "how good is my average efficiency if I'm willing to beam out to this distance?".
-    _order = np.argsort(np.abs(xs))                                     # frames from closest approach out
-    _cummean = np.cumsum((eta_series / 100.0)[_order]) / np.arange(1, len(xs) + 1)
+    _order = np.argsort(np.abs(xs_curve))                              # points from closest approach out
+    _cummean = np.cumsum((eta_series / 100.0)[_order]) / np.arange(1, n_curve + 1)
     windowed_eta = np.empty_like(eta_series)
     windowed_eta[_order] = _cummean * 100.0                             # mean η over |x| ≤ |x_k|, in %
     # Companion (same ±d window): TOTAL energy delivered if the beam only operates within ±d —
@@ -546,6 +562,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # "how much energy do I actually land if I'm willing to beam out to this distance?".
     windowed_gj = np.empty_like(eta_series)
     windowed_gj[_order] = np.cumsum((deliverable_mw * dt_s)[_order]) / 1e3   # GJ within |x| ≤ |x_k|
+    # Frame-resolution values for the moving markers + panel-A capture text: sample the dense curves
+    # at each frame's along-track position, so a marker always rides exactly on its (smooth) line.
+    eta_mk = np.interp(xs, xs_curve, eta_series)
+    cap_mk = np.interp(xs, xs_curve, capture_series)
+    cum_mk = np.interp(xs, xs_curve, cum_gj)
+    win_eta_mk = np.interp(xs, xs_curve, windowed_eta)
+    win_gj_mk = np.interp(xs, xs_curve, windowed_gj)
+    cap_pct_frame = np.array([f["geom"] for f in frames_phys]) * 100    # panel-A "% captured" text
     # Panels F/F₂ (beam channel): the along-path axis is normalised to the LONGEST path over the
     # pass, so the plane's position along it encodes actual slant (far = near the far end, close
     # = near the emitter) — that distance cue is what keeps F/F₂ from being redundant with A.
@@ -570,34 +594,36 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     EMIT_MARGIN = 0.06                         # padding around the shown (half-)aperture
 
     def _cross_window(ap_radial_m, ap_cross_m):
-        """(lo, hi) range for an emitter panel's CROSS axis, at true (isotropic) scale. Show a HALF
-        aperture (0 → edge) when the cross axis is the long one so the wide F view is contained not
-        chopped; the full width when it is the short one (F₂)."""
-        if ap_cross_m > ap_radial_m:           # cross = long axis → one half, centre → edge
-            lo, hi = 0.0, ap_cross_m
-        else:                                  # cross = short axis → full width
-            lo, hi = -ap_cross_m, ap_cross_m
-        pad = EMIT_MARGIN * (hi - lo)
-        return lo - pad, hi + pad
+        """(lo, hi) range for an emitter panel's CROSS axis, at true (isotropic) scale. BOTH panels
+        show a HALF aperture cut along the RADIAL axis: the cut sits at cross = 0 (the map-adjacent
+        edge, so it lines up with and touches the map's white aperture-line) and the arc bulges to
+        NEGATIVE cross (away from the map). The aperture is symmetric, so a half is lossless; the pad
+        is applied only on the arc (outer) side so the cut stays flush with the panel edge."""
+        pad = EMIT_MARGIN * ap_cross_m
+        return -ap_cross_m - pad, 0.0
     # Dense sampling so the baked map images are smooth WITHOUT interpolation: radial is
     # interpolation-only (free), along-path is one diffraction pass each (linear cost, kept
     # moderate — the propagation envelope varies slowly).
-    dist_norm = np.linspace(0.0, 1.0, 200)     # along-path samples (one diffraction pass each)
+    dist_norm = np.linspace(0.0, 1.0, 360)     # along-path samples (one diffraction pass each)
     radial = np.linspace(-PHASE_L, PHASE_L, 600)  # radial samples — cheap (interp only)
     r_t0 = frames_phys[0]["chan_emit_radius_m"]
 
-    # Intensity self-normalises per frame so the beam shape is always visible (a pass-peak
-    # scale left all but the closest frames dark blue); the along-path axis spans max_total and
-    # the beam is masked beyond the current plane position (current_total_m = this slant). The
-    # encircled-energy contours are absolute fractions, so brightness normalisation is moot for
-    # reading "how much lands on the plane".
+    # The along-path axis spans max_total, so the sample SPACING (Δz = max_total/(N−1)) is CONSTANT
+    # across frames and the sample count effectively grows with slant (near/overhead frames fill only
+    # a short low band, far frames the whole axis). Intensity self-normalises per frame so the beam
+    # shape is always visible; the encircled-energy contours are absolute fractions, so normalisation
+    # is moot for reading "how much lands on the plane".
+    #   beam_full_range=False (default): the beam is masked beyond the current plane position, so the
+    #     map shows only emitter→plane. True: render the field over the WHOLE path (out to max_total),
+    #     so the energy that MISSES the plane — sidelobes + the diverging beam BEHIND the aircraft —
+    #     is visible for an exposure/limits check (the plane line still marks the aircraft position).
     _chan_cache = {}
 
     def _channel_all(f):                              # (ix, ex, iy, ey) — both cuts, one pass
         key = id(f)
         if key not in _chan_cache:
-            _chan_cache[key] = _channel_field(dist_norm, radial, f["chan_legs"], max_total,
-                                              f["chan_total"])
+            shown_to = max_total if beam_full_range else f["chan_total"]
+            _chan_cache[key] = _channel_field(dist_norm, radial, f["chan_legs"], max_total, shown_to)
         return _chan_cache[key]
 
     def channel(f, axis):                             # axis 'y' = major (wide), 'x' = minor (narrow)
@@ -627,13 +653,12 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         phi = (phi + np.pi) % (2.0 * np.pi) - np.pi
         return np.where(inside, phi, np.nan).astype(np.float32)
 
-    def emitter_outline(ap_radial_m, ap_cross_m):      # thin white aperture edge; x = cross, y = radial
-        if ap_cross_m > ap_radial_m:                   # half shown → D-shape: arc + straight cut at cross=0
-            t = np.linspace(-np.pi / 2.0, np.pi / 2.0, 160)
-            return (np.append(ap_cross_m * np.cos(t), 0.0),
-                    np.append(ap_radial_m * np.sin(t), -ap_radial_m))
-        t = np.linspace(0.0, 2.0 * np.pi, 240)         # full ellipse (short axis along cross)
-        return ap_cross_m * np.cos(t), ap_radial_m * np.sin(t)
+    def emitter_outline(ap_radial_m, ap_cross_m):      # thin white aperture edge; returns (cross, radial)
+        # Half aperture (both panels): D-shape with the straight cut along the RADIAL axis at cross=0
+        # (so it coincides with the map's white aperture-line) and the arc bulging to NEGATIVE cross.
+        t = np.linspace(-np.pi / 2.0, np.pi / 2.0, 200)
+        return (np.append(-ap_cross_m * np.cos(t), 0.0),      # 0 → −ap_cross → 0, then close the cut
+                np.append(ap_radial_m * np.sin(t), -ap_radial_m))
 
     # Layout: A (beam spot over silhouette) and D (along-pass curves) come first, then the two
     # beam-channel maps each with its emitter-phase plot sharing the RADIAL axis (so the aperture
@@ -681,13 +706,12 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         F_emit, F_map, F2_emit, F2_map = (3, 1), (3, 2), (4, 1), (4, 2)
 
     # ---- offline renderers: heatmaps → honest no-AA PNG backgrounds; contours → vector lines --
-    LV = _CONTOUR_LEVELS
     def map_png(f, cut):                                   # beam intensity → background image
         return _field_to_png(channel(f, cut), transpose=not portrait, flip_rows=portrait)
     def map_contour(f, cut):                               # encircled-energy funnel (per-plane inversion)
         # Enclosed field is now integrated on a common grid (see _channel_field) so it's smooth
         # along the path — no dejitter needed; the surviving waviness is real Fresnel structure.
-        r_vals, z_vals = _funnel_contour(channel_enc(f, cut), dist_norm, radial, LV)  # r_L(z) by E⁻¹
+        r_vals, z_vals = _funnel_contour(channel_enc(f, cut), dist_norm, radial, _BEAM_LEVELS)  # r_L(z)=E⁻¹
         return (r_vals, z_vals) if portrait else (z_vals, r_vals)     # portrait x=radial; landscape x=dist
     def phase_png(f, ar, ac):                              # emitter zone-plate → background image
         lo, hi = _cross_window(ar, ac)
@@ -696,20 +720,25 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
                              transpose=portrait, flip_rows=False, cmap="twilight")
     def incid_png(f):                                      # silhouette incidence → background image
         return _field_to_png(incidence_grid(f), transpose=False, flip_rows=True)
-    def incid_contour(f):
-        return _contour_xy(encircled_grid(f), gx, gy, LV)
+    def incid_contour(f, levels):
+        return _contour_xy(encircled_grid(f), gx, gy, levels)
 
-    # ---- Panel A: incidence image (added to layout.images below) + encircled contour (vector) --
+    # ---- Panel A: incidence image (added to layout.images below) + encircled contours (vector) --
     # Mint-green reads cleanly over Plasma (which has no green). The heatmap itself is a baked
-    # background image; only the contour and the capture text are live vector traces here.
+    # background image; only the two contour traces (solid 0.1/0.5/0.8, dotted 0.3/0.7) and the
+    # capture text are live vector traces here.
     i_contA = len(fig.data)
-    cAx, cAy = incid_contour(frames_phys[0])
+    cAx, cAy = incid_contour(frames_phys[0], _SIL_SOLID)
     fig.add_trace(go.Scatter(x=cAx, y=cAy, mode="lines", line=dict(color="#7dffce", width=1.1),
-                             opacity=0.55, showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
+                             opacity=0.4, showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
+    i_contA_dot = len(fig.data)
+    dAx, dAy = incid_contour(frames_phys[0], _SIL_DOTTED)
+    fig.add_trace(go.Scatter(x=dAx, y=dAy, mode="lines", line=dict(color="#7dffce", width=1.0, dash="dot"),
+                             opacity=0.3, showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
     # Live capture % in the corner of panel A — the beam fraction the silhouette intercepts.
     i_capA = len(fig.data)
     fig.add_trace(go.Scatter(x=[-EXT_H * 0.94], y=[EXT_V * 0.82], mode="text",
-                             text=[f"{capture_series[0]:.0f}% captured"], textposition="middle right",
+                             text=[f"{cap_pct_frame[0]:.0f}% captured"], textposition="middle right",
                              textfont=dict(size=16, color="#ffffff"), cliponaxis=False,
                              showlegend=False, hoverinfo="skip"), row=A_rc[0], col=A_rc[1])
 
@@ -720,39 +749,39 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     nm_cum = "energy (GJ)" if portrait else "cumulative energy (GJ)"
     nm_win = "pass η, ±d (%)" if portrait else "pass η if beaming within ±d (%)"
     nm_weg = "energy, ±d (GJ)" if portrait else "energy delivered if beaming within ±d (GJ)"
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=eta_series, mode="lines", name=nm_eta,
+    fig.add_trace(go.Scatter(x=xs_curve / 1e3, y=eta_series, mode="lines", name=nm_eta,
                              line=dict(color="#1f77b4", width=2), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=windowed_eta, mode="lines", name=nm_win,
+    fig.add_trace(go.Scatter(x=xs_curve / 1e3, y=windowed_eta, mode="lines", name=nm_win,
                              line=dict(color="#9467bd", width=2, dash="dash"), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=capture_series, mode="lines", name=nm_cap,
+    fig.add_trace(go.Scatter(x=xs_curve / 1e3, y=capture_series, mode="lines", name=nm_cap,
                              line=dict(color="#2ca02c", width=2, dash="dot"), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=cum_gj, mode="lines", name=nm_cum,
+    fig.add_trace(go.Scatter(x=xs_curve / 1e3, y=cum_gj, mode="lines", name=nm_cum,
                              line=dict(color="#ff7f0e", width=2), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
-    fig.add_trace(go.Scatter(x=xs / 1e3, y=windowed_gj, mode="lines", name=nm_weg,
+    fig.add_trace(go.Scatter(x=xs_curve / 1e3, y=windowed_gj, mode="lines", name=nm_weg,
                              line=dict(color="#e377c2", width=2, dash="dash"), hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
     i_eta_m = len(fig.data)
-    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_series[0]], mode="markers",
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[eta_mk[0]], mode="markers",
                              marker=dict(size=9, color="#1f77b4"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_win_m = len(fig.data)
-    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[windowed_eta[0]], mode="markers",
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[win_eta_mk[0]], mode="markers",
                              marker=dict(size=9, color="#9467bd"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_cap_m = len(fig.data)
-    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[capture_series[0]], mode="markers",
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cap_mk[0]], mode="markers",
                              marker=dict(size=9, color="#2ca02c"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=False)
     i_cum_m = len(fig.data)
-    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cum_gj[0]], mode="markers",
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[cum_mk[0]], mode="markers",
                              marker=dict(size=9, color="#ff7f0e"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
     i_wgj_m = len(fig.data)
-    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[windowed_gj[0]], mode="markers",
+    fig.add_trace(go.Scatter(x=[xs[0] / 1e3], y=[win_gj_mk[0]], mode="markers",
                              marker=dict(size=9, color="#e377c2"), showlegend=False, hoverinfo="skip"),
                   row=D_rc[0], col=D_rc[1], secondary_y=True)
 
@@ -767,7 +796,7 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
         i_cont = len(fig.data)
         cxx, cyy = map_contour(f0, cut)
         fig.add_trace(go.Scatter(x=cxx, y=cyy, mode="lines", line=dict(color="#7dffce", width=1.1),
-                                 opacity=0.6, showlegend=False, hoverinfo="skip"), row=mr, col=mc)
+                                 opacity=0.45, showlegend=False, hoverinfo="skip"), row=mr, col=mc)
         if portrait:
             ap_x, ap_y, pl_x, pl_y = [-ap_radial_m, ap_radial_m], [0.0, 0.0], [-s0, s0], [yy0, yy0]
         else:
@@ -823,13 +852,14 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     # Each frame swaps the 5 background images (a cheap relayout) and restyles the live vector
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
-    ANIMATED = [i_contA, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
+    ANIMATED = [i_contA, i_contA_dot, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
                 F["cont"], F["plane"], F2["cont"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
         yy = f["chan_total"] / max_total
-        cAx, cAy = incid_contour(f)
+        cAx, cAy = incid_contour(f, _SIL_SOLID)
+        dAx, dAy = incid_contour(f, _SIL_DOTTED)
         fcx, fcy = map_contour(f, "y"); f2cx, f2cy = map_contour(f, "x")
         if portrait:
             fpl = go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy])
@@ -839,12 +869,13 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
             f2pl = go.Scatter(x=[yy, yy], y=[-f["sil_minor_m"], f["sil_minor_m"]])
         frames.append(go.Frame(name=str(k), traces=ANIMATED,
             data=[go.Scatter(x=cAx, y=cAy),
-                  go.Scatter(text=[f"{capture_series[k]:.0f}% captured"]),
-                  go.Scatter(x=[cur], y=[eta_series[k]]),
-                  go.Scatter(x=[cur], y=[windowed_eta[k]]),
-                  go.Scatter(x=[cur], y=[capture_series[k]]),
-                  go.Scatter(x=[cur], y=[cum_gj[k]]),
-                  go.Scatter(x=[cur], y=[windowed_gj[k]]),
+                  go.Scatter(x=dAx, y=dAy),
+                  go.Scatter(text=[f"{cap_pct_frame[k]:.0f}% captured"]),
+                  go.Scatter(x=[cur], y=[eta_mk[k]]),
+                  go.Scatter(x=[cur], y=[win_eta_mk[k]]),
+                  go.Scatter(x=[cur], y=[cap_mk[k]]),
+                  go.Scatter(x=[cur], y=[cum_mk[k]]),
+                  go.Scatter(x=[cur], y=[win_gj_mk[k]]),
                   go.Scatter(x=fcx, y=fcy), fpl,
                   go.Scatter(x=f2cx, y=f2cy), f2pl],
             layout=go.Layout(images=frame_images(f))))
