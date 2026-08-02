@@ -5,8 +5,6 @@ here. It deliberately imports nothing — the keywords are handed to `beam_link.
 whoever runs them (`sweeps.corridor_table`, the econ driver, the flyby animation).
 """
 
-from __future__ import annotations
-
 
 def standard_architectures(station_pos=(0.0, 0.0, 0.0), weather="clear", pae_scenario="today",
                            relay_alt_m=20_000.0, tether_alt_m=20_000.0,

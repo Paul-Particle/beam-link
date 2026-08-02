@@ -46,6 +46,15 @@ def _aperture_spacing(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range
 N_AP_FIT_CAP = 4096
 
 
+class ApertureTooFine(ValueError):
+    """The aperture cannot be sampled finely enough to be represented at this focus and range.
+
+    Its own type so callers can back off from a geometry the sampling cannot reach without also
+    swallowing every other ValueError the capture chain might raise. Subclasses ValueError so
+    existing `except ValueError` handlers keep working.
+    """
+
+
 def _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m, n_ap,
                    cap=N_AP_FIT_CAP):
     """Sample pitch AND a grid size that actually contains the aperture: (d, n).
@@ -66,7 +75,7 @@ def _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, z_m, focus_range_m,
         if n_need <= n:
             return d, n
         if n_need > cap:
-            raise ValueError(
+            raise ApertureTooFine(
                 f"aperture would be clipped: semi-axes ({semi_major_m:.3g}, {semi_minor_m:.3g}) m at "
                 f"z={z_m:.4g} m, focus={focus_range_m:.4g} m need n_ap >= {n_need} (cap {cap}). The "
                 f"focusing phase sets the pitch here; raise the cap or evaluate no closer to the "
@@ -239,7 +248,7 @@ def axial_cuts_direct(z_m, focus_range_m, semi_major_m, semi_minor_m, wavelength
         try:
             d, n_ap = _aperture_grid(semi_major_m, semi_minor_m, wavelength_m, zi, focus_range_m,
                                      n_ap_base, cap=n_ap_max)
-        except ValueError:
+        except ApertureTooFine:
             continue
         coord = (np.arange(n_ap) - n_ap // 2) * d
         X, Y = np.meshgrid(coord, coord, indexing="ij")

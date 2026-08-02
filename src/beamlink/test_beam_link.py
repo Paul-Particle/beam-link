@@ -401,6 +401,41 @@ def test_pointing_density():
           f"1 MW → {lo:.1f} m, 40 MW → {hi:.1f} m")
 
 
+def test_defocus_floor():
+    """A big aperture cannot be focused as short as the density cap's `slant/8` floor: the field
+    model refuses (rather than silently clip the aperture) because the focusing phase would need a
+    finer sample pitch than it will allocate. The floor has to back off to a focus it can
+    represent instead of letting that refusal escape.
+
+    The animation's own defaults land here — they size the emitter for a low-elevation reference
+    and then fly it overhead, so a several-hundred-metre aperture sits 11 km from the aircraft.
+    """
+    print("\n[defocus floor — an unrepresentable focus backs off, it does not raise]")
+    station, plane, diam = (0.0, 0.0, 0.0), (0.0, 0.0, 11_000.0), 400.0
+    cfg = bl.LinkConfig(station_pos=station, plane_pos=plane, f_emit_plane_ghz=5.8,
+                        emitter_diam_m=diam)
+    slant = float(bl.geometry(np.asarray(plane, float), np.asarray(station, float))[0])
+
+    # Precondition, so the rest of this is exercising the back-off rather than a geometry that
+    # never needed one: the intended floor really is out of the field model's reach here.
+    try:
+        bl.plane_capture(cfg, station, 5.8, diam, taper_p=0.0, focus_range_m=slant / 8.0)
+        refused = False
+    except dfr.ApertureTooFine:
+        refused = True
+    check(f"slant/8 is unrepresentable for a {diam:.0f} m aperture at {slant/1e3:.0f} km", refused)
+
+    focused = bl.plane_capture(cfg, station, 5.8, diam, taper_p=0.0)
+    focus, pc = bl._defocus_floor(cfg, station, 5.8, diam, 0.0, slant, focused, False)
+    check("the floor backs off to a longer focus", slant / 8.0 < focus <= slant,
+          f"{focus/1e3:.2f} km vs slant/8 = {slant/8e3:.2f} km")
+    check("...and the capture there is real", pc["capture"] > 0.0, f"capture {pc['capture']:.3f}")
+
+    s = bl.evaluate(cfg, 10.0)              # used to propagate ApertureTooFine out of evaluate
+    check("a large overhead aperture evaluates end-to-end", 0.0 < s["eta_end_to_end"] < 1.0,
+          f"η {s['eta_end_to_end']:.3f} at focus {s['focus_range_m']/1e3:.1f} km")
+
+
 def test_taper():
     """What tapering the aperture buys, on a receiver whose radius is the first Airy null
     (0.61*lambda*D/a): it moves
@@ -554,6 +589,7 @@ if __name__ == "__main__":
     test_overlap()
     test_flyby()
     test_pointing_density()
+    test_defocus_floor()
     test_taper()
     test_adaptive_taper()
     test_energy_balance()

@@ -24,6 +24,8 @@ from beamlink import relations
 from beamlink import geo
 from beamlink.bwb_model import (BWBSilhouette, beta_alpha_from_enu, direction_from_beta_alpha,
                                 get_mesh, rasterize_silhouette_zbuffer)
+# Only the exception: the field model itself is reached through `capture`, never from here.
+from beamlink.diffraction import ApertureTooFine
 # The capture physics proper lives in `capture`, which knows nothing of LinkConfig or of this
 # chain, so it can be reworked without touching either. Re-exported because this module is the
 # engine's public face: bl.overlap_capture and bl.size_emitter_diameter are what the econ
@@ -393,14 +395,18 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
     return out
 
 
-def _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant, return_field):
+def _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant, focused_pc,
+                   return_field):
     """Capture at the shortest focus range the defocus search may use — the most-spread spot.
 
     `slant / 8` is the intended floor, but focusing a very large aperture that short leaves the
     regime the field is sampled in: the aperture pitch goes as the residual focusing phase, so
     `diffraction._aperture_grid` refuses rather than clip the aperture. Walk the floor back out
     until it can be evaluated; a longer focus always needs a coarser pitch, so everything above
-    the floor is then evaluable too. Returns (focus_range_m, capture dict).
+    the floor is then evaluable too. If nothing shorter than the slant can be represented, the
+    floor IS the slant, which is `focused_pc` — no defocus is available at all.
+
+    Returns (focus_range_m, capture dict).
     """
     focus = slant / 8.0
     while focus < slant:
@@ -408,12 +414,11 @@ def _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant, r
             return focus, plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
                                         taper_p=taper_p, focus_range_m=focus,
                                         return_field=return_field)
-        except ValueError:
-            _LOG.debug("defocus floor %.3g m unevaluable for a %.3g m emitter at %.3g m slant; "
-                       "backing off", focus, emitter_diam_m or 0.0, slant)
+        except ApertureTooFine:
+            _LOG.debug("defocus floor %.3g m unrepresentable for a %.3g m emitter at %.3g m "
+                       "slant; backing off", focus, focused_pc["emitter_diam_m"], slant)
             focus *= 1.5
-    return slant, plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
-                                focus_range_m=slant, return_field=return_field)
+    return slant, focused_pc
 
 
 def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
@@ -439,8 +444,10 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     # through a 40 m relay aperture overhead sits ~1.30x the cap at every focus). When even `lo` is
     # over there is no compliant geometry in range, so log it and mark the result rather than
     # returning a quietly non-compliant one; by decision this SURFACES but does not block, and
-    # `feasible` is deliberately left alone.
-    lo, pc_lo = _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant,
+    # `feasible` is deliberately left alone. `lo` is the shortest focus the field model can
+    # REPRESENT, which is slant/8 unless the aperture is large enough that _defocus_floor has to
+    # back off.
+    lo, pc_lo = _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant, pc,
                                return_field)
     hi = slant
     density_lo = _peak_density(delivered_mw, pc_lo["capture"], rect_total, pc_lo["peak_intensity"])
