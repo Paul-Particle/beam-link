@@ -12,10 +12,13 @@ Layers: Atmosphere (table lookup) -> per-stage efficiency terms -> spot/silhouet
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+_LOG = logging.getLogger(__name__)
 
 from beamlink import relations
 from beamlink import geo
@@ -443,7 +446,7 @@ def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=200
 def _capture_dict(shared, geom, eff, peak, taper_p, focus_range_m):
     return dict(**shared, capture=eff, capture_geom=geom, peak_intensity=peak,
                 equivalent_disc_radius_m=equivalent_disc_radius(peak), taper_p=float(taper_p),
-                focus_range_m=float(focus_range_m))
+                focus_range_m=float(focus_range_m), density_cap_exceeded=False)
 
 
 def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
@@ -541,13 +544,26 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     if _peak_density(delivered_mw, pc["capture"], rect_total, pc["peak_intensity"]) <= cap:
         return pc
     slant = pc["slant"]
-    # OPEN: `lo` is meant to hold a compliant focus range, but slant/8 is assumed compliant and
-    # never tested. It is not always: whenever that much defocus still cannot spread the spot
-    # enough -- a function of delivered power, aperture, range and frequency together, not of
-    # emitter size alone (400 MW through the 40 m relay aperture overhead reports 1.30x the cap)
-    # -- an over-limit density is returned unflagged, no caller checks it, and
-    # `stages["feasible"]` ignores it. What should happen instead is undecided.
+    # The bisection needs `lo` to be a COMPLIANT focus range and `hi` a too-hot one, so test `lo`
+    # instead of assuming it: whether the most defocused geometry we allow can meet the cap depends
+    # on delivered power, aperture, range and frequency together, not on emitter size alone (400 MW
+    # through a 40 m relay aperture overhead sits ~1.30x the cap at every focus). When even `lo` is
+    # over there is no compliant geometry in range, so log it and mark the result rather than
+    # returning a quietly non-compliant one; by decision this SURFACES but does not block, and
+    # `feasible` is deliberately left alone.
     lo, hi = slant / 8.0, slant
+    pc_lo = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
+                          focus_range_m=lo, return_field=return_field)
+    density_lo = _peak_density(delivered_mw, pc_lo["capture"], rect_total, pc_lo["peak_intensity"])
+    if density_lo > cap:
+        _LOG.warning(
+            "power-density cap unmet: %.2fx cap (%.3g vs %.3g W/m2) at maximum defocus "
+            "(focus %.3g m of %.3g m slant, %.3g MW delivered, taper %.2f, emitter %.3g m) - "
+            "returning the most-spread geometry with density_cap_exceeded set",
+            density_lo / cap, density_lo, cap, lo, slant, delivered_mw, taper_p,
+            pc_lo["emitter_diam_m"])
+        pc_lo["density_cap_exceeded"] = True
+        return pc_lo
     for _ in range(16):
         mid = 0.5 * (lo + hi)
         pcm = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p, focus_range_m=mid)
@@ -639,6 +655,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
             aperture_taper_p=pc["taper_p"], focus_range_m=pc["focus_range_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
+            density_cap_exceeded=pc["density_cap_exceeded"],
             emitter_diam_m=pc["emitter_diam_m"], slant_km=pc["slant"] / 1e3,
             elevation_deg=pc["elevation"], blocked=blocked)
 
@@ -682,6 +699,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
             focus_range_m=pc["focus_range_m"], emitter_diam_m=pc["emitter_diam_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
+            density_cap_exceeded=pc["density_cap_exceeded"],
             emitter_diam_up_m=float(h1.emitter_diam_m),
             slant_up_km=h1.slant_m / 1e3, slant_down_km=pc["slant"] / 1e3,
             elevation_up_deg=float(h1.elevation_deg), elevation_down_deg=pc["elevation"],

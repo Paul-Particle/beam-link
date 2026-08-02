@@ -56,7 +56,12 @@ Resolved since:
   unreachable — 70×20 m semi-axes focused at 50 km already clip at n_ap=512 by z≈1.5 km, which
   is squarely where the near-field beam maps evaluate.
 
-Design questions still recorded in the code as open rather than rationalised: what should happen
-when the power-density cap cannot be met, whether the `elevation_deg` sign flip between the
-ground-emitter and relay cases is a bug or a convention, and whether a scan-loss term belongs in
-the chain at all (that last one deferred as later refinement).
+- When the power-density cap cannot be met at any allowed defocus, that is now logged (a warning
+  naming how far over, at what focus and power) and reported as `density_cap_exceeded` on the
+  stages. It deliberately does NOT block, and does not touch `feasible` — the decision was to
+  surface it and keep going. The bisection's lower bracket is tested rather than assumed
+  compliant, which is what used to let a non-compliant geometry return unremarked.
+
+Design questions still recorded in the code as open rather than rationalised: whether the
+`elevation_deg` sign flip between the ground-emitter and relay cases is a bug or a convention,
+and whether a scan-loss term belongs in the chain at all (deferred as later refinement).

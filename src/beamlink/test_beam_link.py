@@ -378,6 +378,16 @@ def test_pointing_density():
                     relay_aperture_diam_m=40), 10.0)
     check("incident power density held under the 25 W/cm² cap",
           s["power_density_w_m2"] <= 2.5e5 * 1.02, f"{s['power_density_w_m2']/1e4:.1f} W/cm²")
+    check("a compliant case is not flagged", s["density_cap_exceeded"] is False)
+
+    # When the cap CANNOT be met at any allowed defocus, that is reported rather than hidden:
+    # 400 MW through the same 40 m relay aperture overhead sits ~1.3× the cap at every focus.
+    hot = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, relay_pos=relay,
+                      relay_mode="multiplier", f_emit_relay_ghz=5.8, f_relay_plane_ghz=17.4,
+                      relay_aperture_diam_m=40), 400.0)
+    check("unmeetable density cap is flagged, not silently exceeded",
+          hot["density_cap_exceeded"] is True and hot["power_density_w_m2"] > 2.5e5,
+          f"{hot['power_density_w_m2']/1e4:.1f} W/cm² = {hot['power_density_w_m2']/2.5e5:.2f}× cap")
     # More delivered power → the cap forces a larger spot (lower peak-power geometry).
     lo = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=5.8,
                      emitter_diam_m=78.0), 1.0)["equivalent_disc_radius_m"]
