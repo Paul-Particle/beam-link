@@ -435,7 +435,7 @@ def _size_emitter_far(kw, ref_elev_deg, plane_alt_m):
     return kw
 
 
-def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_rain",
+def build_flyby_animation(arch_name="5.8 direct", weather="clear",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
@@ -446,7 +446,10 @@ def build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="light_
     `arch_name` selects a named case from `standard_architectures`; pass `arch_kwargs`
     (a LinkConfig kwarg dict, `plane_pos` omitted) instead to animate an architecture not
     in that catalogue (e.g. a passive same-frequency relay), with `arch_name` used only as
-    the display label. `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct →
+    the display label. The default is the DIRECT case, which is the one being iterated on;
+    a RELAY is an explicit opt-in (`arch_name="relay ×3 mult 5.8→17.4"`) and renders the
+    channel as two legs, ground→relay then relay→plane, each with its own aperture, focus
+    and wavelength. `emitter_diam_m` sets the emitter aperture EXPLICITLY (direct →
     `emitter_diam_m`, relay → `relay_aperture_diam_m`) and bypasses the far-reference
     auto-sizing — so emitter size can be swept as the single variable. `grid_nA` is the
     panel-A silhouette-grid resolution (lower it for lighter embedded figures).

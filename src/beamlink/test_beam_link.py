@@ -464,6 +464,42 @@ def test_energy_balance():
     check("0 ≤ served fraction ≤ 1", 0.0 <= r["served_frac"] <= 1.0, f"{r['served_frac']:.2f}")
 
 
+def test_relay_channel():
+    """The RELAY rendering path stays alive while we iterate on the direct case.
+
+    A relay is an opt-in, so nothing in the default build exercises its two-leg channel — this
+    covers it: the frame carries an up-leg and a down-leg whose lengths sum to the total path,
+    the two legs really differ (own aperture, focus and wavelength), and the channel field
+    resolves intensity in BOTH of them rather than only the leg nearest the emitter.
+    """
+    print("\n[relay channel — the opt-in two-leg render path]")
+    from beamlink import beam_link_animation as anim
+
+    arch = bl.standard_architectures(weather="clear")["relay ×3 mult 5.8→17.4"]
+    basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
+    cv, cf = m.make_bwb_mesh(n_span=41, n_theta=26)
+    cn, _ = m.triangle_normals_areas(cv, cf)
+    f = anim._frame_physics(arch, -60e3, 11_000.0, basis, (cv, cf, cn))
+
+    legs = f["chan_legs"]
+    check("relay frame has two channel legs", len(legs) == 2, f"{len(legs)} legs")
+    total = sum(leg["length_m"] for leg in legs)
+    check("leg lengths sum to the total path length",
+          abs(total - f["chan_total"]) < 1.0, f"{total/1e3:.1f} vs {f['chan_total']/1e3:.1f} km")
+    check("the two legs are physically distinct (wavelength and aperture)",
+          legs[0]["lam"] != legs[1]["lam"] and legs[0]["ap_major"] != legs[1]["ap_major"],
+          f"λ {legs[0]['lam']*100:.1f}/{legs[1]['lam']*100:.1f} cm, "
+          f"ap {legs[0]['ap_major']:.0f}/{legs[1]['ap_major']:.0f} m")
+
+    dist = np.linspace(0.0, 1.0, 160)
+    radial = np.linspace(-200.0, 200.0, 161)
+    ix, _, iy, _ = anim._channel_field(dist, radial, legs, f["chan_total"], f["chan_total"])
+    s = dist * f["chan_total"]
+    up = np.isfinite(ix[s < legs[0]["length_m"]]).any()
+    down = np.isfinite(ix[s > legs[0]["length_m"]]).any()
+    check("channel field resolves BOTH legs", bool(up and down), f"up={up} down={down}")
+
+
 if __name__ == "__main__":
     test_silhouette()
     test_atmosphere()
@@ -478,5 +514,6 @@ if __name__ == "__main__":
     test_taper()
     test_adaptive_taper()
     test_energy_balance()
+    test_relay_channel()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)

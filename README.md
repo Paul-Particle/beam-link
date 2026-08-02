@@ -15,6 +15,21 @@ independent of the directory name and does not have to change with it.
     uv sync
     uv run python -m beamlink.test_beam_link      # ALL CHECKS PASSED
     uv run python -m beamlink.econ_pass2
+    uv run python -m beamlink.beam_link_animation # out/flyby.html
+    uv run python -m beamlink.beam_link_phone     # out/flyby_phone.html + the artifact fragment
+
+## Direct by default, relay by opt-in
+
+The case under active iteration is the DIRECT link (`5.8 direct`), and that is what every
+entry point builds unless told otherwise. A RELAY is fully supported but deliberately opt-in:
+
+    build_flyby_animation(arch_name="relay ×3 mult 5.8→17.4", weather="clear")
+
+It is a genuinely different render path — the channel becomes two legs, ground→relay then
+relay→plane, each with its own aperture, focus and wavelength — so `test_relay_channel` exercises
+it on every run to stop it rotting while the direct case moves. Relay also earned its keep
+physically: at a matched aperture it roughly doubled the direct case's delivered energy, and it
+is the weather-robust option, so it is not to be quietly dropped.
 
 ## Layout
 
