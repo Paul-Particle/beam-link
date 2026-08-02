@@ -38,7 +38,7 @@ from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import geo
 from beamlink.architectures import standard_architectures
-from beamlink.flyby_frames import (channel_field, frame_physics, funnel_contour,
+from beamlink.flyby_frames import (beam_cut_axes, channel_field, frame_physics, funnel_contour,
                                    max_silhouette_extent, size_emitter_far)
 
 OUT = "out"
@@ -210,12 +210,9 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
     # PER-FRAME airframe projection into each beam-cut plane, drawn at the plane line. Unlike a fixed
     # top/side view, this reflects the aircraft's TRUE orientation relative to the cut we are viewing at
     # that instant (and would follow a banking manoeuvre if modelled), and it is coloured by BEAM
-    # incidence (n̂·look, exactly like panel A). Each beam map is a cut of the 3-D beam containing the
-    # propagation axis and one transverse axis: F = MAJOR transverse (radial ← major, along ← beam
-    # propagation, VIEWED along the minor transverse), F₂ = MINOR transverse (radial ← minor, viewed
-    # along the major). The transverse axes are the silhouette's principal axes in the panel-A view
-    # plane, so the projection foreshortens/rotates with the geometry. Uses the coarse channel mesh
-    # (fast; the projection is a small on-screen element). `cut` = 'y' (F, major) / 'x' (F₂, minor).
+    # incidence (n̂·look, exactly like panel A). The cut's three axes — radial, along (propagation)
+    # and viewing direction, for this layout — come from `flyby_frames.beam_cut_axes`. Uses the coarse
+    # channel mesh (fast; the projection is a small on-screen element).
     proj_v, proj_f, proj_n = coarse_mesh
     _blank_png = _field_to_png(np.full((2, 2), np.nan))
     _proj_cache = {}
@@ -225,29 +222,21 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
         beam-cut plane at frame `f`, coloured by beam incidence. Cached per (frame, cut)."""
         key = (id(f), cut)
         if key not in _proj_cache:
+            radial_ax, along_ax, view_ax = beam_cut_axes(f, cut, portrait=portrait)
             look = np.asarray(f["look"], float); look = look / (np.linalg.norm(look) + 1e-30)
-            vu, vv = np.asarray(f["view_u"], float), np.asarray(f["view_v"], float)
-            coords = np.vstack([f["field"]["u"], f["field"]["v"]])
-            if coords.shape[1] >= 3:
-                _, ev = np.linalg.eigh(np.cov(coords))    # cols [minor, major] in the (view_u,view_v) plane
-                major = ev[0, 1] * vu + ev[1, 1] * vv
-                minor = ev[0, 0] * vu + ev[1, 0] * vv
-            else:
-                major, minor = vu, vv
-            radial_ax, view_ax = (major, minor) if cut == "y" else (minor, major)
             beam_inc = np.clip(proj_n @ look, 0.0, 1.0)   # COLOUR: beam incidence (like panel A)
             view_inc = proj_n @ view_ax                    # CULL/occlude by the viewing direction
             front = view_inc > 1e-6
             if not front.any():
                 return _blank_png, 0.5, 0.5
             fv = np.unique(proj_f[front])
-            R, A = proj_v @ radial_ax, proj_v @ look       # radial (transverse) & along (propagation)
+            R, A = proj_v @ radial_ax, proj_v @ along_ax   # radial (transverse) & along (propagation)
             r_half = max(0.5 * (R[fv].max() - R[fv].min()) * 1.05, 0.3)
             a_half = max(0.5 * (A[fv].max() - A[fv].min()) * 1.05, 0.3)
             r_mid, a_mid = 0.5 * (R[fv].min() + R[fv].max()), 0.5 * (A[fv].min() + A[fv].max())
             r_lin = np.linspace(r_mid - r_half, r_mid + r_half, 170)
             a_lin = np.linspace(a_mid - a_half, a_mid + a_half, 170)
-            incid = m.rasterize_view_zbuffer(radial_ax, look, view_ax, proj_v, proj_f, view_inc,
+            incid = m.rasterize_view_zbuffer(radial_ax, along_ax, view_ax, proj_v, proj_f, view_inc,
                                              r_lin, a_lin, color=beam_inc)
             png = _field_to_png(incid, transpose=not portrait, flip_rows=True, cmap="plasma")
             _proj_cache[key] = (png, float(r_half), float(a_half))

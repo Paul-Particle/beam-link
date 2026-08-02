@@ -15,7 +15,7 @@ from beamlink import sweeps
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import field as fl
-from beamlink.flyby_frames import channel_field, frame_physics
+from beamlink.flyby_frames import beam_cut_axes, channel_field, frame_physics
 from beamlink.architectures import standard_architectures
 from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
@@ -544,6 +544,51 @@ def test_hankel_reference():
               f"field {captured:.4f} vs 1−exp(−τ²) {goubau:.4f}  ({captured-goubau:+.4f})")
 
 
+def test_beam_cut_orientation():
+    """The airframe drawn on a beam map faces the way it is flying, and stays the right way up.
+
+    The map's along axis runs emitter → plane, so the nose must sit on the EMITTER side of the
+    projection while the aircraft is inbound and on the far side once it is outbound —
+    `frame["look"]` runs the other way (at the emitter, which is what incidence needs), so taking
+    it as the along axis mirrors the aircraft front-to-back. The transverse axis needs pinning to
+    the airframe as well: eigenvector signs are arbitrary, and the sign eigh returns flips at the
+    overhead crossover. In the VERTICAL cut that pin buys dorsal-up everywhere (see
+    `beam_cut_axes` for the one mirror it costs); the HORIZONTAL cut has no such trade and must
+    come out continuous frame to frame.
+    """
+    print("\n[beam-cut axes — how the airframe sits on a beam map]")
+    arch = standard_architectures(weather="clear")["5.8 direct"]
+    basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
+    cv, cf = m.make_bwb_mesh(n_span=41, n_theta=26)
+    cn, _ = m.triangle_normals_areas(cv, cf)
+    nose, dorsal = np.array([1.0, 0, 0]), np.array([0, 0, -1.0])
+    xs = np.array([-120e3, -40e3, -10e3, 0.0, 10e3, 40e3, 120e3])   # a pass, straddling overhead
+    frames = [frame_physics(arch, x, 11_000.0, basis, (cv, cf, cn)) for x in xs]
+
+    for cut, label in (("y", "F  horizontal"), ("x", "F₂ vertical")):
+        axes = [beam_cut_axes(f, cut) for f in frames]
+        alongs = np.array([nose @ a for _, a, _ in axes])
+        check(f"{label}: the nose faces the emitter inbound and away from it outbound",
+              (alongs[xs < 0] < 0.0).all() and (alongs[xs > 0] > 0.0).all(),
+              "nose·along " + " ".join(f"{v:+.2f}" for v in alongs))
+        radial, view = axes[0][0], axes[0][2]
+        _, _, view_portrait = beam_cut_axes(frames[0], cut, portrait=True)
+        check(f"{label}: the viewing axis is normal to the cut plane, on the layout's own side",
+              abs(np.linalg.norm(view) - 1.0) < 1e-9 and abs(view @ axes[0][1]) < 1e-9
+              and abs(view @ radial) < 1e-9 and view_portrait @ view < -0.999,
+              f"|v| {np.linalg.norm(view):.6f}, portrait·landscape {view_portrait @ view:+.3f}")
+        if cut == "x":
+            up = np.array([dorsal @ r for r, _, _ in axes])
+            check(f"{label}: never drawn belly-up — dorsal is up in every frame", (up >= 0.0).all(),
+                  "dorsal·radial " + " ".join(f"{v:+.2f}" for v in up))
+        else:
+            steps = [(axes[k][0] @ axes[k + 1][0], axes[k][2] @ axes[k + 1][2])
+                     for k in range(len(axes) - 1)]
+            check(f"{label}: no flip between frames — the cut turns smoothly through overhead",
+                  all(r > 0.0 and v > 0.0 for r, v in steps),
+                  "frame-to-frame view·view " + " ".join(f"{v:+.2f}" for _, v in steps))
+
+
 def test_relay_channel():
     """The RELAY rendering path stays alive while we iterate on the direct case.
 
@@ -594,6 +639,7 @@ if __name__ == "__main__":
     test_adaptive_taper()
     test_energy_balance()
     test_hankel_reference()
+    test_beam_cut_orientation()
     test_relay_channel()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)

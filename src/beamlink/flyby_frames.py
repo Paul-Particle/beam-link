@@ -1,12 +1,13 @@
 """Per-frame physics for the flyby animation — everything one frame of the picture needs to
 know about the beam, computed from the engine, with no plotly in sight.
 
-The animation module owns layout, colour and baking; this owns the numbers it draws. Two
-things happen here:
+The animation module owns layout, colour and baking; this owns the numbers it draws:
   `frame_physics` — one plane position of one architecture through `beam_link.evaluate_with_field`,
     plus the view basis, the silhouette's principal extents, and the beam-channel legs.
   `channel_field` — the scalar-diffraction beam along the WHOLE path as a side view, leg by leg,
     with the encircled-energy fraction the funnel contours are inverted from.
+  `beam_cut_axes` — the body-frame axes of one beam-cut plane, which is what orients the airframe
+    projection the animation draws on top of that cut.
 
 Reached into by `beam_link_animation`, `beam_link_phone` and the test suite, so the names here
 are public: they are the seam a rewrite of either side would meet at.
@@ -292,6 +293,63 @@ def frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
                 phase_d=(np.asarray(plane, float) - emitter), phase_R=float(diam / 2.0),
                 phase_lam=lam, phase_normal_up=(cfg.relay_pos is None),
                 wf_labels=[lbl for lbl, _ in wf], wf_values=[v for _, v in wf])
+
+
+def _pin_transverse_sign(axis):
+    """Pin a silhouette principal axis to the AIRFRAME, in body coordinates.
+
+    `np.linalg.eigh` fixes each principal DIRECTION but not its sign, and the sign it happens to
+    return flips as the pass crosses overhead — which mirrors whatever is drawn on that axis.
+    Anchor to DORSAL (−ẑ body: the same "dorsal up" convention panel A is rotated into), and fall
+    back to STARBOARD, then NOSE, for the axes perpendicular to it — the span axis always, and the
+    near-vertical axis at overhead, where it swings into the nose direction. A unit axis always has
+    a sizeable component on one of the three, so the chain resolves.
+    """
+    candidates = (-axis[2], axis[1], axis[0])                     # dorsal, starboard, nose
+    reference = next((c for c in candidates if abs(c) > 0.1), 1.0)
+    return axis if reference >= 0.0 else -axis
+
+
+def beam_cut_axes(frame, cut, portrait=False):
+    """(radial, along, view) body-frame unit axes of one beam-cut plane of `frame`.
+
+    A beam map is a cut of the 3-D beam containing the propagation axis and one transverse axis:
+    `cut='y'` (F) takes the MAJOR silhouette axis as radial and views along the minor, `cut='x'`
+    (F₂) the other way round. The transverse axes are the silhouette's principal axes in the
+    panel-A view plane, so a cut foreshortens and rotates with the geometry.
+
+      `along`  is the PROPAGATION direction, emitter → plane, matching the map's along axis
+               (0 at the aperture, 1 at the plane). Note `frame["look"]` runs the OTHER way —
+               it points at the emitter, which is what incidence needs.
+      `radial` is the chosen transverse axis, sign-pinned to the airframe.
+      `view`   is DERIVED from the other two rather than taken as the leftover eigenvector, so
+               the render is a true view of the cut plane and not its mirror: the viewer sits at
+               +view, which has to be (screen right × screen up). `portrait` swaps those two,
+               putting radial on the screen's horizontal instead of its vertical, so it also
+               swaps the side the plane is viewed from.
+
+    A pass turns the airframe by ~170° in the beam's frame (the beam arrives ahead of the aircraft
+    inbound, from below at overhead, behind it outbound), so in the vertical cut it CANNOT be drawn
+    dorsal-up throughout and continuously — one or the other has to give. Pinning to the airframe
+    picks dorsal-up: every frame reads as an aircraft the right way up, at the cost of the drawn
+    attitude mirroring once, at the overhead frame where the beam is belly-on and up-vs-down in the
+    cut is degenerate anyway. The horizontal cut has no such choice to make (dorsal is its normal),
+    and comes out continuous: plan view inbound, head-on at overhead, from below outbound.
+    """
+    look = np.asarray(frame["look"], float)
+    look = look / (np.linalg.norm(look) + 1e-30)
+    along = -look
+    view_u, view_v = np.asarray(frame["view_u"], float), np.asarray(frame["view_v"], float)
+    coords = np.vstack([frame["field"]["u"], frame["field"]["v"]])
+    if coords.shape[1] >= 3:
+        _, evec = np.linalg.eigh(np.cov(coords))     # cols [minor, major] in the (view_u, view_v) plane
+        major = evec[0, 1] * view_u + evec[1, 1] * view_v
+        minor = evec[0, 0] * view_u + evec[1, 0] * view_v
+    else:
+        major, minor = view_u, view_v
+    radial = _pin_transverse_sign(major if cut == "y" else minor)
+    view = np.cross(radial, along) if portrait else np.cross(along, radial)
+    return radial, along, view
 
 
 def size_emitter_far(kw, ref_elev_deg, plane_alt_m):

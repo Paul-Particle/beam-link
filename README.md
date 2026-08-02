@@ -48,7 +48,7 @@ is the weather-robust option, so it is not to be quietly dropped.
 | `econ` | cost primitives: energy, fuel, station spacing/count, infra and airframe ownership |
 | `econ_pass2` | the only econ driver — assembles those primitives on the engine's computed η |
 | `field`, `chain_reference` | Hankel-transform ground truth the closed forms are checked against |
-| `flyby_frames` | per-frame physics for the figure: one frame's beam, and the channel side view |
+| `flyby_frames` | per-frame physics for the figure: one frame's beam, the channel side view, the beam-cut axes |
 | `beam_link_animation`, `beam_link_phone` | the flyby figure itself, landscape and portrait |
 | `plot_spectrum` | the atmospheric-attenuation figure the research notebook embeds |
 | `generate_atmosphere_profile`, `generate_spectrum` | regenerate the committed ITU tables (`--extra generators`) |
@@ -86,6 +86,15 @@ Resolved since:
   the most-spread spot the field model can represent. Before that, `build_flyby_animation()` on
   its own defaults — no explicit `emitter_diam_m`, so the emitter is sized for the horizon —
   raised `ValueError` from the aperture guard at the overhead frames.
+
+- The airframe drawn on the beam maps faces the way it is flying. Its along axis was
+  `frame["look"]`, which points AT the emitter (what incidence needs) while the map's along axis
+  runs emitter → plane — so the aircraft was mirrored front-to-back, nose pointing away from the
+  emitter on the inbound half and back at it on the outbound half. The cut's three axes now come
+  from `flyby_frames.beam_cut_axes`, which also pins the transverse sign to the airframe (eigenvector
+  signs are arbitrary and flip at the overhead crossover, which drew the aircraft belly-up over half
+  the pass) and derives the viewing direction, per layout, so each panel is a true view of its cut
+  rather than the mirror image.
 
 Design questions still recorded in the code as open rather than rationalised: whether the
 `elevation_deg` sign flip between the ground-emitter and relay cases is a bug or a convention,
