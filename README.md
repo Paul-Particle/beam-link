@@ -36,6 +36,7 @@ is the weather-robust option, so it is not to be quietly dropped.
 | module | what it is |
 |---|---|
 | `beam_link` | the engine: scenario → link budget, taper choice, flyby energy balance |
+| `capture` | the overlap physics — beam × silhouette, free of `LinkConfig` and the chain |
 | `diffraction` | scalar diffraction from tapered elliptical apertures |
 | `bwb_model` | blended-wing-body silhouette mesh and its projected capture area |
 | `geo` | ENU pass geometry |
