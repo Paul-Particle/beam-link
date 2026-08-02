@@ -3,6 +3,20 @@
 Propagates the actual aperture field with a quasi-discrete Hankel transform
 (Guizar-Sicairos & Gutierrez-Vega 2004) so that aperture truncation, sidelobes
 and the power that misses an element are all real rather than assumed.
+
+This is the INDEPENDENT reference: circularly symmetric, on a disc, sharing no
+code with `diffraction`'s FFT/DFT propagation on a square grid. `test_hankel_reference`
+checks the coupling law against it.
+
+Scope, measured rather than assumed: it is accurate for SMOOTH illumination (the
+matched Gaussian below, whose amplitude is already small at the rim) and for
+INTEGRATED quantities - power is conserved to ~1e-16 and captured fractions track
+1-exp(-tau^2) to a few percent. It is NOT reliable for a hard-edged uniform disc's
+PEAK intensity: the discontinuity is not band-limited on this grid, and the on-axis
+value then does not converge - it wanders between ~0.47x and ~1.25x the analytic
+pi*a^2/(lambda*L)^2 as n_points and the pad are varied, getting worse with finer
+sampling. Use `diffraction` for peak intensity and hard apertures; use this for
+coupling and as the cross-check.
 """
 from __future__ import annotations
 
@@ -80,7 +94,7 @@ def matched_waists(r_a: float, r_b: float, length: float, wavelength: float):
 
 def hop_field(r_a, r_b, length, wavelength, n_planes=48, n_points=512,
               pad=8.0, incident=None, grid=None):
-    """Propagate one hop; return (grid, z samples, field per plane, tau)."""
+    """Propagate one hop; return (grid, z samples, field per plane, tau, launched power)."""
     w_a, w_b, tau = matched_waists(r_a, r_b, length, wavelength)
     if grid is None:
         grid = HankelGrid(pad * max(r_a, r_b), n_points)

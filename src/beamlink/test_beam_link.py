@@ -13,6 +13,7 @@ from beamlink import geo
 from beamlink import beam_link as bl
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
+from beamlink import field as fl
 from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
 
@@ -464,6 +465,47 @@ def test_energy_balance():
     check("0 ≤ served fraction ≤ 1", 0.0 <= r["served_frac"] <= 1.0, f"{r['served_frac']:.2f}")
 
 
+def test_hankel_reference():
+    """`field`'s Hankel propagator, as the independent ground truth for the coupling closed form.
+
+    It is a separate implementation from `diffraction` (quasi-discrete Hankel transform on a disc
+    rather than an FFT/DFT on a square grid), so it is the check that the Goubau law the engine
+    sizes apertures with is not just internally consistent. Three things: the propagator conserves
+    power, an untruncated Gaussian follows the analytic spreading law, and a truncated aperture's
+    captured fraction tracks 1-exp(-tau^2) while sitting BELOW it - truncation can only lose power
+    that the closed form assumes arrives, so the sign of that gap is physics, not tolerance.
+    """
+    print("\n[Hankel ground truth — the coupling law from an independent propagator]")
+    lam = relations.wavelength(34.8e9)
+
+    # Untruncated Gaussian: power conserved, width follows w0*sqrt(1+(z/zR)^2).
+    grid = fl.HankelGrid(30 * 82.5, 512)
+    w0 = 20.0
+    zr = np.pi * w0 ** 2 / lam
+    start = np.exp(-(grid.radius / w0) ** 2).astype(complex)
+    worst_power, worst_width = 0.0, 0.0
+    for dist in (0.25 * zr, zr, 3 * zr):
+        out = grid.propagate(start, dist, lam)
+        worst_power = max(worst_power, abs(grid.power(out) / grid.power(start) - 1.0))
+        inten = np.abs(out) ** 2 / np.abs(out[0]) ** 2
+        w_fit = np.interp(np.exp(-2.0), inten[::-1], grid.radius[::-1])
+        worst_width = max(worst_width, abs(w_fit / (w0 * np.sqrt(1 + (dist / zr) ** 2)) - 1.0))
+    check("Hankel propagation conserves power", worst_power < 1e-9, f"max drift {worst_power:.2e}")
+    check("untruncated Gaussian follows the analytic spreading law", worst_width < 0.04,
+          f"max width error {100*worst_width:.1f}%")
+
+    # Truncated aperture vs Goubau, over the tau range the engine actually sizes into.
+    L, r_a = 300e3, 82.5
+    for tau_target in (0.5, 1.0, 2.0, 3.0):
+        r_b = tau_target * lam * L / (np.pi * r_a)
+        g, _, planes, tau, launched = fl.hop_field(r_a, r_b, L, lam, n_planes=2, n_points=1024)
+        captured = g.power_within(planes[-1], r_b) / launched
+        goubau = relations.collection_efficiency(tau)
+        check(f"τ={tau:.1f}: true truncated field tracks Goubau, from below",
+              captured <= goubau + 1e-6 and abs(captured - goubau) < 0.03,
+              f"field {captured:.4f} vs 1−exp(−τ²) {goubau:.4f}  ({captured-goubau:+.4f})")
+
+
 def test_relay_channel():
     """The RELAY rendering path stays alive while we iterate on the direct case.
 
@@ -514,6 +556,7 @@ if __name__ == "__main__":
     test_taper()
     test_adaptive_taper()
     test_energy_balance()
+    test_hankel_reference()
     test_relay_channel()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)
