@@ -11,9 +11,11 @@ import numpy as np
 from beamlink import relations
 from beamlink import geo
 from beamlink import beam_link as bl
+from beamlink import sweeps
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import field as fl
+from beamlink.architectures import standard_architectures
 from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
 
@@ -82,7 +84,7 @@ def test_atmosphere():
           f"{slant:.3f}/{g11:.3f} = {slant/g11:.2f}")
 
     # Rain hammers 30 GHz but spares 5.8 GHz.
-    st, pl = bl.reference_geometry(30.0)
+    st, pl = sweeps.reference_geometry(30.0)
     r58 = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=5.8,
                                     weather="heavy_rain"), 10.0)["atmos"]
     r30 = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=30.0,
@@ -130,7 +132,7 @@ def test_coupling():
 
     # Sizing to τ=2 at any frequency yields the same capture; the differentiator is
     # emitter DIAMETER, which scales as λ (∝ 1/f).
-    st, pl = bl.reference_geometry(30.0)
+    st, pl = sweeps.reference_geometry(30.0)
     d58 = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=5.8), 10.0)["emitter_diam_m"]
     d30 = bl.evaluate(bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=30.0), 10.0)["emitter_diam_m"]
     ratio = float(d58) / float(d30)
@@ -138,8 +140,8 @@ def test_coupling():
           f"Ø 5.8={float(d58):.0f} m, 30={float(d30):.0f} m, ratio {ratio:.2f} vs {30/5.8:.2f}")
 
     # Lower elevation → longer slant + smaller silhouette → bigger emitter.
-    d_high = bl.evaluate(bl.LinkConfig(*bl.reference_geometry(45.0), f_emit_plane_ghz=30.0), 10.0)["emitter_diam_m"]
-    d_low = bl.evaluate(bl.LinkConfig(*bl.reference_geometry(10.0), f_emit_plane_ghz=30.0), 10.0)["emitter_diam_m"]
+    d_high = bl.evaluate(bl.LinkConfig(*sweeps.reference_geometry(45.0), f_emit_plane_ghz=30.0), 10.0)["emitter_diam_m"]
+    d_low = bl.evaluate(bl.LinkConfig(*sweeps.reference_geometry(10.0), f_emit_plane_ghz=30.0), 10.0)["emitter_diam_m"]
     check("low elevation needs a bigger emitter", float(d_low) > float(d_high),
           f"45°→{float(d_high):.0f} m, 10°→{float(d_low):.0f} m")
 
@@ -152,7 +154,7 @@ def test_end_to_end():
     from it. Last check: at 30 GHz a passive mirror beats an active relay, i.e. the
     conversion loss of rectifying and re-transmitting costs more than it buys."""
     print("\n[end-to-end]")
-    st, pl = bl.reference_geometry(30.0)
+    st, pl = sweeps.reference_geometry(30.0)
     for arch, cfg in {
         "direct": bl.LinkConfig(station_pos=st, plane_pos=pl, f_emit_plane_ghz=30.0),
         "relay-active": bl.LinkConfig(station_pos=st, plane_pos=pl,
@@ -209,7 +211,7 @@ def test_pass_profile():
     emitter for a lower reference elevation buys a wider useful window at the price of a
     bigger aperture. Capture is near-perfect overhead and poor at the edges."""
     print("\n[pass profile / fixed emitter]")
-    p = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=60.0)
+    p = sweeps.pass_profile(frequency_ghz=30.0, reference_elevation_deg=60.0)
     peak_idx = int(np.argmax(p["deliverable_mw"]))
     overhead_idx = int(np.argmin(np.abs(p["alongtrack_km"])))
     dmax = p["deliverable_mw"].max()
@@ -229,7 +231,7 @@ def test_pass_profile():
 
     # A larger emitter (built for a lower reference elevation) widens the window.
     def window_km(ref):
-        pp = bl.pass_profile(frequency_ghz=30.0, reference_elevation_deg=ref)
+        pp = sweeps.pass_profile(frequency_ghz=30.0, reference_elevation_deg=ref)
         norm = pp["deliverable_mw"] / pp["deliverable_mw"].max()
         xin = pp["alongtrack_km"][norm >= 0.5]
         return float(xin.max() - xin.min()), pp["emitter_diam_m"]
@@ -330,29 +332,29 @@ def test_flyby():
     beats going direct through a storm; and a 30 GHz ground station loses the link outright in
     a storm, which is what makes its constant-delivery energy infinite."""
     print("\n[flyby — trajectory-integrated over a pass]")
-    archs = bl.standard_architectures()
+    archs = standard_architectures()
 
     # Ordering: harmonic ≤ arithmetic mean ≤ peak, always.
-    r = bl.flyby(archs["5.8 direct"], station_spacing_km=200.0)
+    r = sweeps.flyby(archs["5.8 direct"], station_spacing_km=200.0)
     check("harmonic ≤ mean ≤ peak η", r["hmean_eta"] <= r["mean_eta"] + 1e-9 <= r["peak_eta"] + 1e-9,
           f"h {r['hmean_eta']:.3f} ≤ mean {r['mean_eta']:.3f} ≤ peak {r['peak_eta']:.3f}")
 
     # The tether (emitter above the weather) is ~weather-independent over the pass.
-    t_clear = bl.flyby({**archs["tether 30 direct"], "weather": "clear"}, station_spacing_km=200.0)["mean_eta"]
-    t_storm = bl.flyby({**archs["tether 30 direct"], "weather": "storm"}, station_spacing_km=200.0)["mean_eta"]
+    t_clear = sweeps.flyby({**archs["tether 30 direct"], "weather": "clear"}, station_spacing_km=200.0)["mean_eta"]
+    t_storm = sweeps.flyby({**archs["tether 30 direct"], "weather": "storm"}, station_spacing_km=200.0)["mean_eta"]
     check("tether high-f is ~weather-independent", abs(t_clear - t_storm) / t_clear < 0.05,
           f"clear {t_clear:.3f} vs storm {t_storm:.3f}")
 
     # In a storm the relay feeds continuously far better than 5.8-direct (whose
     # low-elevation pass edges rain out) — the relay's value over the FULL flyby.
-    relay = bl.flyby({**archs["relay ×3 mult 5.8→17.4"], "weather": "storm"}, station_spacing_km=200.0)
-    direct = bl.flyby({**archs["5.8 direct"], "weather": "storm"}, station_spacing_km=200.0)
+    relay = sweeps.flyby({**archs["relay ×3 mult 5.8→17.4"], "weather": "storm"}, station_spacing_km=200.0)
+    direct = sweeps.flyby({**archs["5.8 direct"], "weather": "storm"}, station_spacing_km=200.0)
     check("relay beats 5.8-direct on continuous delivery in storm",
           relay["hmean_eta"] > direct["hmean_eta"],
           f"relay hmean {relay['hmean_eta']:.3f} vs direct {direct['hmean_eta']:.3f}")
 
     # Ground direct-30 rains out somewhere on the pass → cannot feed continuously (∞).
-    g30 = bl.flyby({**archs["30 direct (ground)"], "weather": "storm"}, station_spacing_km=200.0)
+    g30 = sweeps.flyby({**archs["30 direct (ground)"], "weather": "storm"}, station_spacing_km=200.0)
     check("ground direct-30 cannot feed continuously in a storm",
           not np.isfinite(g30["grid_energy_per_pass_gj"]))
 
@@ -455,8 +457,8 @@ def test_energy_balance():
     """`flyby`'s energy bookkeeping closes: waste is grid minus delivered, energy_eta is the
     ratio of the two, and the served fraction is a fraction."""
     print("\n[flyby energy balance — plane banks everything]")
-    archs = bl.standard_architectures(weather="clear")
-    r = bl.flyby(archs["relay ×3 mult 5.8→17.4"], station_spacing_km=200.0)
+    archs = standard_architectures(weather="clear")
+    r = sweeps.flyby(archs["relay ×3 mult 5.8→17.4"], station_spacing_km=200.0)
     check("waste = grid − delivered energy", abs(r["waste_gj"] - (r["grid_gj"] - r["delivered_gj"])) < 1e-9,
           f"grid {r['grid_gj']:.2f} − deliv {r['delivered_gj']:.2f} = {r['grid_gj']-r['delivered_gj']:.2f}")
     check("energy η = delivered / grid over served window",
@@ -517,7 +519,7 @@ def test_relay_channel():
     print("\n[relay channel — the opt-in two-leg render path]")
     from beamlink import beam_link_animation as anim
 
-    arch = bl.standard_architectures(weather="clear")["relay ×3 mult 5.8→17.4"]
+    arch = standard_architectures(weather="clear")["relay ×3 mult 5.8→17.4"]
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
     cv, cf = m.make_bwb_mesh(n_span=41, n_theta=26)
     cn, _ = m.triangle_normals_areas(cv, cf)

@@ -36,6 +36,7 @@ from beamlink import beam_link as bl
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import geo
+from beamlink.architectures import standard_architectures
 
 OUT = "out"
 
@@ -462,7 +463,7 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
         orientation = "portrait"
     portrait = (orientation == "portrait")
     if arch_kwargs is None:
-        archs = bl.standard_architectures(weather=weather)
+        archs = standard_architectures(weather=weather)
         if arch_name not in archs:
             raise KeyError(f"{arch_name!r} not in {list(archs)}")
         kw = dict(archs[arch_name])

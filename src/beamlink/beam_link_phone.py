@@ -16,6 +16,7 @@ from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import geo
 from beamlink import beam_link_animation as anim
+from beamlink.architectures import standard_architectures
 
 OUT = "out"
 
@@ -92,7 +93,7 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
                          emitter_diam_m=100.0, n_frames=25, grid_dist=60, grid_radial=90,
                          plane_alt_m=11_000.0, min_elevation_deg=2.0, delivered_mw=10.0,
                          write=True, path=f"{OUT}/flyby_phone.html"):
-    kw = dict(bl.standard_architectures(weather=weather)[arch_name])
+    kw = dict(standard_architectures(weather=weather)[arch_name])
     kw["emitter_diam_m"] = emitter_diam_m
     lateral_m = lateral_offset_km * 1e3
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
@@ -224,7 +225,7 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     the best single elliptical array to build for THIS pass geometry.
 
     Run:  uv run python beam_link_phone.py   → out/flyby_phone.html"""
-    base_kw = dict(bl.standard_architectures(weather=weather)[arch_name])
+    base_kw = dict(standard_architectures(weather=weather)[arch_name])
     base_kw["emitter_diam_m"] = emitter_diam_m
     lateral_m = lateral_offset_km * 1e3
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))

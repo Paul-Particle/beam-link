@@ -14,6 +14,7 @@ independent of the directory name and does not have to change with it.
 
     uv sync
     uv run python -m beamlink.test_beam_link      # ALL CHECKS PASSED
+    uv run python -m beamlink.sweeps              # the corridor table, per weather
     uv run python -m beamlink.econ_pass2
     uv run python -m beamlink.beam_link_animation # out/flyby.html
     uv run python -m beamlink.beam_link_phone     # out/flyby_phone.html + the artifact fragment
@@ -35,8 +36,10 @@ is the weather-robust option, so it is not to be quietly dropped.
 
 | module | what it is |
 |---|---|
-| `beam_link` | the engine: scenario → link budget, taper choice, flyby energy balance |
+| `beam_link` | the engine: one scenario → link budget, taper choice, efficiency chain |
 | `capture` | the overlap physics — beam × silhouette, free of `LinkConfig` and the chain |
+| `architectures` | the named cases compared, as `LinkConfig` keyword sets — imports nothing |
+| `sweeps` | the engine mapped over a trajectory: one pass, one corridor, the energy balance |
 | `diffraction` | scalar diffraction from tapered elliptical apertures |
 | `bwb_model` | blended-wing-body silhouette mesh and its projected capture area |
 | `geo` | ENU pass geometry |

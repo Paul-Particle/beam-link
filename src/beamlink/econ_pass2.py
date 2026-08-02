@@ -14,11 +14,12 @@ The test is the conservative one we agreed on: does beamed beat fossil at LOW de
 planes → low utilization) and LONG range (few, widely spaced stations)?  Sweeps frequency ×
 elevation × weather.  `station_musd_elliptical` below is now the single station cost model.
 
-Run:  PYTHONPATH=$PWD uv run python econ_pass2.py
+Run:  uv run python -m beamlink.econ_pass2
 """
 import numpy as np
 
 from beamlink import beam_link as bl
+from beamlink import sweeps
 from beamlink import bwb_model as m
 from beamlink import geo
 from beamlink import airframe
@@ -86,7 +87,7 @@ def delivery_eta(freq_ghz, diam_m, min_elev_deg, weather):
     spacing_km = econ.station_spacing_km(ALT_M / 1e3, min_elev_deg)
     arch = dict(station_pos=(0.0, 0.0, 0.0), relay_pos=None, f_emit_plane_ghz=freq_ghz,
                 emitter_diam_m=diam_m, shaped_spot=True, weather=weather)
-    fb = bl.flyby(arch, plane_alt_m=ALT_M, station_spacing_km=spacing_km,
+    fb = sweeps.flyby(arch, plane_alt_m=ALT_M, station_spacing_km=spacing_km,
                   speed_ms=SPEED_MS, delivered_mw=DELIVERED_MW_CEIL)
     return fb["energy_eta"], fb["served_frac"]
 
