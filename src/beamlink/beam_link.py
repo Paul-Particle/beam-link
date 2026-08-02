@@ -393,6 +393,29 @@ def plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m=None, taper_p=None,
     return out
 
 
+def _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant, return_field):
+    """Capture at the shortest focus range the defocus search may use — the most-spread spot.
+
+    `slant / 8` is the intended floor, but focusing a very large aperture that short leaves the
+    regime the field is sampled in: the aperture pitch goes as the residual focusing phase, so
+    `diffraction._aperture_grid` refuses rather than clip the aperture. Walk the floor back out
+    until it can be evaluated; a longer focus always needs a coarser pitch, so everything above
+    the floor is then evaluable too. Returns (focus_range_m, capture dict).
+    """
+    focus = slant / 8.0
+    while focus < slant:
+        try:
+            return focus, plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m,
+                                        taper_p=taper_p, focus_range_m=focus,
+                                        return_field=return_field)
+        except ValueError:
+            _LOG.debug("defocus floor %.3g m unevaluable for a %.3g m emitter at %.3g m slant; "
+                       "backing off", focus, emitter_diam_m or 0.0, slant)
+            focus *= 1.5
+    return slant, plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
+                                focus_range_m=slant, return_field=return_field)
+
+
 def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw, rect_total,
                        taper_p, pc=None, return_field=False):
     """Capture at a fixed taper, deliberately defocused if the skin power density would
@@ -417,9 +440,9 @@ def _capture_for_taper(cfg, emitter_pos, freq_ghz, emitter_diam_m, delivered_mw,
     # over there is no compliant geometry in range, so log it and mark the result rather than
     # returning a quietly non-compliant one; by decision this SURFACES but does not block, and
     # `feasible` is deliberately left alone.
-    lo, hi = slant / 8.0, slant
-    pc_lo = plane_capture(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p=taper_p,
-                          focus_range_m=lo, return_field=return_field)
+    lo, pc_lo = _defocus_floor(cfg, emitter_pos, freq_ghz, emitter_diam_m, taper_p, slant,
+                               return_field)
+    hi = slant
     density_lo = _peak_density(delivered_mw, pc_lo["capture"], rect_total, pc_lo["peak_intensity"])
     if density_lo > cap:
         _LOG.warning(

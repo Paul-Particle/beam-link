@@ -48,7 +48,8 @@ is the weather-robust option, so it is not to be quietly dropped.
 | `econ` | cost primitives: energy, fuel, station spacing/count, infra and airframe ownership |
 | `econ_pass2` | the only econ driver — assembles those primitives on the engine's computed η |
 | `field`, `chain_reference` | Hankel-transform ground truth the closed forms are checked against |
-| `beam_link_animation`, `beam_link_phone` | the flyby figure, landscape and portrait |
+| `flyby_frames` | per-frame physics for the figure: one frame's beam, and the channel side view |
+| `beam_link_animation`, `beam_link_phone` | the flyby figure itself, landscape and portrait |
 | `plot_spectrum` | the atmospheric-attenuation figure the research notebook embeds |
 | `generate_atmosphere_profile`, `generate_spectrum` | regenerate the committed ITU tables (`--extra generators`) |
 
@@ -79,7 +80,12 @@ Resolved since:
   naming how far over, at what focus and power) and reported as `density_cap_exceeded` on the
   stages. It deliberately does NOT block, and does not touch `feasible` — the decision was to
   surface it and keep going. The bisection's lower bracket is tested rather than assumed
-  compliant, which is what used to let a non-compliant geometry return unremarked.
+  compliant, which is what used to let a non-compliant geometry return unremarked. That bracket
+  (`slant / 8`) is also no longer assumed EVALUABLE: focusing a very large auto-sized aperture
+  that short leaves the sampled Fresnel regime, so `_defocus_floor` walks the floor back out to
+  the most-spread spot the field model can represent. Before that, `build_flyby_animation()` on
+  its own defaults — no explicit `emitter_diam_m`, so the emitter is sized for the horizon —
+  raised `ValueError` from the aperture guard at the overhead frames.
 
 Design questions still recorded in the code as open rather than rationalised: whether the
 `elevation_deg` sign flip between the ground-emitter and relay cases is a bug or a convention,

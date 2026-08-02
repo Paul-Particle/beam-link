@@ -15,6 +15,7 @@ from beamlink import sweeps
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import field as fl
+from beamlink.flyby_frames import channel_field, frame_physics
 from beamlink.architectures import standard_architectures
 from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
@@ -517,13 +518,11 @@ def test_relay_channel():
     resolves intensity in BOTH of them rather than only the leg nearest the emitter.
     """
     print("\n[relay channel — the opt-in two-leg render path]")
-    from beamlink import beam_link_animation as anim
-
     arch = standard_architectures(weather="clear")["relay ×3 mult 5.8→17.4"]
     basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
     cv, cf = m.make_bwb_mesh(n_span=41, n_theta=26)
     cn, _ = m.triangle_normals_areas(cv, cf)
-    f = anim._frame_physics(arch, -60e3, 11_000.0, basis, (cv, cf, cn))
+    f = frame_physics(arch, -60e3, 11_000.0, basis, (cv, cf, cn))
 
     legs = f["chan_legs"]
     check("relay frame has two channel legs", len(legs) == 2, f"{len(legs)} legs")
@@ -537,7 +536,7 @@ def test_relay_channel():
 
     dist = np.linspace(0.0, 1.0, 160)
     radial = np.linspace(-200.0, 200.0, 161)
-    ix, _, iy, _ = anim._channel_field(dist, radial, legs, f["chan_total"], f["chan_total"])
+    ix, _, iy, _ = channel_field(dist, radial, legs, f["chan_total"], f["chan_total"])
     s = dist * f["chan_total"]
     up = np.isfinite(ix[s < legs[0]["length_m"]]).any()
     down = np.isfinite(ix[s > legs[0]["length_m"]]).any()

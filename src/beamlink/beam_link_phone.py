@@ -2,10 +2,10 @@
 
 A compact, single-column animation of panels F / F₂ from the full flyby — the converging
 beam channel in its two orthogonal cross-sections, with the encircled-energy funnel and the
-plane slice — small enough to open on a phone. Reuses the full engine + frame physics from
-beam_link_animation, so it stays in lock-step with the main figure.
+plane slice — small enough to open on a phone. Reuses the full engine + the per-frame physics in
+`flyby_frames`, so it stays in lock-step with the main figure.
 
-Run:  uv run python beam_link_phone.py   → out/flyby_phone.html
+Run:  uv run python -m beamlink.beam_link_phone   → out/flyby_phone.html
 """
 import numpy as np
 import plotly.graph_objects as go
@@ -15,6 +15,7 @@ from beamlink import beam_link as bl
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import geo
+from beamlink.flyby_frames import channel_field, frame_physics
 from beamlink import beam_link_animation as anim
 from beamlink.architectures import standard_architectures
 
@@ -31,7 +32,7 @@ def build_flyby_phone(arch_name="5.8 direct", weather="clear", lateral_offset_km
     (tens of MB with the inline plotly.js) — open it locally. To PUBLISH as an artifact, strip it
     with build_phone_artifact() (which trades frames for bytes to fit the size cap).
 
-    Run:  uv run python beam_link_phone.py   → out/flyby_phone.html"""
+    Run:  uv run python -m beamlink.beam_link_phone   → out/flyby_phone.html"""
     return anim.build_flyby_animation(arch_name=arch_name, weather=weather,
                                       lateral_offset_km=lateral_offset_km,
                                       emitter_diam_m=emitter_diam_m, n_frames=n_frames,
@@ -102,7 +103,7 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
     mesh = (cv, cf, cn)
     half = float(geo.downrange_for_elevation(min_elevation_deg, plane_alt_m))
     xs = np.linspace(-half, half, n_frames)
-    fp = [anim._frame_physics(kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m,
+    fp = [frame_physics(kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m,
                               delivered_mw=delivered_mw) for x in xs]
 
     max_total = max(f["chan_total"] for f in fp)
@@ -117,7 +118,7 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
     def _all(f):
         k = id(f)
         if k not in _cc:
-            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"])
+            _cc[k] = channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"])
         return _cc[k]
 
     def chan(f, axis):
@@ -204,7 +205,7 @@ def _optimal_fixed_aspect(base_kw, xs, plane_alt_m, basis, mesh, lateral_m, deli
     best = (-np.inf, 1.0)
     for asp in aspects:
         kw = {**base_kw, "shaped_spot": True, "fixed_emitter_aspect": asp}
-        s = sum(anim._frame_physics(kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m,
+        s = sum(frame_physics(kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m,
                                     delivered_mw=delivered_mw)["eta"] for x in xs)
         if s > best[0]:
             best = (s, asp)
@@ -224,7 +225,7 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     The fixed aspect is chosen (if not given) to maximise pass-integrated delivered energy —
     the best single elliptical array to build for THIS pass geometry.
 
-    Run:  uv run python beam_link_phone.py   → out/flyby_phone.html"""
+    Run:  uv run python -m beamlink.beam_link_phone   → out/flyby_phone.html"""
     base_kw = dict(standard_architectures(weather=weather)[arch_name])
     base_kw["emitter_diam_m"] = emitter_diam_m
     lateral_m = lateral_offset_km * 1e3
@@ -246,9 +247,9 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     ellf_kw = {**base_kw, "shaped_spot": True, "fixed_emitter_aspect": fixed_aspect}
     adap_kw = {**base_kw, "shaped_spot": True}
 
-    fr_c = [anim._frame_physics(circ_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
-    fr_e = [anim._frame_physics(ellf_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
-    cap_adap = np.array([anim._frame_physics(adap_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw)["eff"] for x in xs]) * 100.0
+    fr_c = [frame_physics(circ_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
+    fr_e = [frame_physics(ellf_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw) for x in xs]
+    cap_adap = np.array([frame_physics(adap_kw, x, plane_alt_m, basis, mesh, lateral_offset_m=lateral_m, delivered_mw=delivered_mw)["eff"] for x in xs]) * 100.0
 
     all_fr = fr_c + fr_e
     max_total = max(f["chan_total"] for f in all_fr)
@@ -265,7 +266,7 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
     def _all(f):
         k = id(f)
         if k not in _cc:
-            _cc[k] = anim._channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"])
+            _cc[k] = channel_field(dist, radial, f["chan_legs"], max_total, f["chan_total"])
         return _cc[k]
 
     def chan(f, axis):
@@ -403,7 +404,7 @@ def build_phone_focus(freq_ghz=5.8, emitter_diam_m=100.0, fixed_aspect=3.5, tape
     ellipse} × {major, minor} plus the delivered-spot-vs-range curves. `taper_p` is the aperture
     amplitude taper (0 = uniform → the sharpest sidelobes). Slider = focus distance.
 
-    Run:  uv run python beam_link_phone.py   → out/focus_phone.html"""
+    Run:  uv run python -m beamlink.beam_link_phone   → out/focus_phone.html"""
     lam = bl.relations.SPEED_OF_LIGHT / (freq_ghz * 1e9)
     r = emitter_diam_m / 2.0
     A = float(fixed_aspect)
