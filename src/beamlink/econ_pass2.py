@@ -1,17 +1,18 @@
 """Second econ pass: the low-density / long-range VERDICT with the real physics wired in.
 
-Two things the first-pass `napkin.econ_comparison` gets wrong for this test:
-  (1) it sizes a ROUND emitter (`emitter_diameter_m`) — the BWB silhouette is ~4.3:1, so a
+This is the only econ driver. It replaced a first-pass comparison (now deleted, in git history)
+that got two things wrong for this test:
+  (1) it sized a ROUND emitter (`emitter_diameter_m`) — the BWB silhouette is ~4.3:1, so a
       shaped (phased-array) elliptical spot needs ~1/3 the aperture AREA for the same capture;
-  (2) it uses a FLAT `ETA_BEAM = 0.80` for the beam — the beam-link engine computes the real
+  (2) it used a FLAT `ETA_BEAM = 0.80` for the beam — the beam-link engine computes the real
       delivery η (weather, self-occluded silhouette, elliptical spot, incidence) over the pass.
 
 Here we size the ELLIPTICAL aperture by inverting the shaped-spot capture at the design edge
 (min-elevation, τ≈2-equivalent → ~90% capture), run a beam-link `flyby` over the served window
-to get the real `energy_eta`, and feed BOTH (aperture area + η) into napkin's cost chain. The
-test is the conservative one we agreed on: does beamed beat fossil at LOW density (few planes →
-low utilization) and LONG range (few, widely spaced stations)?  Sweeps frequency × elevation ×
-weather.  napkin.py is left untouched — this composes its functions; fold in once validated.
+to get the real `energy_eta`, and feed BOTH (aperture area + η) into the `econ` cost primitives.
+The test is the conservative one we agreed on: does beamed beat fossil at LOW density (few
+planes → low utilization) and LONG range (few, widely spaced stations)?  Sweeps frequency ×
+elevation × weather.  `station_musd_elliptical` below is now the single station cost model.
 
 Run:  PYTHONPATH=$PWD uv run python econ_pass2.py
 """
@@ -30,7 +31,8 @@ SPEED_MS = 250.0
 CAPTURE_TARGET = 0.90          # elliptical-aperture sizing target at the design edge (τ≈2-ish)
 DELIVERED_MW_CEIL = 10.0       # plane absorption ceiling for the flyby FoM (η is ratio, ceiling cancels)
 
-# napkin station-capex coefficients (mirrored so we can swap in the elliptical aperture)
+# Station-capex coefficients. These began as a mirror of a round-aperture cost model in `econ`;
+# that one is gone, so this is the only copy and there is nothing to keep in sync.
 FIXED_MUSD = 50.0
 ARRAY_MUSD_PER_RF_MW = 2.5
 SUPPLY_MUSD_PER_GRID_MW = 1.2

@@ -162,23 +162,6 @@ def polarization_efficiency(polarization="circular", roll_deg=0.0, axial_ratio_l
     return np.cos(np.radians(roll_deg)) ** 2
 
 
-def rectenna_derate(freq_ghz, beta_deg, polarization="circular", roll_deg=0.0,
-                    spot_match=0.90, incidence_floor=0.70):
-    """Lumped receive-side derate -- the closed-form alternative to the raster overlap below,
-    superseded by it and not called by `evaluate`. Its `incidence_floor=0.70` is the fixed-patch
-    rectenna value, left behind when this stopped being called; the live default is 0.90."""
-    conv = relations.rectenna_efficiency_band(freq_ghz) if np.ndim(freq_ghz) == 0 else \
-        np.array([relations.rectenna_efficiency_band(f) for f in np.atleast_1d(freq_ghz)]).reshape(np.shape(freq_ghz))
-    # Fold topside (β>90) onto the equivalent belly angle — the airframe is
-    # symmetric, so a beam 47° off the top normal is as good as 47° off the belly.
-    beta_folded = np.where(np.asarray(beta_deg) > 90.0, 180.0 - np.asarray(beta_deg), beta_deg)
-    # cos-weighted between full efficiency face-on and `incidence_floor` edge-on
-    incidence = incidence_floor + (1.0 - incidence_floor) * np.cos(np.radians(beta_folded))
-    pol = polarization_efficiency(polarization, roll_deg)
-    return conv * spot_match * incidence * pol, dict(rf_to_dc=conv, spot_match=spot_match,
-                                                     incidence=incidence, polarization=pol)
-
-
 def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
     """Gaussian 1/e^2 waist inflated by sqrt(2) over the true delivered radius lambda*L/(pi*a).
 
@@ -778,19 +761,6 @@ def evaluate_with_field(cfg: LinkConfig, delivered_mw=None):
     return _evaluate_scalar(cfg, delivered_mw, return_field=True)
 
 
-def best_path(cfg: LinkConfig, delivered_mw=None):
-    """Better of going direct or through the configured relay, plus both for comparison."""
-    direct_cfg = LinkConfig(**{**cfg.__dict__, "relay_pos": None, "_silhouette": cfg.silhouette()})
-    direct = evaluate(direct_cfg, delivered_mw)
-    if cfg.relay_pos is None:
-        return dict(chosen=direct, direct=direct, relayed=None)
-    relayed = evaluate(cfg, delivered_mw)
-    chosen = direct if direct["eta_end_to_end"] >= relayed["eta_end_to_end"] else relayed
-    return dict(chosen=chosen, direct=direct, relayed=relayed)
-
-
-# --- pass and corridor sweeps -----------------------------------------------------------
-
 def emitter_for_reference(frequency_ghz, station_pos, plane_alt_m=11_000.0,
                           reference_elevation_deg=60.0, tau_target=2.0,
                           silhouette=None):
@@ -959,38 +929,10 @@ def waterfall(stages):
     return [(label, float(stages[k])) for label, k in keys]
 
 
-def print_report(name, stages):
-    print(f"\n=== {name}  [{stages['architecture']}] ===")
-    running = 1.0
-    for label, eff in waterfall(stages):
-        running *= eff
-        print(f"  {label:24s} × {eff:6.3f}   → cumulative {running:6.3f}")
-    print(f"  {'END-TO-END':24s} = {float(stages['eta_end_to_end']):6.3f}")
-    if "grid_mw" in stages:
-        print(f"  delivered {float(stages['delivered_mw']):5.2f} MW → grid "
-              f"{float(stages['grid_mw']):6.2f} MW  (waste {float(stages['waste_mw']):5.2f} MW)")
-    ed = stages.get("emitter_diam_m", stages.get("emitter_diam_down_m"))
-    print(f"  emitter Ø {float(np.atleast_1d(ed)[0]):.0f} m,  silhouette "
-          f"{float(np.atleast_1d(stages['silhouette_m2'])[0]):.0f} m² "
-          f"(r_recv {float(np.atleast_1d(stages['receiver_radius_m'])[0]):.1f} m), "
-          f"β {float(np.atleast_1d(stages['beta_deg'])[0]):.0f}°")
-
-
-# --- Named tech cases ---------------------------------------------------------
-
 def reference_geometry(elevation_deg=30.0, plane_alt_km=11.0):
     """(station_pos, plane_pos) placing the aircraft at a chosen elevation from the station."""
     downrange = float(geo.downrange_for_elevation(elevation_deg, plane_alt_km * 1e3))
     return (0.0, 0.0, 0.0), (downrange, 0.0, plane_alt_km * 1e3)
-
-
-def tech_cases(elevation_deg=30.0, weather="clear", delivered_mw=10.0):
-    """Snapshot evaluation of the standard architectures at one elevation (kept for the
-    waterfall/spot-check figures; the flyby is the primary figure of merit)."""
-    station, plane = reference_geometry(elevation_deg)
-    archs = standard_architectures(station_pos=station, weather=weather)
-    return {name: evaluate(LinkConfig(plane_pos=plane, **kw), delivered_mw)
-            for name, kw in archs.items()}
 
 
 if __name__ == "__main__":
