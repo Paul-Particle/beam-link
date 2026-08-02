@@ -162,38 +162,7 @@ def polarization_efficiency(polarization="circular", roll_deg=0.0, axial_ratio_l
     return np.cos(np.radians(roll_deg)) ** 2
 
 
-def focused_spot_waist(wavelength_m, slant_m, emitter_radius_m):
-    """Gaussian 1/e^2 waist inflated by sqrt(2) over the true delivered radius lambda*L/(pi*a).
-
-    That factor is exactly what makes a round Gaussian spot on a round rectenna of radius r_r
-    reproduce the Goubau law: 1 - exp(-2*r_r^2/w^2) == 1 - exp(-tau^2), identically. So this is a
-    coupling proxy from the pre-diffraction model, not a field radius, and the only caller left
-    is `test_gaussian_beam`. `stages["spot_waist_m"]` is `effective_waist`, a different measure.
-    """
-    return np.sqrt(2.0) * wavelength_m * slant_m / (np.pi * np.maximum(emitter_radius_m, 1e-6))
-
-
-def gaussian_beam_radius(z_m, aperture_radius_m, wavelength_m, focus_range_m):
-    """Gaussian beam of waist `aperture_radius_m` at the aperture, focused at `focus_range_m`.
-
-    Returns (radius at z_m, waist radius, range at which the waist forms). Standard
-    thin-lens result: with u = L/zR the waist shrinks to a*u/sqrt(1+u^2) and forms short of
-    the nominal focus, at L/(1+u^2). Reference model only -- the link budget uses the
-    diffraction integrals instead.
-    """
-    a = float(aperture_radius_m)
-    lam = float(wavelength_m)
-    L = max(float(focus_range_m), 1e-9)
-    zR = np.pi * a ** 2 / lam
-    u = L / zR
-    w0 = a * u / np.sqrt(1.0 + u ** 2)
-    z_waist = L / (1.0 + u ** 2)
-    zR_out = max(np.pi * w0 ** 2 / lam, 1e-12)
-    w = w0 * np.sqrt(1.0 + ((np.asarray(z_m, dtype=float) - z_waist) / zR_out) ** 2)
-    return w, float(w0), float(z_waist)
-
-
-def effective_waist(peak_intensity):
+def equivalent_disc_radius(peak_intensity):
     """Single length scale for a spot of any shape: the radius of the uniform disc that would
     carry all the power at the observed peak intensity (pi*r^2*I_peak = 1). Takes the
     unit-power normalised intensity from `diffraction`, so 1/m^2 in, m out."""
@@ -473,7 +442,7 @@ def _capture_setup(cfg, emitter_pos, freq_ghz, emitter_diam_m, raster_n_grid=200
 
 def _capture_dict(shared, geom, eff, peak, taper_p, focus_range_m):
     return dict(**shared, capture=eff, capture_geom=geom, peak_intensity=peak,
-                spot_waist_m=effective_waist(peak), taper_p=float(taper_p),
+                equivalent_disc_radius_m=equivalent_disc_radius(peak), taper_p=float(taper_p),
                 focus_range_m=float(focus_range_m))
 
 
@@ -666,7 +635,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
             capture=pc["capture"], capture_geom=pc["capture_geom"], atmos=atmos_t,
             rectenna_rf_to_dc=conv, polarization=pol,
             rectenna_total=conv * pol, silhouette_m2=pc["area"],
-            receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], spot_waist_m=pc["spot_waist_m"],
+            receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"], equivalent_disc_radius_m=pc["equivalent_disc_radius_m"],
             aperture_taper_p=pc["taper_p"], focus_range_m=pc["focus_range_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
@@ -709,7 +678,7 @@ def _evaluate_scalar(cfg: LinkConfig, delivered_mw=None, return_field=False):
             rectenna_rf_to_dc=conv, polarization=pol, rectenna_total=conv * pol,
             capture=pc["capture"], atmos=atmos_dn,
             silhouette_m2=pc["area"], receiver_radius_m=pc["r_recv"], beta_deg=pc["beta"],
-            spot_waist_m=pc["spot_waist_m"], aperture_taper_p=pc["taper_p"],
+            equivalent_disc_radius_m=pc["equivalent_disc_radius_m"], aperture_taper_p=pc["taper_p"],
             focus_range_m=pc["focus_range_m"], emitter_diam_m=pc["emitter_diam_m"],
             power_density_w_m2=_peak_density(delivered_mw, pc["capture"], conv * pol,
                                             pc["peak_intensity"]),
@@ -894,7 +863,7 @@ def flyby(arch_kwargs, plane_alt_m=11_000.0, lateral_offset_m=0.0, station_spaci
     return dict(
         x_km=x / 1e3, eta=eta, elevation_deg=np.asarray(s["elevation_deg"], float),
         silhouette_m2=np.asarray(s["silhouette_m2"], float),
-        capture=np.asarray(s["capture"], float), spot_waist_m=np.asarray(s["spot_waist_m"], float),
+        capture=np.asarray(s["capture"], float), equivalent_disc_radius_m=np.asarray(s["equivalent_disc_radius_m"], float),
         deliverable_mw=deliverable_mw, mean_eta=float(np.mean(eta)),
         hmean_eta=float(len(eta) / np.sum(1.0 / np.maximum(eta, 1e-9))),
         peak_eta=peak, energy_eta=energy_eta, served_frac=float(np.mean(served)),

@@ -44,13 +44,19 @@ Carried over deliberately unfixed, from the comment-recovery review that precede
 
 - `airframe`/`relations` are clean, but `tether_blowover` — which stayed in the research repo —
   applies its tilt penalty twice and double-counts cable weight.
-- `diffraction.effective_waist` computes the uniform-disc equivalent radius, not a Gaussian
-  1/e² waist; the √2 discrepancy propagates into the name `spot_waist_m`.
-- `focal_intensity_grid` / `_at` can clip the aperture on the `d_phase` branch with no guard.
-  Unreachable through the public API only because deep defocus and high aperture aspect are
-  anti-correlated, and nothing enforces that.
 
-Three design questions are recorded in the code as open rather than rationalised: what should
-happen when the power-density cap cannot be met, whether the `elevation_deg` sign flip between
-the ground-emitter and relay cases is a bug or a convention, and whether a scan-loss term
-belongs in the chain at all.
+Resolved since:
+
+- The uniform-disc measure is now named for what it is: `equivalent_disc_radius`, reported as
+  `equivalent_disc_radius_m`. It was never a Gaussian 1/e² waist, and the two functions whose
+  √2 the old `spot_waist_m` name echoed (`focused_spot_waist`, `gaussian_beam_radius`) are gone
+  with the rest of the pre-diffraction spot model.
+- `focal_intensity_grid` / `_at` no longer clip the aperture on the `d_phase` branch:
+  `_aperture_grid` sizes the grid to hold it and refuses past a cap. This was NOT in fact
+  unreachable — 70×20 m semi-axes focused at 50 km already clip at n_ap=512 by z≈1.5 km, which
+  is squarely where the near-field beam maps evaluate.
+
+Design questions still recorded in the code as open rather than rationalised: what should happen
+when the power-density cap cannot be met, whether the `elevation_deg` sign flip between the
+ground-emitter and relay cases is a bug or a convention, and whether a scan-loss term belongs in
+the chain at all (that last one deferred as later refinement).
