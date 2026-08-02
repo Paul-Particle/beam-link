@@ -5,7 +5,10 @@ The animation module owns layout, colour and baking; this owns the numbers it dr
   `frame_physics` — one plane position of one architecture through `beam_link.evaluate_with_field`,
     plus the view basis, the silhouette's principal extents, and the beam-channel legs.
   `channel_field` — the scalar-diffraction beam along the WHOLE path as a side view, leg by leg,
-    with the encircled-energy fraction the funnel contours are inverted from.
+    in ABSOLUTE W/m², with the encircled-energy fraction the funnel contours are inverted from
+    and, optionally, the aircraft's own shadow in the beam past it.
+  `exposure_boundary` — the outermost radius per plane at which that field still exceeds an
+    exposure limit: the beam's keep-out tube.
   `beam_cut_axes` — the body-frame axes of one beam-cut plane, which is what orients the airframe
     projection the animation draws on top of that cut.
 
@@ -45,16 +48,107 @@ def localize(downrange_m, crossrange_m, altitude_m, basis):
     return np.array([np.dot(d, north), np.dot(d, east), np.dot(d, up)])
 
 
-def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
+def _shadow_transmission(local_z, radial, plane_dist_m, silhouette_half_m, aperture_half_m,
+                         wavelength_m, captured_fraction):
+    """Fraction of the beam that survives the aircraft, plane by plane — the shadow it casts.
+
+    100 % capture and no reflection: whatever the silhouette intercepts is gone from the beam
+    downstream, and `captured_fraction` (the engine's geometric overlap, the same number panel A
+    prints) is how much that is. Two limits bracket what the shadow looks like, and this blends
+    between them:
+
+      CLOSE BEHIND, ray optics. The emitting aperture is `aperture_half_m` wide on this cut, so the
+      shadow has an umbra (no part of the aperture visible) inside a penumbra (part of it):
+        r_umbra(z) = a + (a − R)·(z − d)/d        r_penumbra(z) = a + (a + R)·(z − d)/d
+      for silhouette half-extent a, aperture half-extent R, aircraft range d. An aircraft narrower
+      than the aperture (a < R) has an umbra that CLOSES at z = d·a/(R − a) and is all penumbra
+      beyond — which is why the dark core fades on its own even before diffraction acts.
+
+      FAR BEHIND, diffraction. The surrounding beam spreads across the shadow once the Fresnel scale
+      √(λ·Δz) exceeds the aircraft, i.e. beyond Δz ≈ a²/λ (~17 km for a 30 m half-span at 5.8 GHz).
+      There the beam has its original shape again, carrying (1 − captured_fraction) of its power.
+
+    The blend weight is `fade` = 1 − √(λ·Δz)/a, so both ends are the honest limit and the crossover
+    sits where the physics says it does. What this is NOT is an obstructed-diffraction calculation:
+    it has no shadow-edge fringes, and the transition between the two limits is an interpolation
+    rather than a propagation. The rigorous version is Babinet with the silhouette approximated by a
+    separable rectangle — the aperture illumination and the residual focusing phase are both
+    separable, so the blocked field is a difference of two separable terms and each propagates as a
+    pair of 1-D transforms (the same trick `diffraction.axial_cuts_direct` already uses). That is
+    the upgrade path if the shadow ever has to carry more than the exposure read.
+    """
+    dz = np.asarray(local_z, float)[:, None] - float(plane_dist_m)      # (n_z, 1), past the aircraft
+    r = np.abs(np.asarray(radial, float))[None, :]
+    a, R = max(float(silhouette_half_m), 1e-9), float(aperture_half_m)
+    d = max(float(plane_dist_m), 1e-9)
+    umbra = np.maximum(a + (a - R) * dz / d, 0.0)
+    penumbra = a + (a + R) * dz / d
+    lit = np.clip((r - umbra) / np.maximum(penumbra - umbra, 1e-9), 0.0, 1.0)   # ray-optics shadow
+    fade = np.clip(1.0 - np.sqrt(float(wavelength_m) * np.maximum(dz, 0.0)) / a, 0.0, 1.0)
+    survives = 1.0 - float(captured_fraction)
+    return np.where(dz > 0.0, fade * lit + (1.0 - fade) * survives, 1.0)
+
+
+def exposure_boundary(intensity_w_m2, dist, radial, level_w_m2, edge_margin=0.9):
+    """The beam's keep-out tube: per plane, the OUTERMOST radius at which the beam still exceeds
+    `level_w_m2`. Inverted per plane like `funnel_contour` (not by marching squares), but from the
+    outside in, because intensity is not monotonic in r — sidelobes cross the level several times
+    and it is the last crossing that bounds the volume to keep clear.
+
+    What is inverted is the sidelobe ENVELOPE, not the raw profile: max over [r, r_max], which is
+    monotone by construction, so the boundary follows the skirt instead of jumping between the nulls
+    of individual sidelobes. Keeping people out of a null between two lobes that both exceed the
+    limit is not a real option anyway.
+
+    A plane contributes a gap (NaN) when the level is exceeded nowhere, and also when the boundary
+    falls outside `edge_margin` of the radial window — where it is effectively off the map, and
+    drawing it would claim a tube the picture cannot see. The margin is not just tidiness: near the
+    aperture the boundary sits AT the window edge for tens of km, and without it the line breaks into
+    a dashed mess as consecutive planes flip either side of the edge. Same convention as the funnel —
+    no line means the beam is wider than the window. Returns (r_vals, z_vals) flat arrays with NaN
+    gaps, the +side then the −side."""
+    pos = radial >= 0
+    order = np.argsort(radial[pos])
+    rp = radial[pos][order]                           # 0 → +max, ascending
+    r_lvl = np.full(intensity_w_m2.shape[0], np.nan)
+    for i in range(intensity_w_m2.shape[0]):
+        row = np.nan_to_num(intensity_w_m2[i, pos][order], nan=0.0)
+        env = np.maximum.accumulate(row[::-1])[::-1]  # max over [r, r_max] — non-increasing in r
+        if env[0] <= level_w_m2:
+            continue                                  # nowhere above the level on this plane
+        r = float(np.interp(level_w_m2, env[::-1], rp[::-1]))
+        if r < edge_margin * rp[-1]:
+            r_lvl[i] = r
+    r_out, z_out = [], []
+    for sign in (1.0, -1.0):
+        r_out.extend(sign * r_lvl); r_out.append(np.nan)
+        z_out.extend(dist);         z_out.append(np.nan)
+    return np.asarray(r_out), np.asarray(z_out)
+
+
+def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m, shadow=None):
     """Scalar-diffraction beam along the whole path, as a (n_dist, n_radial) side view: the
     along-path axis (fraction of the longest total path over the pass) is laid out over the
     link's legs — one leg for a direct link, TWO for a relay (ground→relay up-leg focused at
     the relay, then relay→plane down-leg focused at the plane). Both principal cuts are computed
     in ONE diffraction pass per leg (`diffraction.axial_cut_xy`, complex64 — display precision),
     so the picture is the model: converging cone → diffraction waist → divergence, Airy sidelobes
-    included. NaN beyond the current plane position. Returns (ix, ex, iy, ey): intensity of the
-    narrow (x) and wide (y) cuts, each normalised to the frame peak, with the strip-marginal
-    encircled-energy fraction for the funnel."""
+    included. Each leg is scaled by its own radiated power (`leg["power_w"]`), so the field is in
+    ABSOLUTE W/m² before display normalisation — which is what an exposure limit can be compared
+    against, and what keeps the two legs of a relay in their true relative brightness.
+
+    `current_total_m` is how far along the path to render. Passing the aircraft's own range stops
+    the beam there (nothing past it is drawn); passing more extends the LAST leg beyond the aircraft
+    — the same Fresnel evaluation at z > focus, the beam diverging again — which is what shows the
+    power that MISSES the aircraft and how far the beam stays hazardous. `shadow`, then, is what the
+    aircraft removes from it: dict(captured_fraction=, half_major_m=, half_minor_m=) — the engine's
+    geometric overlap plus the silhouette's half-extents on the wide and narrow cuts (the same
+    numbers the white plane-slice line is drawn from). See `_shadow_transmission`. Without it the
+    beam past the aircraft is drawn as if the aircraft were not there.
+
+    Returns (ix, ex, iy, ey, peak_w_m2): intensity of the narrow (x) and wide (y) cuts, each divided
+    by `peak_w_m2` (the shared frame peak, so multiplying by it recovers W/m²), with the
+    strip-marginal encircled-energy fraction for the funnel."""
     s = dist_norm * total_shown_m
     shp = (dist_norm.size, radial.size)
     ix = np.full(shp, np.nan); ex = np.full(shp, np.nan)
@@ -69,8 +163,14 @@ def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
     r_wide = np.linspace(-3.0 * half, 3.0 * half, 3 * radial.size)
     o = np.argsort(np.abs(r_wide)); dw = r_wide[1] - r_wide[0]
     cum = 0.0
-    for leg in legs:
-        sel = (s >= cum) & (s < cum + leg["length_m"]) & (s <= current_total_m)
+    for index, leg in enumerate(legs):
+        last = index == len(legs) - 1
+        # Each leg owns the planes between its own aperture and its end — except the LAST leg, which
+        # runs on to `current_total_m`, so asking for more than the path length draws the beam PAST
+        # the aircraft rather than truncating it there.
+        sel = (s >= cum) & (s <= current_total_m)
+        if not last:
+            sel &= s < cum + leg["length_m"]
         if leg["length_m"] > 0 and np.any(sel):
             local_z = s[sel] - cum                           # distance from this leg's emitter
             lix, _, liy, _ = dfr.axial_cut_xy(
@@ -90,9 +190,14 @@ def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
                 lix[unresolved], liy[unresolved] = nfx, nfy
             idx = np.where(sel)[0]
             taper_p = float(leg["taper_p"])
-            for inten_w, i_out, e_out, ap_cut in ((lix, ix, ex, leg["ap_major"]),
-                                                  (liy, iy, ey, leg["ap_minor"])):
-                Iw = np.abs(np.nan_to_num(np.asarray(inten_w, dtype=np.float64), nan=0.0))
+            sh = shadow or {}
+            for inten_w, i_out, e_out, ap_cut, sil_half in (
+                    (lix, ix, ex, leg["ap_major"], sh.get("half_minor_m")),
+                    (liy, iy, ey, leg["ap_minor"], sh.get("half_major_m"))):
+                # W/m²: the raw cut is a fraction of radiated power per m², so scaling by this leg's
+                # radiated power makes the whole channel absolute (and relay legs comparable).
+                Iw = np.abs(np.nan_to_num(np.asarray(inten_w, dtype=np.float64), nan=0.0)) \
+                    * float(leg["power_w"])
                 filled = np.isfinite(inten_w).any(axis=1)    # planes with a resolved diffraction cut
                 # SUB-FRESNEL FILL: planes closer than the Fresnel floor (below what the zoom above can
                 # resolve) come back NaN. There the paraxial field IS ≈ the aperture illumination, so
@@ -114,8 +219,15 @@ def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
                         w = float(np.clip(local_z[a] / z_h, 0.0, 1.0))
                         Iw[a] = (1.0 - w) * ap_prof + w * Iw[fv]
                     filled[near] = True
+                # The funnel's denominator is the plane total BEFORE the aircraft takes its share, so
+                # what the aircraft absorbs SHOWS UP as the high-level rings closing at the plane
+                # line. Normalising to the surviving power instead would renormalise the loss away
+                # and draw a confident funnel around a beam that is no longer there.
+                tot = (Iw.sum(axis=1) * dw)[:, None]
+                if shadow is not None and last:
+                    Iw = Iw * _shadow_transmission(local_z, r_wide, leg["length_m"], sil_half,
+                                                   ap_cut, leg["lam"], shadow["captured_fraction"])
                 c = np.cumsum(Iw[:, o] * dw, axis=1)         # enclosed from the axis outward
-                tot = c[:, -1:]
                 Ew = np.divide(c, tot, out=np.full_like(c, np.nan), where=tot > 0)
                 Ew_r = np.empty_like(Ew); Ew_r[:, o] = Ew    # undo the |r| sort → r_wide order
                 for a, zi in enumerate(idx):
@@ -134,7 +246,7 @@ def channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
                float(iy[fin_y].max()) if fin_y.any() else 0.0)
     scale = peak if peak > 0 else 1.0
     return ((ix / scale).astype(np.float32), ex.astype(np.float32),
-            (iy / scale).astype(np.float32), ey.astype(np.float32))
+            (iy / scale).astype(np.float32), ey.astype(np.float32), float(scale))
 
 
 def funnel_contour(enc, dist, radial, levels):
@@ -260,16 +372,29 @@ def frame_physics(arch_kwargs, x_along_m, plane_alt_m, basis, coarse_mesh,
     # the focused relay→plane down-leg (the relay's elliptical aperture); direct = one leg. Each
     # leg carries its aperture semi-axes, focus range, wavelength and taper — the channel
     # renderer computes the exact diffraction field per leg.
+    # Radiated power per leg, so the channel map can be drawn in absolute W/m² (exposure limits are
+    # absolute). The field is normalised to unit radiated power per plane, so the beam power at the
+    # aircraft is the delivered DC divided back out through capture and the rectenna, and the LAUNCH
+    # power adds the atmospheric loss back on — the worst case anywhere on that leg. The floors keep
+    # a horizon-blocked frame (atmos → 0, so η → 0 and grid power → ∞) finite instead of poisoning
+    # the whole map with infinities.
+    p_at_plane = delivered_mw * 1e6 / max(eff * float(s["rectenna_total"]), 1e-9)
+    p_rad_down = p_at_plane / max(float(s["atmos"]), 1e-3)
     down_leg = dict(ap_major=ap_major, ap_minor=ap_minor, focus_m=focus,
-                    length_m=float(slant), lam=lam, taper_p=taper_p)
+                    length_m=float(slant), lam=lam, taper_p=taper_p, power_w=p_rad_down)
     if cfg.relay_pos is not None:
         station = np.asarray(cfg.station_pos, float)
         L1 = float(bl.geometry(station, np.asarray(cfg.relay_pos, float))[0])   # ground→relay
         r_relay = cfg.relay_aperture_diam_m / 2.0
         r_up = bl.size_emitter_diameter(cfg.f_emit_relay_ghz, L1, r_relay, cfg.tau_target) / 2.0
         lam_up = bl.relations.SPEED_OF_LIGHT / (cfg.f_emit_relay_ghz * 1e9)
+        # The up-leg carries MORE power than the down-leg: walk the down-leg's launch power back up
+        # through the relay's conversion and aperture and the up-leg's own capture and atmosphere.
+        up_chain = (float(s["relay_convert"]) * float(s["relay_aperture"])
+                    * float(s["capture_up"]) * float(s["atmos_up"]))
         up_leg = dict(ap_major=float(r_up), ap_minor=float(r_up), focus_m=L1,
-                      length_m=L1, lam=lam_up, taper_p=0.0)
+                      length_m=L1, lam=lam_up, taper_p=0.0,
+                      power_w=p_rad_down / max(up_chain, 1e-6))
         chan_legs = [up_leg, down_leg]
         chan_total = L1 + float(slant)
         chan_relay_m, chan_relay_radius_m, chan_emit_radius_m = L1, r_relay, float(r_up)

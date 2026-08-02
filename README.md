@@ -48,7 +48,7 @@ is the weather-robust option, so it is not to be quietly dropped.
 | `econ` | cost primitives: energy, fuel, station spacing/count, infra and airframe ownership |
 | `econ_pass2` | the only econ driver — assembles those primitives on the engine's computed η |
 | `field`, `chain_reference` | Hankel-transform ground truth the closed forms are checked against |
-| `flyby_frames` | per-frame physics for the figure: one frame's beam, the channel side view, the beam-cut axes |
+| `flyby_frames` | per-frame physics for the figure: one frame's beam (in W/m²), the channel side view, the aircraft's shadow, the exposure boundary, the beam-cut axes |
 | `beam_link_animation`, `beam_link_phone` | the flyby figure itself, landscape and portrait |
 | `plot_spectrum` | the atmospheric-attenuation figure the research notebook embeds |
 | `generate_atmosphere_profile`, `generate_spectrum` | regenerate the committed ITU tables (`--extra generators`) |
@@ -57,6 +57,37 @@ is the weather-robust option, so it is not to be quietly dropped.
 is in this repo, but the similarity is too low for git's default rename detection:
 
     git log --follow -M20% -- src/beamlink/relations.py
+
+## Exposure: the beam is a keep-out volume, not a hazard that ends somewhere
+
+The beam maps are drawn in absolute W/m² (each channel leg scaled by its own radiated power), so
+they can carry a regulatory line: `relations.PUBLIC_EXPOSURE_LIMIT_W_M2` = 10 W/m², where ICNIRP
+2020, FCC OET-65 uncontrolled and IEEE C95.1-2019 all agree above ~2 GHz. What that line says for
+the reference case (5.8 GHz, 100 m emitter, 10 MW delivered, clear air):
+
+- **Nothing along the beam is remotely close to compliant.** Mean density across the emitter face
+  is 1.7 kW/m² at the overhead frame — 171× the public limit, 34× occupational — and 19 kW/m² at
+  100 km along-track (the engine radiates 148 MW there to deliver 10 MW). There is no distance at
+  which the beam "becomes safe": it is a keep-out tube from the array face to the aircraft and on
+  past it.
+- **The tube's radius is what the picture shows**: ~20 m at the overhead waist, a few hundred m at
+  mid-pass, 1.6 km (wide axis) at 100 km along-track and ~4 km at the horizon frames. It is set by
+  where the sidelobe skirt drops through the limit, so it tracks the beam envelope: on the far
+  frames it is several times wider than the map window and the amber line correctly disappears.
+- **The occupational limit is not worth drawing separately** — 5× in level is <20 % in radius at
+  these gradients, i.e. the same boundary one line-width out.
+- **The aircraft is the beam dump, and that is the one place the hazard does end.** Overhead the
+  silhouette intercepts 99.94 % of the beam, so past it the axis is 0.6 W/m² — below the public
+  limit. At 120 km along-track it catches 7 % of a 220 MW beam, so what continues past is still
+  400× the limit. The exposure argument therefore rests on capture: a well-aimed beam has its
+  hazard terminated by the receiver, a poorly-aimed one irradiates whatever is behind it.
+- The skin cap (`LinkConfig.max_power_density_w_m2`, 2.5e5 W/m²) is never the binding constraint
+  anywhere in the channel — peak on the skin is 1.3e5 W/m² at its worst.
+
+The shadow behind the aircraft is ray optics (umbra/penumbra from the finite aperture) blended into
+the diffraction limit ((1 − capture) of the power, original beam shape) over the Fresnel length
+a²/λ ≈ 17 km. It is not an obstructed-diffraction calculation and has no edge fringes;
+`flyby_frames._shadow_transmission` records what a rigorous version would take.
 
 ## Known open items
 
@@ -95,6 +126,15 @@ Resolved since:
   signs are arbitrary and flip at the overhead crossover, which drew the aircraft belly-up over half
   the pass) and derives the viewing direction, per layout, so each panel is a true view of its cut
   rather than the mirror image.
+
+- The beam maps no longer stop at the aircraft: the last channel leg is rendered over the whole
+  along axis with the aircraft's shadow cast into it (`beam_past_plane`, on by default). The old
+  `beam_full_range` flag never worked — planes were assigned to a leg only within its own length, so
+  asking for the full range still left everything past the aircraft NaN. The funnel's denominator is
+  now the plane total BEFORE the aircraft takes its share, so capture shows up as the high-level
+  rings closing at the plane line instead of being renormalised away (which drew confident contours
+  around a beam that was no longer there). Cost: every frame now evaluates every plane, ~2.2× the
+  build time.
 
 Design questions still recorded in the code as open rather than rationalised: whether the
 `elevation_deg` sign flip between the ground-emitter and relay cases is a bug or a convention,

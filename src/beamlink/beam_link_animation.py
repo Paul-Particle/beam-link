@@ -38,8 +38,8 @@ from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import geo
 from beamlink.architectures import standard_architectures
-from beamlink.flyby_frames import (beam_cut_axes, channel_field, frame_physics, funnel_contour,
-                                   max_silhouette_extent, size_emitter_far)
+from beamlink.flyby_frames import (beam_cut_axes, channel_field, exposure_boundary, frame_physics,
+                                   funnel_contour, max_silhouette_extent, size_emitter_far)
 
 OUT = "out"
 
@@ -108,6 +108,12 @@ _BEAM_LEVELS = (0.1, 0.5, 0.8)
 # Panel A (spot over silhouette): the same three as SOLID rings, plus 0.3/0.7 as DOTTED in-betweens.
 _SIL_SOLID = (0.1, 0.5, 0.8)
 _SIL_DOTTED = (0.3, 0.7)
+# Beam maps, second contour: the PUBLIC exposure limit, as an absolute W/m² iso-line — the edge of
+# the volume that has to be kept clear of people. Amber, so it never reads as one of the mint-green
+# enclosed-energy rings. The occupational limit is only 5× higher, which at these gradients puts its
+# line within ~20 % of this one, so drawing both would just thicken the same boundary.
+_EXPOSURE_LEVEL_W_M2 = bl.relations.PUBLIC_EXPOSURE_LIMIT_W_M2
+_EXPOSURE_COLOR = "#ffb547"
 
 # Beam-map overlay line weight: the emitter half-aperture outline, the white aperture (z=0) line and
 # the plane slice line ALL share this one thin weight (matched to the ellipse border) and are all
@@ -139,7 +145,7 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
                           plane_alt_m=11_000.0, lateral_offset_km=0.0, min_elevation_deg=2.0,
                           n_frames=121, size_ref_elev_deg=8.0, delivered_mw=10.0,
                           grid_nA=200, emitter_diam_m=None, arch_kwargs=None,
-                          orientation="landscape", phone=False, beam_full_range=False,
+                          orientation="landscape", phone=False, beam_past_plane=True,
                           write=True, path=f"{OUT}/beam_link_flyby_animation.html"):
     """Build (and, if `write`, save) the flyby animation (A, D, F, F₂), returning the figure.
 
@@ -157,7 +163,11 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
     `orientation`: "landscape" (desktop — beam maps read left→right with the emitter phase
     in a column to their LEFT) or "portrait" (the same views rotated 90° — beam maps read
     bottom→top with the emitter phase directly BELOW; a single column that fits a phone).
-    `phone=True` selects the portrait layout at a phone-width size with a black background."""
+    `phone=True` selects the portrait layout at a phone-width size with a black background.
+
+    `beam_past_plane` (default) draws the beam on PAST the aircraft, with the aircraft's shadow in
+    it — the power that misses, and how far the beam stays above the public exposure limit. Set it
+    False for the emitter→plane channel alone (the beam simply stops at the plane line)."""
     if phone:
         orientation = "portrait"
     portrait = (orientation == "portrait")
@@ -348,26 +358,35 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
     # a short low band, far frames the whole axis). Intensity self-normalises per frame so the beam
     # shape is always visible; the encircled-energy contours are absolute fractions, so normalisation
     # is moot for reading "how much lands on the plane".
-    #   beam_full_range=False (default): the beam is masked beyond the current plane position, so the
-    #     map shows only emitter→plane. True: render the field over the WHOLE path (out to max_total),
-    #     so the energy that MISSES the plane — sidelobes + the diverging beam BEHIND the aircraft —
-    #     is visible for an exposure/limits check (the plane line still marks the aircraft position).
+    #   beam_past_plane (default): render the field over the WHOLE axis (out to max_total), with the
+    #     aircraft's SHADOW cast into it — 100 % capture, no reflection, so what continues past the
+    #     plane line is the power that missed. That is what an exposure read needs, and the shadow
+    #     leaves the gap the airframe projection is drawn into. False: mask the beam at the plane
+    #     position, so the map shows the emitter→plane channel alone.
     _chan_cache = {}
 
-    def _channel_all(f):                              # (ix, ex, iy, ey) — both cuts, one pass
+    def _channel_all(f):                    # (ix, ex, iy, ey, peak W/m²) — both cuts, one pass
         key = id(f)
         if key not in _chan_cache:
-            shown_to = max_total if beam_full_range else f["chan_total"]
-            _chan_cache[key] = channel_field(dist_norm, radial, f["chan_legs"], max_total, shown_to)
+            shown_to = max_total if beam_past_plane else f["chan_total"]
+            # The shadow half-extents ARE the ones the white plane-slice line is drawn from, so the
+            # gap in the beam lines up with the aircraft marker on screen.
+            shadow = (dict(captured_fraction=f["geom"], half_major_m=f["sil_major_m"],
+                           half_minor_m=f["sil_minor_m"]) if beam_past_plane else None)
+            _chan_cache[key] = channel_field(dist_norm, radial, f["chan_legs"], max_total, shown_to,
+                                             shadow=shadow)
         return _chan_cache[key]
 
     def channel(f, axis):                             # axis 'y' = major (wide), 'x' = minor (narrow)
-        ix, ex, iy, ey = _channel_all(f)
+        ix, ex, iy, ey, peak = _channel_all(f)
         return iy if axis == "y" else ix
 
     def channel_enc(f, axis):
-        ix, ex, iy, ey = _channel_all(f)
+        ix, ex, iy, ey, peak = _channel_all(f)
         return ey if axis == "y" else ex
+
+    def channel_w_m2(f, axis):                        # the same cut, in ABSOLUTE W/m²
+        return channel(f, axis) * _channel_all(f)[4]
 
     # Emitter phase, drawn INTO each beam map's plot (in the along < 0 region), sharing the map's
     # radial axis so the aperture's straight cut lands on the map's white aperture-line. The image is
@@ -437,6 +456,13 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
         # so it is already smooth along the path; the surviving waviness is real Fresnel structure.
         r_vals, z_vals = funnel_contour(channel_enc(f, cut), dist_norm, radial, _BEAM_LEVELS)  # r_L(z)=E⁻¹
         return (r_vals, z_vals) if portrait else (z_vals, r_vals)     # portrait x=radial; landscape x=dist
+    def map_exposure(f, cut):                              # public-exposure keep-out boundary
+        # Absolute W/m², so this line is a regulatory level and not a fraction of the frame's own
+        # peak. It vanishes on the frames where the beam is wider than the radial window — see
+        # `exposure_boundary`: the whole panel is then inside the keep-out volume.
+        r_vals, z_vals = exposure_boundary(channel_w_m2(f, cut), dist_norm, radial,
+                                           _EXPOSURE_LEVEL_W_M2)
+        return (r_vals, z_vals) if portrait else (z_vals, r_vals)
     def phase_png(f, ar, ac):                              # emitter zone-plate → background image
         cross_lin = np.linspace(-ac, 0.0, 220)             # cross ∈ [−ap_cross, 0] (cut at 0, map side)
         # portrait: transpose so cross→y, and flip so the cut (cross=0) is the TOP row (abuts the map
@@ -558,15 +584,21 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
     yy0 = frames_phys[0]["chan_total"] / max_total
 
     def add_channel(f0, cut, sil_key, ap_radial_m, rc):
-        """Vector overlays for one channel, all in the SAME subplot `rc`: encircled contour + the
-        white aperture-line + the plane slice (the emitter outline is added later, once the isotropic
-        cross extent is known). Heatmaps are baked images. Returns the trace indices."""
+        """Vector overlays for one channel, all in the SAME subplot `rc`: encircled contour, the
+        exposure-limit boundary, the white aperture-line and the plane slice (the emitter outline is
+        added later, once the isotropic cross extent is known). Heatmaps are baked images. Returns
+        the trace indices."""
         mr, mc = rc
         s0 = f0[sil_key]
         i_cont = len(fig.data)
         cxx, cyy = map_contour(f0, cut)
         fig.add_trace(go.Scatter(x=cxx, y=cyy, mode="lines", line=dict(color="#7dffce", width=1.1),
                                  opacity=0.45, showlegend=False, hoverinfo="skip"), row=mr, col=mc)
+        i_expo = len(fig.data)
+        exx, exy = map_exposure(f0, cut)
+        fig.add_trace(go.Scatter(x=exx, y=exy, mode="lines",
+                                 line=dict(color=_EXPOSURE_COLOR, width=1.1, dash="dash"),
+                                 opacity=0.75, showlegend=False, hoverinfo="skip"), row=mr, col=mc)
         if portrait:
             ap_x, ap_y, pl_x, pl_y = [-ap_radial_m, ap_radial_m], [0.0, 0.0], [-s0, s0], [yy0, yy0]
         else:
@@ -576,7 +608,7 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
         i_plane = len(fig.data)
         fig.add_trace(go.Scatter(x=pl_x, y=pl_y, mode="lines", line=dict(color="white", width=_MAP_EDGE_W),
                                  showlegend=False, hoverinfo="skip"), row=mr, col=mc)   # plane slice
-        return dict(cont=i_cont, plane=i_plane)
+        return dict(cont=i_cont, expo=i_expo, plane=i_plane)
 
     # F: major-axis (wide) cut — SHORT aperture axis along the radial. F₂: minor-axis (narrow) cut —
     # LONG axis along the radial (the 90°-rotated view of F's aperture). ap_cross is the OTHER axis.
@@ -665,7 +697,7 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
     # traces (contours, plane slices, D markers, capture text) — no per-frame raster or contour
     # recompute in the browser, so playback stays fast.
     ANIMATED = [i_contA, i_contA_dot, i_capA, i_eta_m, i_win_m, i_cap_m, i_cum_m, i_wgj_m,
-                F["cont"], F["plane"], F2["cont"], F2["plane"]]
+                F["cont"], F["expo"], F["plane"], F2["cont"], F2["expo"], F2["plane"]]
     frames = []
     for k, f in enumerate(frames_phys):
         cur = xs[k] / 1e3
@@ -673,6 +705,7 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
         cAx, cAy = incid_contour(f, _SIL_SOLID)
         dAx, dAy = incid_contour(f, _SIL_DOTTED)
         fcx, fcy = map_contour(f, "y"); f2cx, f2cy = map_contour(f, "x")
+        fex, fey = map_exposure(f, "y"); f2ex, f2ey = map_exposure(f, "x")
         if portrait:
             fpl = go.Scatter(x=[-f["sil_major_m"], f["sil_major_m"]], y=[yy, yy])
             f2pl = go.Scatter(x=[-f["sil_minor_m"], f["sil_minor_m"]], y=[yy, yy])
@@ -688,8 +721,8 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
                   go.Scatter(x=[cur], y=[cap_mk[k]]),
                   go.Scatter(x=[cur], y=[cum_mk[k]]),
                   go.Scatter(x=[cur], y=[win_gj_mk[k]]),
-                  go.Scatter(x=fcx, y=fcy), fpl,
-                  go.Scatter(x=f2cx, y=f2cy), f2pl],
+                  go.Scatter(x=fcx, y=fcy), go.Scatter(x=fex, y=fey), fpl,
+                  go.Scatter(x=f2cx, y=f2cy), go.Scatter(x=f2ex, y=f2ey), f2pl],
             layout=go.Layout(images=frame_images(f))))
     fig.frames = frames
 
@@ -746,6 +779,16 @@ def build_flyby_animation(arch_name="5.8 direct", weather="clear",
                        xanchor="left", yanchor="bottom",
                        text="green = enclosed beam-energy fraction",
                        showarrow=False, font=dict(size=8, color="#8fffd0"))
+    # What the two non-green features on the beam maps mean. On F only: F₂ sits directly next to it
+    # and repeating the note there would cost more clutter than it buys.
+    expo_note = (f"amber = {_EXPOSURE_LEVEL_W_M2:.0f} W/m² public limit<br>"
+                 "wake = shadow, 100 % capture" if portrait else
+                 f"amber dash = {_EXPOSURE_LEVEL_W_M2:.0f} W/m² public exposure limit — no line means "
+                 "the whole panel is above it<br>dark wake past the plane line = the aircraft's own "
+                 "shadow (100 % capture, no reflection)")
+    fig.add_annotation(x=0.02, y=0.03, xref="x domain", yref="y domain", row=F_rc[0], col=F_rc[1],
+                       xanchor="left", yanchor="bottom", align="left", text=expo_note,
+                       showarrow=False, font=dict(size=8, color=_EXPOSURE_COLOR))
     pass_kind = "head-on pass" if abs(lateral_m) < 1.0 else f"lateral pass ({lateral_offset_km:.0f} km offset)"
     aperture_m = kw.get("emitter_diam_m") or kw.get("relay_aperture_diam_m") or 0.0
     stamp = _build_stamp()

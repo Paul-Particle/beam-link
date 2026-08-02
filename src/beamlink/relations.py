@@ -11,6 +11,16 @@ import numpy as np
 
 SPEED_OF_LIGHT = 2.998e8   # m/s
 
+# Incident power density a member of the public may be exposed to, W/m². Above ~2 GHz ICNIRP 2020
+# (whole-body average, 30 min), FCC OET-65 "general population / uncontrolled" (1 mW/cm²) and
+# IEEE C95.1-2019 (unrestricted environment) all land on the same 10 W/m² plateau, so one constant
+# covers every band this model uses. The controlled/occupational figure is 5× higher (50 W/m²).
+# Localised short-term limits are higher again; this is the number that defines a public keep-out
+# volume around a beam, and it is 4-5 orders of magnitude BELOW the density the aircraft's skin sees
+# (`LinkConfig.max_power_density_w_m2`).
+PUBLIC_EXPOSURE_LIMIT_W_M2 = 10.0
+OCCUPATIONAL_EXPOSURE_LIMIT_W_M2 = 50.0
+
 
 # --- beam coupling (Goubau) ------------------------------------------------------------
 

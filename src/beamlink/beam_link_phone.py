@@ -122,11 +122,11 @@ def build_phone_channels(arch_name="5.8 direct", weather="clear", lateral_offset
         return _cc[k]
 
     def chan(f, axis):
-        ix, ex, iy, ey = _all(f)
+        ix, ex, iy, ey, peak = _all(f)
         return iy if axis == "y" else ix
 
     def enc(f, axis):
-        ix, ex, iy, ey = _all(f)
+        ix, ex, iy, ey, peak = _all(f)
         return ey if axis == "y" else ex
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,
@@ -270,11 +270,11 @@ def build_phone_comparison(arch_name="5.8 direct", weather="clear", lateral_offs
         return _cc[k]
 
     def chan(f, axis):
-        ix, ex, iy, ey = _all(f)
+        ix, ex, iy, ey, peak = _all(f)
         return iy if axis == "y" else ix
 
     def enc(f, axis):
-        ix, ex, iy, ey = _all(f)
+        ix, ex, iy, ey, peak = _all(f)
         return ey if axis == "y" else ex
 
     contour_opts = dict(coloring="lines", showlabels=True, start=0.1, end=0.9, size=0.2,

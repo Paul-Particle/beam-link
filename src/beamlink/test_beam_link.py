@@ -15,7 +15,7 @@ from beamlink import sweeps
 from beamlink import diffraction as dfr
 from beamlink import bwb_model as m
 from beamlink import field as fl
-from beamlink.flyby_frames import beam_cut_axes, channel_field, frame_physics
+from beamlink.flyby_frames import beam_cut_axes, channel_field, exposure_boundary, frame_physics
 from beamlink.architectures import standard_architectures
 from beamlink.bwb_model import BWBSilhouette, beta_alpha_from_enu, projected_area, make_bwb_mesh, \
     triangle_normals_areas, direction_from_beta_alpha
@@ -589,6 +589,98 @@ def test_beam_cut_orientation():
                   "frame-to-frame view·view " + " ".join(f"{v:+.2f}" for _, v in steps))
 
 
+def test_beam_shadow_and_exposure():
+    """The beam PAST the aircraft: the shadow it casts there, and where that beam is still hazardous.
+
+    The channel map is drawn in ABSOLUTE W/m² now, which the engine itself can check: its reported
+    peak density on the skin is the same diffraction field at the same plane, differing only by the
+    atmospheric loss it counts and the launch-power scaling here does not.
+
+    100 % capture and no reflection then says two things about the shadow, at its two ends. Right
+    behind the aircraft the axis has to go dark (at overhead the silhouette intercepts nearly the
+    whole beam). Far behind, once diffraction has washed the shadow out, the beam must be back to its
+    own shape carrying (1 − capture) of its power — NOT back to full brightness, which is the way a
+    shadow that merely faded out would misreport the exposure question.
+
+    And the exposure boundary is a TUBE, not a point along the path where the beam becomes safe: even
+    tens of km past the aircraft, and with the shadow taken out, the axis is still orders of magnitude
+    above the public limit.
+    """
+    print("\n[beam past the aircraft — shadow + exposure limit]")
+    kw = dict(standard_architectures(weather="clear")["5.8 direct"])
+    kw["emitter_diam_m"] = 100.0                      # the canonical figure's emitter
+    basis = (geo.point(0.0, 0.0, 0.0), *geo.local_enu(geo.point(0.0, 0.0, 0.0)))
+    cv, cf = m.make_bwb_mesh(n_span=41, n_theta=26)
+    cn, _ = m.triangle_normals_areas(cv, cf)
+    alt, delivered_mw = 11_000.0, 10.0
+    f = frame_physics(kw, 0.0, alt, basis, (cv, cf, cn), delivered_mw=delivered_mw)
+    s = bl.evaluate(bl.LinkConfig(plane_pos=(0.0, 0.0, alt), **kw), delivered_mw)
+
+    slant = f["chan_total"]
+    shown = 4.0 * slant                               # room behind the aircraft for the shadow to end
+    dist = np.linspace(0.0, 1.0, 240)
+    radial = np.linspace(-160.0, 160.0, 321)
+    shadow = dict(captured_fraction=f["geom"], half_major_m=f["sil_major_m"],
+                  half_minor_m=f["sil_minor_m"])
+    _, _, clear_y, _, clear_peak = channel_field(dist, radial, f["chan_legs"], shown, shown)
+    _, _, shade_y, _, shade_peak = channel_field(dist, radial, f["chan_legs"], shown, shown,
+                                                 shadow=shadow)
+
+    expected_peak = s["power_density_w_m2"] / s["atmos"]     # engine's skin peak, back at the aperture
+    check("the channel map is in absolute W/m² — its peak is the engine's own skin density",
+          abs(clear_peak / expected_peak - 1.0) < 0.2,
+          f"map {clear_peak:.3g} vs engine {expected_peak:.3g} W/m² "
+          f"({clear_peak/expected_peak:.2f}x), capture {f['geom']*100:.2f}%")
+
+    axis = np.argmin(np.abs(radial))
+    z = dist * shown
+    clear_axis = np.nan_to_num(clear_y[:, axis], nan=0.0) * clear_peak
+    shade_axis = np.nan_to_num(shade_y[:, axis], nan=0.0) * shade_peak
+    ahead = int(np.searchsorted(z, slant) - 1)
+    behind = int(np.searchsorted(z, slant * 1.06))    # a few hundred m past it, shadow still sharp
+    check("the aircraft casts a shadow — the axis goes dark right behind it",
+          shade_axis[behind] < 0.1 * shade_axis[ahead],
+          f"{shade_axis[behind]:.3g} behind vs {shade_axis[ahead]:.3g} W/m² ahead "
+          f"({shade_axis[behind]/max(shade_axis[ahead], 1e-30)*100:.1f}%)")
+    far = -1                                          # ≫ the a²/λ range over which the shadow washes out
+    survives = shade_axis[far] / max(clear_axis[far], 1e-30)
+    check("far behind, the shadow has washed out but only (1 − capture) of the power is left",
+          abs(survives - (1.0 - f["geom"])) < 0.25 * max(1.0 - f["geom"], 0.02),
+          f"{survives*100:.2f}% of the unobstructed beam at {z[far]/1e3:.0f} km vs "
+          f"1 − capture = {(1-f['geom'])*100:.2f}%")
+
+    limit = relations.PUBLIC_EXPOSURE_LIMIT_W_M2
+    check("overhead the aircraft IS the beam dump — past it nothing reaches the public limit",
+          shade_axis[behind:].max() < limit,
+          f"loudest point past the aircraft {shade_axis[behind:].max():.3g} W/m², "
+          f"limit {limit:.0f} W/m²")
+    r_vals, _ = exposure_boundary(shade_y * shade_peak, dist, radial, limit)
+    r_at_plane = r_vals[:dist.size][ahead]
+    check("the keep-out boundary is a finite tube radius where it fits the map window",
+          np.isfinite(r_vals).any() and 0.0 < r_at_plane < float(radial.max()),
+          f"{r_at_plane:.0f} m at the aircraft, "
+          f"{np.isfinite(r_vals).sum()}/{r_vals.size} planes resolved in the window")
+
+    # The other end of the pass: the silhouette catches a few percent, so nearly the whole beam
+    # carries on past it — and it is a much bigger beam, since holding the delivered power at that
+    # range takes far more radiated power. This is the frame the exposure line is really about.
+    far_x = 120e3
+    ff = frame_physics(kw, far_x, alt, basis, (cv, cf, cn), delivered_mw=delivered_mw)
+    shown_far = float(geo.downrange_for_elevation(2.0, alt))          # the figure's own along axis
+    _, _, ff_y, _, ff_peak = channel_field(
+        dist, radial, ff["chan_legs"], shown_far, shown_far,
+        shadow=dict(captured_fraction=ff["geom"], half_major_m=ff["sil_major_m"],
+                    half_minor_m=ff["sil_minor_m"]))
+    ff_axis = np.nan_to_num(ff_y[:, axis], nan=0.0) * ff_peak
+    ff_past = ff_axis[int(np.searchsorted(dist * shown_far, ff["chan_total"] * 1.06)):]
+    check(f"at {far_x/1e3:.0f} km along-track it is not — the beam past the aircraft stays far above "
+          "the limit",
+          ff_past.min() > 100.0 * limit,
+          f"capture {ff['geom']*100:.0f}%, {ff['chan_legs'][-1]['power_w']/1e6:.0f} MW radiated, "
+          f"quietest point past the aircraft {ff_past.min():.3g} W/m² = "
+          f"{ff_past.min()/limit:.0f}x the limit")
+
+
 def test_relay_channel():
     """The RELAY rendering path stays alive while we iterate on the direct case.
 
@@ -616,7 +708,7 @@ def test_relay_channel():
 
     dist = np.linspace(0.0, 1.0, 160)
     radial = np.linspace(-200.0, 200.0, 161)
-    ix, _, iy, _ = channel_field(dist, radial, legs, f["chan_total"], f["chan_total"])
+    ix, _, iy, _, _ = channel_field(dist, radial, legs, f["chan_total"], f["chan_total"])
     s = dist * f["chan_total"]
     up = np.isfinite(ix[s < legs[0]["length_m"]]).any()
     down = np.isfinite(ix[s > legs[0]["length_m"]]).any()
@@ -640,6 +732,7 @@ if __name__ == "__main__":
     test_energy_balance()
     test_hankel_reference()
     test_beam_cut_orientation()
+    test_beam_shadow_and_exposure()
     test_relay_channel()
     print(f"\n{'ALL CHECKS PASSED' if not _failures else 'FAILURES: ' + ', '.join(_failures)}")
     raise SystemExit(1 if _failures else 0)
