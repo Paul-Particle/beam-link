@@ -26,11 +26,11 @@ independent of the directory name and does not have to change with it.
 | `geo` | ENU pass geometry |
 | `relations` | closed-form beam terms: Goubau coupling, the prime multiplier chain, ITU-R P.838 rain, band efficiencies |
 | `airframe` | flight power and the mass cascade |
-| `econ` | first-pass cost comparison against jet fuel |
-| `econ_pass2` | the same cost primitives driven by the engine's computed η instead of a flat placeholder |
+| `econ` | cost primitives: energy, fuel, station spacing/count, infra and airframe ownership |
+| `econ_pass2` | the only econ driver — assembles those primitives on the engine's computed η |
 | `field`, `chain_reference` | Hankel-transform ground truth the closed forms are checked against |
-| `beam_link_figures`, `beam_link_animation`, `beam_link_phone`, `beam_link_emitter_shape` | plotly output |
-| `winglet_validation` | matplotlib diagnostics for the mesh |
+| `beam_link_animation`, `beam_link_phone` | the flyby figure, landscape and portrait |
+| `plot_spectrum` | the atmospheric-attenuation figure the research notebook embeds |
 | `generate_atmosphere_profile`, `generate_spectrum` | regenerate the committed ITU tables (`--extra generators`) |
 
 `relations`, `airframe` and `econ` were one 719-line `napkin.py` before the split. Its history

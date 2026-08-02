@@ -197,23 +197,6 @@ def _localize(downrange_m, crossrange_m, altitude_m, basis):
     return np.array([np.dot(d, north), np.dot(d, east), np.dot(d, up)])
 
 
-def _beam_on_grid(field, gx, gy):
-    """The emitter's SCALAR-DIFFRACTION target-plane intensity (from overlap_capture's returned
-    field: x_axis/y_axis/intensity in the aperture principal frame) resampled onto the panel grid
-    (gx, gy) and aligned to the DISPLAYED silhouette's principal axes. Out-of-grid samples → 0.
-    Used by `beam_link_figures` for the capture-overlap snapshot; the flyby's panel-A contours use
-    the native diffraction grid directly (see `incid_contour`). Returns z[row=y, col=x]."""
-    uu, vv = np.meshgrid(gx, gy)                              # (len(gy), len(gx))
-    if field["u"].size < 3 or "intensity" not in field:
-        return np.zeros_like(uu)
-    coords = np.vstack([field["u"], field["v"]])
-    _, evecs = np.linalg.eigh(np.cov(coords))                # display-frame principal axes
-    proj = evecs.T @ np.vstack([uu.ravel(), vv.ravel()])     # rows: [along minor, along major]
-    beam = dfr.sample_focal_intensity(field["x_axis"], field["y_axis"], field["intensity"],
-                                      proj[0], proj[1])
-    return beam.reshape(uu.shape)
-
-
 def _channel_field(dist_norm, radial, legs, total_shown_m, current_total_m):
     """Scalar-diffraction beam along the whole path, as a (n_dist, n_radial) side view: the
     along-path axis (fraction of the longest total path over the pass) is laid out over the
