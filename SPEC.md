@@ -116,6 +116,17 @@ does not belong in a product. Products are independent (I1/I2): none republishes
 Scenarios without a receiver are legal: P5 and P4 exist, P3/P6/P7 do not, and consumers see that in
 the manifest. That is the general form of the "pure focusing sweep" figure.
 
+Flight-mechanics products (`physics.airframe`, per D5). They share the aircraft geometry the link
+products index against, and are indexed the same way, but depend on nothing in `beam_link`:
+
+- **P11 `mass`** — what the aircraft weighs and where the weight is: the converged mass cascade
+  (payload, structure, systems, motors, reserve, rectenna) and MTOW.
+- **P12 `flight_power`** — what it costs to fly the profile: cruise and peak shaft power, and the
+  power required **at a named reference plane** (rectenna terminals), so it composes with P8 without
+  double-counting the drivetrain.
+- **P13 `reserve`** — how far it gets unpowered: glide range from the beam-dropout altitude, and the
+  buffer the reserve mass in P11 actually buys.
+
 ## 6. Fidelity
 
 ### 6a. Vectorization
@@ -293,11 +304,33 @@ completion against them and reviewed as a finished version (§12).
 The firewall is enforced by **package layout**, not by naming exceptions, so it has no holes and a
 new file inherits the rule from its directory:
 
-    engine/     — may import physics; owns products and their schema
-    artifacts/  — read-only loaders and dataclasses; imports nothing from engine/
-    viz/        — may import artifacts/ only
-    econ/       — may import artifacts/ only
-    drivers/    — may invoke engine/ AND econ/; may not reimplement any part of either
+    artifacts/            — the data contract: product dataclasses, load and save. Imports
+                            NOTHING else in the repo.
+    physics/              — the engine. Imports artifacts/ (to build and write products).
+      geo.py              — earth and ENU geometry, shared by both domains
+      airframe/           — the aircraft: loft, mesh and silhouette table; flight power and
+                            the mass cascade
+      beam_link/          — the link: chain, capture, diffraction, closed-form relations,
+                            atmosphere; and reference/ (Hankel ground truth, tests only)
+    viz/                  — may import artifacts/ only
+    econ/                 — may import artifacts/ only
+    drivers/              — may invoke physics/ AND econ/; may not reimplement any part of either
+
+Two placements are worth justifying because neither is the obvious one:
+
+- **The product dataclasses live in `artifacts/`, not inside `physics/`.** Physics still *owns* what
+  is in them — it decides the products and their fields — but if the definitions lived under
+  `physics/`, every consumer would have to import `physics/` to read a run, and the firewall would be
+  a fiction. A package with no repo dependencies and no physics in it is the data contract, and the
+  import rule stays structural: nothing outside `physics/` and `drivers/` may import `physics/`, and
+  `artifacts/` may import nothing from the repo at all. One definition, no hole.
+- **Aircraft geometry belongs to `airframe/`, and `beam_link/` imports it.** The BWB loft, mesh and
+  silhouette table describe the aircraft, and both domains need them: the link to integrate capture
+  over the silhouette, the airframe to size a rectenna. The dependency runs one way — link depends on
+  aircraft, never the reverse.
+
+(`physics.beam_link` inside a package called `beamlink` is mildly redundant; `physics.link` reads
+better. Taking the names as given unless you'd rather have the shorter one.)
 
 A driver that calls `engine.evaluate()` computes no physics itself, so this is a classification, not
 an exemption — the same resolution as the Hankel ground truth in §2. Viz and econ never appear on the
@@ -327,15 +360,37 @@ input to either.
   number, and econ still only selects. Needs a ruling before P9 is written. (With D4 settled this is
   the driver's, since the driver already owns cross-scenario work — but it should be an explicit
   ruling rather than an inference.)
-- **Is the airframe and flight model inside this engine?** `airframe` (cruise and climb power, the
-  mass cascade, glide reserve, lift-to-drag) is physics, and econ calls it directly today —
-  `econ_pass2` takes `CRUISE_MW` straight from `airframe.mass_buildup`, which the firewall forbids. It
-  is also a *different physical domain* from the link, and §5's catalogue is entirely link products,
-  so there is a real gap either way. It couples to the link in both directions: delivered power sets
-  what the aircraft can do, and rectenna mass feeds the mass cascade which sets the power required.
-  Recommendation: yes, inside — it is physics, econ must not compute it, and the catalogue gains a
-  flight-mechanics section whose products are indexed the same way. Needs a ruling because it widens
-  what "the engine" means.
+*(D5 below settles the airframe question that was open here.)*
+
+### D5 — the airframe is inside the engine
+
+`physics.airframe` alongside `physics.beam_link`: cruise and climb power, the mass cascade, glide
+reserve, lift-to-drag, and the aircraft's own geometry. It is physics, so econ may not compute it —
+`econ_pass2` currently takes `CRUISE_MW` straight out of `airframe.mass_buildup`, which the firewall
+forbids. §5 gains flight products (P11–P13). Three consequences fall out of the ruling:
+
+- **The two domains stay independent, coupled only through the spec.** Neither imports the other; both
+  use the shared aircraft geometry. The apparent cross-domain fixed point — delivered power sets what
+  the aircraft can do, aircraft mass sets the power required — is *cut today by a hardcoded
+  `rectenna_mass_t = 2.0`*, and it should stay cut, because rectenna mass follows from silhouette area
+  and areal density (geometry) rather than from the link's η. Closing the remaining scenario-level
+  condition — "the aperture and frequency that deliver the power this aircraft needs" — is a search
+  over scenarios, which D4 already puts in the driver. No engine-internal cross-domain solve, so I1
+  stays clean and either domain remains usable on its own.
+- **`rectenna_mass_t` becomes derived rather than assumed.** A gain the ruling enables: silhouette area
+  is already a product (P3), so the 2 t constant becomes area × areal density, with the areal density
+  as the declared input it actually is.
+- **`mass_buildup`'s fixed point must go lockstep** (I9). It is currently a scalar loop with a
+  data-dependent early exit (`max_iter=200`, `tol=1 kg`, `if converged: break`). Vectorized over
+  candidates it runs a fixed iteration count set by the fidelity config; convergence is geometric, so
+  this costs little.
+
+**And one bookkeeping hazard the ruling exposes.** `airframe.mass_buildup` folds the onboard
+motor/drivetrain (`eta_chain=0.85`) into `cruise_mw`, and `econ.delivery_efficiency` carries a comment
+warning not to double-count it. A number whose measurement point lives in a comment is the same defect
+as an unnamed derived quantity. Both domains must state their **power reference point** in the schema —
+the airframe's requirement and the link's delivered power quoted at the same named plane (rectenna
+terminals) — so the double count is structurally impossible rather than warned against.
 
 ## 10. Order of work
 
