@@ -199,7 +199,7 @@ def _atmosphere(scenarios, trajectory, geometry, config) -> product_types.Atmosp
 
 def _silhouette(scenarios, geometry, config) -> product_types.Silhouette:
     loft = scenarios[0].airframe.loft
-    vertices, faces, normals = loft_module.mesh(loft)
+    vertices, faces, normals = loft_module.mesh(loft, config)
     cloud = silhouette_module.element_cloud(loft, geometry.arrival_beta_deg,
                                             geometry.arrival_alpha_deg, config)
     return product_types.Silhouette(
@@ -486,6 +486,8 @@ def _to_product(solved, radiated_w, n_candidates, n_samples, reasons):
         grid_axes={name: np.asarray(value) for name, value in solved.grid_axes.items()},
         occluder_transmission=None if solved.occluder_transmission is None
         else solved.occluder_transmission.reshape(shape + (n_point,)),
+        enclosed_fraction=None if solved.enclosed_fraction is None
+        else solved.enclosed_fraction.reshape(shape + (n_point,)),
         aperture_pitch_m=None if solved.aperture_pitch_m is None
         else solved.aperture_pitch_m.reshape(shape + (2,)),
         aperture_samples=None if solved.aperture_samples is None

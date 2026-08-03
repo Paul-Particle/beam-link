@@ -1,8 +1,12 @@
 # beamlink — physics engine spec
 
-Status: **outline, agreed in principle, not yet implemented.** This document is the target shape and
-the record of every decision behind it (§9). The current code does not conform; §8 is the backlog that
-gets it there. Built to completion and reviewed as a finished version — see §11.
+Status: **implemented, ready for review as a finished version** (§11). This document is both the target
+shape and the record of every decision behind it — D1–D6 were taken before any code was written, D7–D14
+are the ones the implementation forced, and §8's backlog now carries what was actually done to each
+item. §12 keeps the pre-implementation measurements and adds the ones taken since.
+
+The pre-SPEC modules are in `archive/pre-spec/` rather than deleted, so the two can be compared line by
+line where a number is in question.
 
 ## 1. What this is for
 
@@ -171,6 +175,27 @@ Econ is expected to be vectorized in the same shape, which makes it an obligatio
 layer: loaders expose arrays with named axes (candidate, sample, …), never per-sample objects that
 force a consumer to loop.
 
+**What it cost, measured after the fact.** A warm 81-sample pass at `standard` runs at **18 ms per
+sample** against the 56–95 ms above, and the batching is only part of it. Three changes, in order of
+what they were worth:
+
+- **Anisotropic aperture sampling.** The pitch is set per axis, so each axis is sampled at its own
+  scale and the aperture grid is ~2.2·N on both regardless of aspect: n = 624 → 80 for an 8:1 aperture,
+  which is 20× fewer aperture samples on exactly the low-elevation geometries a pass spends most of its
+  time at. A common pitch had to use the minor axis's fine spacing across the major axis's full length.
+- **The focusing phase folded into the transform kernels.** exp(iπ/λ·inv·(x²+y²)) factorises as
+  p(x)·p(y), so it multiplies the two O(n·n_out) kernels instead of the O(n²) aperture array — and the
+  aperture amplitude then stays real and constant across a whole defocus search, so a 12-step bisection
+  builds it once. The pre-SPEC near-field cut used this factorisation as a special case for on-axis
+  cuts; here it is how every evaluation works.
+- **The taper grid as a loop rather than a second batch axis** (D11), which is the one place the
+  obvious reading of this section was measurably wrong.
+
+Sizing the aperture grid to the APERTURE rather than to a transform window is what makes the first of
+those available at all. The pre-SPEC path carried an `n_ap = 512` floor at a pitch of min_semi/12,
+putting a 100 m aperture inside a grid 21 diameters wide — a 512² array of which ~450 samples were
+illuminated — because the size was inherited from a single-FFT observation window it did not use.
+
 **Run time against accuracy is the only trade axis, and every point on it is set from the config.**
 Nothing else — output size in particular — is a design constraint: the one place size ever mattered
 was the 15 MB cap on a published phone artifact, which is a property of that publishing route and not
@@ -189,6 +214,27 @@ order of value:
 Measured non-levers, recorded so they are not tried again: the silhouette raster's output grid
 (200 → 64 buys 25 % and adds ±1 pp of resampling noise), and the capture integral's own transform
 grid (stable to <0.001 pp from n_grid 256 to 1536).
+
+**Re-measured on the implementation** (`drivers.calibrate`, published in the README). Three of those
+claims changed shape, and the reasons are worth having:
+
+- the **mesh face count** is no longer a run-time lever at all, because the cost it drove was paying
+  for silhouette rasters and those are now cached across runs. 5704 → 824 faces costs 0.2 % of the
+  aggregates and buys nothing on a warm pass; the 8× is a one-off on the first run of a new loft, which
+  belongs to the cache and not to the tier. It stays in the config because that first run still matters.
+- **closed-form capture** is confirmed one-sided and biased high, at 5.2 pp of η on the clear reference
+  case for 78×. What was not in the original measurement: it **cannot defocus**, so where the skin
+  power-density cap binds its error roughly doubles — 7.6 % → 13.2 % on pass efficiency at 60 MW
+  delivered. That is a limit on what the tier can ANSWER, not a rounding difference, which is why P6
+  names its inputs differently at that tier (I5).
+- the **taper search** is the one real accuracy lever left: 17 → 5 points is 0.9–1.3 % on the
+  aggregates for 2.7–3.3×.
+- and one new non-lever: **single precision** is 5 % of run time for no measurable error, because the
+  cost is in the transforms' memory traffic rather than their arithmetic.
+
+Which leaves the honest summary: after the vectorization work, `standard` and `full` differ by 3–4× and
+0.1 pp, so the tier ladder matters much less than it did — the speed came from the sampling being right
+rather than from being allowed to be wrong.
 
 Free of any fidelity cost, and therefore first: a persistent on-disk raster cache (77 ms → ~1 ms per
 look angle) and a coarser look-angle bin (0.1° → ~0.5°, so a pass reuses ~40 rasters instead of 219).
@@ -215,7 +261,31 @@ design. Visualization is rebuilt against it too, and is expected to be broken in
 
 ## 8. Backlog: what to cut, rework, or promote
 
-From the audit of 2026-08-03. Verdicts are against §3 and §5.
+From the audit of 2026-08-03. Verdicts are against §3 and §5. **All 22 items are closed**; the
+"outcome" column says how, and the two that were not simply done as written are 16 and 18 — one stayed
+parked and one was retired by D3, both as the verdict called for.
+
+| # | outcome |
+|---|---|
+| 1 | both cut. No rounding and no peak normalisation anywhere; `test_the_field_is_absolute_and_not_peak_normalised` asserts it |
+| 2 | gone. There is no "with field" return mode: the field is P5, and the sample set P6 integrated is the one P5 emits |
+| 3 | cut. P7 emits `factor_names` as data and the viewer's waterfall reads them, so there is no mirror to keep |
+| 4, 5 | moved out. `physics/` imports no plotting library — the firewall test asserts it — and the z-buffer takes no `color` |
+| 6 | holds by construction. One cached mesh serves the integral and P3, so "displayed == integrated" is not a cost any more |
+| 7, 8, 9 | cut. No camera, no pre-projected positions, no which-way-up flag. P4 emits the aperture frame in the earth frame and the aperture phase as a field |
+| 10 | cut. The relay's factors are named per leg; nothing is republished under a generic key |
+| 11 | reworked. `FieldSampling(kind="axial_plane", axis=...)` names a physical plane; no layout argument exists |
+| 12 | reworked into P5, absolute and masked |
+| 13 | reworked. The default cuts are the APERTURE's principal planes (D2), and there is one frame in the repo, defined in P3 |
+| 14 | reworked. The sub-Fresnel region is `valid=False` with a stated reason; nothing is filled |
+| 15 | cut, and replaced: P5 emits `enclosed_fraction` and the viewer contours it with `contourpy` |
+| 16 | stays parked, as the verdict said. `PUBLIC_EXPOSURE_LIMIT_W_M2` lives in `viz/panels.py` and is drawn as an overlay on P5's absolute field; no product knows it exists |
+| 17 | reworked. A 3-D occluder option on the solve, parameterised by the receiver's own extents, applied to any sampling |
+| 18 | retired by D3, as the verdict allowed. "Best fixed aperture aspect" is `drivers.sweep(base, "aperture.fixed_aspect", …)` against a named aggregate |
+| 19 | kept. `Silhouette.max_half_extent_m`, cached per loft |
+| 20 | reworked. The serve floor is `ProductRequest(name="aggregates", serve_eta_floor=…)`, recorded in every definition that applies it, and `speed_ms` is now the trajectory's own times |
+| 21 | reworked into P1. `TrajectorySpec` carries positions, attitudes AND times, and every aggregate's span names it |
+| 22 | dead with the econ rewrite. There is no beam efficiency constant in `econ/` at all |
 
 **Presentation inside the physics modules**
 
@@ -398,9 +468,123 @@ This is why I3 is worded as *derivation is owned and recorded* rather than "only
 the engine derives within a run, the driver derives across runs, and a consumer never derives at all.
 The line is not who is allowed to do arithmetic — it is that whoever does it is named in the output.
 
+### D7 — one run is one architecture
+
+A candidate axis may not switch between the direct and relay architectures, and may not add or remove
+the receiver. Two reasons, and the second is the real one: the leg-indexed products (P2, P8, P10)
+would acquire a ragged leg axis, and *direct* and *relay* are not one model at different parameter
+values — they are different models. Comparing them is a study over two runs, which D6 already makes
+the driver's job. The engine raises rather than producing a run whose per-candidate product set
+differs.
+
+Weather is not in this class and stays a run axis by convention rather than by rule: it changes no
+shape, so a candidate axis over weather would work. It is a run axis in the reference driver because a
+route does not sit under one sky, and that is a statement about corridors, not about the engine.
+
+### D8 — the field solve's tier is one per run
+
+`field` and `capture` share a fidelity tier by construction, because P6 is a sampling of P5. A
+per-product override on either would split one solve into two at different methods — which I1 forbids
+outright, and which I5 could not make detectable, since both would be labelled with the product they
+came out of rather than the solve they came from. `fidelity.resolve` rejects it.
+
+Products with a genuinely independent method may be overridden freely: the silhouette mesh, the mass
+fixed point, the atmosphere path integral. The manifest records what each one ran at, so a page
+showing two of them at different tiers can say so (it does — see the mixed-tier warning in the run
+report).
+
+### D9 — the defocus floor is closed form, not a back-off loop
+
+The density-cap search needs a compliant lower bracket on focus range. The pre-SPEC engine found it by
+trying `slant/8` and multiplying by 1.5 until the field model stopped raising `ApertureTooFine` — a
+data-dependent loop with an exception as its control flow, which cannot be vectorized. It does not
+have to be a search. The binding constraint is the focusing phase on the longer semi-axis, so
+
+    n = 2.2·semi/d  with  d = λ/(4·semi·|1/z − 1/f|)   ⇒   n = 8.8·semi²·|1/z − 1/f| / λ
+
+is monotone in the defocus and inverts directly at `n = n_max`. Two details are load-bearing and were
+found by the test rather than by inspection: the budget must be discounted by the pitch ladder's own
+rounding (which takes a pitch *down* by up to 19 %) and by the grid quantum, or the closed form
+returns a focus that the sampling then declines to represent — the same class of bug as the loop it
+replaces, only quieter.
+
+### D10 — one field method; the silhouette sampling's resampling is bounded, not tiered
+
+There is one route from aperture to query point (a direct Fresnel transform), at the precision the
+tier sets. The silhouette sampling reads it off a separable grid fitted to the element cloud and
+interpolates onto the elements, because an exact scattered transform over ~11 000 elements costs
+n_query × n_illuminated and does not scale.
+
+That interpolation is a property of the SAMPLING, not a second solve, and it is not a fidelity tier
+either — it is bounded. `physics.recompute.check_field_resampling` re-evaluates the best-captured
+sample with `aperture.scattered_intensity`, which is exact at the element positions, and asserts the
+resulting capture agrees to 1 %. Measured on the reference case: **2.0e-6 relative**.
+
+### D11 — the taper grid is a loop over a config-set count, not a second batch axis
+
+Folding the taper search into the batch axis is the obvious reading of §6a and measurably the wrong
+one. Tiling (member × taper) copies the padded silhouette element cloud once per taper — 127 MB for an
+81-sample pass at nine tapers — and the memory traffic costs more than the transforms it was meant to
+amortise. Measured: 85.5 ms/sample tiled against 72.5 ms/sample looped, before the other two
+optimisations below.
+
+The member batch stays whole and the taper grid is a loop of nine. That is still lockstep: the count
+is config-set and every member walks all of it. What §6a actually asks for is that the *expensive
+internals* see (candidate × sample) as their batch axis, and they do.
+
+### D12 — P4 and P5 describe the leg that serves the aircraft
+
+A relay's up-leg is aperture-to-aperture and the engine has no field solve for it at all — its capture
+is the closed-form Goubau coupling, which is the right model for two circular apertures. So the
+aperture and field products describe the down-leg, and a relay run's P5 is the relay's beam.
+
+This is a scope statement, not an oversight, and it is recorded because the pre-SPEC animation *drew*
+an up-leg by synthesizing an up-leg aperture inside the figure module — a consumer computing physics,
+which is precisely the defect §1 is about. An up-leg field is new products (a leg axis on P4/P5, or a
+second named aperture), not a figure's local calculation.
+
+### D13 — the transverse frame's sign is a gauge, and the pointing error's direction is not an input
+
+The silhouette's narrow principal axis rotates by ~90° over a pass — fore-aft belly-on, near-vertical
+at the horizon — so any fixed reference used to pin its sign has a locus where the pin flips. That is
+not fixable: pinning a direction in a rotating transverse plane always has a degenerate locus. The
+frame is therefore a **deterministic gauge**, reproducible from the arrival angle, and not continuous.
+
+Nothing physical may depend on that gauge, and checking it found something that did. The aperture is an
+ellipse with even illumination, so the FIELD is gauge-invariant outright — but a *signed* pointing
+offset along an arbitrarily-signed axis is not. Measured on this loft at β=60°: the two directions
+differ by **7 pp of capture** (0.857 against 0.928), because the projection is not symmetric about its
+narrow axis. "The worst case for a given magnitude" was therefore a label on one arbitrary side of two.
+
+The fix makes it well posed. `pointing_error_m` is a MAGNITUDE; the direction comes from the
+projection's own third moment (P3 `principal_skew_m3`), which points the beam at the thin side. Skew
+flips sign with the gauge, so the same physical offset is chosen either way, and it is demonstrably the
+worse of the two directions. Two tests pin both halves.
+
+A viewer that wants a continuously-oriented drawn airframe re-pins along the trajectory from the
+emitted per-sample frames. That is a decision about which way up to draw, i.e. presentation, and I7
+puts it on the viewer — which is also the honest resolution of the pre-SPEC belly-up figure: the
+mirror was never a physics defect, it was a viewer without enough information, and now it has it.
+
+### D14 — the loft is the aircraft's shape; the tessellation is a fidelity parameter
+
+`n_span`/`n_theta` moved out of `LoftSpec` and into `FidelityConfig`. While they sat in the loft, the
+mesh face count — §6's largest measured lever — was a scenario input, so changing the tier changed
+nothing, and the calibration table reported 5704 faces at every tier including `coarse`. The shape is
+physics; how finely it is discretised is numerics; separating them is what makes the lever a lever.
+
+### Process: the suite is pytest, in `tests/`
+
+The pre-SPEC checks were a `python -m` script whose every assertion printed the numbers behind it, and
+that property is worth keeping — so the assertion messages carry the numbers. What pytest buys is
+parametrisation (the firewall test is one case per module in the package, so a new file that breaks the
+rule names itself) and fixtures (one archived reference run shared by every contract test). Added as a
+`dev` dependency group; `uv sync` picks it up.
+
 ### Nothing open
 
-All decisions needed to start are taken. Later ones get appended here as they are made (§11).
+All decisions needed to start were taken before implementation; D7–D14 are the ones the
+implementation forced, recorded here as §11 requires.
 
 ## 10. Order of work
 
@@ -420,6 +604,31 @@ All decisions needed to start are taken. Later ones get appended here as they ar
 8. Rebuild viz against the contract; rewrite econ from scratch.
 
 Fidelity tiers land with the schema (I5), not after it.
+
+**All eight are done.** One deviation from the order, worth recording: items 1 and 2 were done
+together rather than 1-then-2, because the raster cache lives inside the new layout and building it
+twice would have been the only way to keep them apart. The measured effect of item 1 is unchanged —
+**93 ms cold to 3 ms from disk** per look angle, and free from the in-process memo after that.
+
+Where the finished code sits against §9's layout:
+
+    artifacts/   spec.py products.py manifest.py store.py serialize.py
+    physics/     engine.py aggregate.py recompute.py fidelity.py cache.py geo.py
+                 airframe/  loft.py silhouette.py flight.py
+                 beam_link/ aperture.py solver.py occlusion.py capture.py chain.py
+                            atmosphere.py relations.py  reference/ hankel.py chain_reference.py
+    viz/         run_report.py panels.py provenance.py
+    econ/        cost.py verdict.py
+    drivers/     sweep.py corridor.py calibrate.py
+    tests/       test_physics.py test_contract.py test_import_firewall.py
+
+`physics.beam_link` was kept over the shorter `physics.link`, as §9 offered — the recorded layout is
+worth more than the two syllables.
+
+One name in §9's sketch did not survive: there is no `physics/airframe/mass.py`. The mass cascade,
+the flight power and the reserve are one file, `flight.py`, because they are one fixed point and its
+consequences — splitting them would have meant `mass.py` importing `flight.py` for the power the
+cascade iterates on, or duplicating it.
 
 ## 11. Working mode
 
@@ -465,3 +674,31 @@ Emitter sizing, three code paths, one scenario at 8° reference elevation: 419.5
 engine), 420.1 m (`sweeps`, τ=2 on the convex table), 419.5 m round / 220.9 m elliptical
 (`econ_pass2`, own scan at forced `taper_p=0`). Agreement is by construction, not by test, and the
 live divergence is the taper regime rather than the diameter.
+
+### Measured since, on the implementation
+
+Reference case as above unless stated; a "pass" is 81 samples over ±100 km at 11 km, `standard` tier.
+
+| what | measured |
+|---|---|
+| warm pass, whole engine | **18 ms per sample** (was 56–95); 0.89 s for a 41-sample run with every product |
+| silhouette raster | 93 ms cold, **3 ms** from the on-disk cache, free from the process memo |
+| aperture grid at 8:1 aspect | n = 624 with one common pitch, **80** with per-axis pitch |
+| field against the analytic Airy encircled energy | within **0.13 pp** at n_ap = 80; the pre-SPEC test's tolerance was 1.5 pp at n_ap = 512 |
+| on-axis peak against π·a²/(λz)² | **0.4 %** |
+| silhouette resample against the exact scattered transform | **2.0e-6** relative in capture (D10) |
+| the two pre-SPEC field solves, now one | the side view's on-axis value **IS** the capture peak, asserted to 1e-9, where the two independent solves agreed to 15 % |
+| pointing-error direction, the two gauges | **7 pp of capture** apart at β=60° — which is what made D13 necessary |
+| MTOW, against the pre-SPEC scalar cascade | 79.95 t; rectenna 2.095 t from area × 1 kg/m² against the old hardcoded 2.0 t |
+| mass fixed point, 10 lockstep iterations | within **1 kg** of 80; residual at 40 iterations is 1.5e-11 kg |
+| station spacing at 15°, 11 km | **81.0 km** on the sphere against econ's flat-earth 82.1 km |
+| the taper grid as a batch axis (D11) | 85.5 ms/sample tiled against 72.5 ms/sample looped |
+
+And one finding that is physics rather than engineering, pinned by
+`test_chaining_relays_compounds_truncation_loss_the_closed_form_cannot_see`: three relays each sized for
+τ=2 give a Goubau product of **94.8 %** and the true propagated field delivers **54.2 %**. The closed
+form assumes the matched mode arrives at every element; after the first truncation the field is
+Airy-like, so each subsequent rim cuts sidelobes the closed form has already counted as captured. The
+gap compounds with hop count, which is a real argument against long relay chains and is not something a
+product of per-hop efficiencies can express. The engine's own relay is one hop, where the same reference
+agrees to 3 %.

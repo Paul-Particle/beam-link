@@ -270,6 +270,19 @@ class FieldSampleSet:
     occluders="receiver". Emitted separately from the intensity so the unobstructed field and the
     shadow are both answerable from one solve rather than two."""
 
+    enclosed_fraction: np.ndarray | None = None
+    """(candidate, sample, point) — at each range, the fraction of that plane's power inside |r|.
+
+    The funnel, as DATA. The pre-SPEC engine returned NaN-separated contour polylines from a physics
+    module; the verdict was to emit the field the contours come from and let the viewer contour it
+    (§8 item 15, and §7 permits contouring). It is the STRIP enclosed fraction along the sampling's
+    own transverse axis, normalised to each plane's total on the requested window — so a beam wider
+    than the window never reaches a high level instead of being renormalised into one — and it is
+    computed BEFORE the occluder, so what the receiver absorbs shows up as the high-level rings
+    closing at the receiver plane rather than being renormalised away.
+
+    None for a 2-D transverse grid, which has no single radial axis to enclose along."""
+
     aperture_pitch_m: np.ndarray | None = None
     """(candidate, sample, 2) — the aperture-plane sample pitch on each axis."""
 

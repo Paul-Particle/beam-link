@@ -84,6 +84,7 @@ class SolvedSampleSet:
     grid_axes: dict
     occluder_transmission: np.ndarray | None = None
     unresolved_reason: np.ndarray | None = None
+    enclosed_fraction: np.ndarray | None = None
     aperture_pitch_m: np.ndarray | None = None
     aperture_samples: np.ndarray | None = None
     """The pitch and grid size the sampling actually needed, per member. Recorded per SAMPLE SET
@@ -316,7 +317,45 @@ def _stack_over_planes(sampling, context: SolveContext, config, fractions, x_axi
         sampling=sampling, points_m=points, intensity_per_m2=intensity, valid=valid,
         grid_shape=grid_shape,
         grid_axes={"z_m": ranges, "z_fraction": fractions, "x_m": x_axis, "y_m": y_axis},
+        enclosed_fraction=_enclosed_fraction(intensity, points, grid_shape, fractions.size,
+                                             n_x, n_y),
         unresolved_reason=reason, aperture_pitch_m=pitch, aperture_samples=grid_n)
+
+
+def _enclosed_fraction(intensity, points, grid_shape, n_plane, n_x, n_y):
+    """The enclosed-energy field: at each range, the fraction of that plane's power inside |r|.
+
+    Emitted because §8 item 15 says so. The pre-SPEC engine returned NaN-separated CONTOUR POLYLINES
+    from a physics module — a drawing, produced inside the model — and the verdict was to emit the
+    field the contours come from and let the viewer contour it (which §7 explicitly permits). So this
+    is the funnel, as data.
+
+    It is the STRIP enclosed fraction along the sampling's own transverse axes — the power within
+    |x| ≤ r of the line, not within a circle of radius r — because that is what a side view's radial
+    axis means. Normalised to each plane's total ON THIS GRID, so a beam wider than the requested
+    window correctly never reaches a high level instead of being renormalised into one.
+
+    Unoccluded: the occluder is applied afterwards, so what the receiver absorbs SHOWS UP as the
+    high-level rings closing at the receiver plane rather than being renormalised away.
+    """
+    members = intensity.shape[0]
+    if n_x > 1 and n_y > 1:
+        return None      # a 2-D transverse grid has no single radial axis to enclose along
+    radial_count = max(n_x, n_y)
+    if radial_count < 2:
+        return None
+    block = intensity.reshape(members, n_plane, radial_count)
+    coordinate = points.reshape(members, n_plane, radial_count, 3)
+    radial = coordinate[..., 0] if n_x > 1 else coordinate[..., 1]
+    order = np.argsort(np.abs(radial), axis=-1)
+    step = np.abs(np.diff(radial, axis=-1)[..., :1])
+    sorted_intensity = np.take_along_axis(block, order, axis=-1)
+    cumulative = np.cumsum(sorted_intensity, axis=-1) * step
+    total = cumulative[..., -1:]
+    enclosed = np.divide(cumulative, total, out=np.zeros_like(cumulative), where=total > 0)
+    restored = np.empty_like(enclosed)
+    np.put_along_axis(restored, order, enclosed, axis=-1)
+    return restored.reshape(members, n_plane * radial_count)
 
 
 # --- shared plumbing ----------------------------------------------------------------------

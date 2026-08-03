@@ -59,8 +59,13 @@ def weather(name: str) -> Weather:
 
 @dataclass(frozen=True)
 class LoftSpec:
-    """Blended-wing-body outer geometry. The mesh the capture integral sums over and the mesh a
-    viewer draws are the same object (P3 emits it), so these numbers set both."""
+    """Blended-wing-body outer SHAPE. Lengths only — no tessellation.
+
+    How finely the shape is discretised is a numerical choice, not a property of the aircraft, so
+    `n_span`/`n_theta` live in the fidelity config and not here. Keeping them apart is what lets the
+    face count be a fidelity LEVER at all (§6 measures it as the largest one: 8× on the dominant cost
+    for 0.34 pp of capture) — while it sat in the loft, changing the tier changed nothing (D14).
+    """
 
     full_span_m: float = 80.0
     root_chord_m: float = 40.0
@@ -69,8 +74,6 @@ class LoftSpec:
     tip_thickness_m: float = 0.4
     sweep_m: float = 25.0
     body_fraction: float = 0.25
-    n_span: int = 71
-    n_theta: int = 40
     winglet_height_m: float = 3.0
     winglet_root_chord_m: float = 3.0
     winglet_tip_chord_m: float = 1.2

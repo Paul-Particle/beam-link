@@ -161,10 +161,11 @@ on the inputs: an entry written before a field was added is not a hit for a call
 the failure mode without this is a KeyError deep inside a batched gather rather than a recompute."""
 
 
-def raster_key(loft: LoftSpec, beta_deg: float, alpha_deg: float, n_grid: int) -> str:
-    return cache.content_key("silhouette", schema=_SCHEMA_VERSION,
-                             mesh=loft_module.mesh_key(loft), beta=float(beta_deg),
-                             alpha=float(alpha_deg), n_grid=int(n_grid))
+def raster_key(loft: LoftSpec, beta_deg: float, alpha_deg: float, config: FidelityConfig) -> str:
+    return cache.content_key(
+        "silhouette", schema=_SCHEMA_VERSION,
+        mesh=loft_module.mesh_key(loft, config.mesh_n_span, config.mesh_n_theta),
+        beta=float(beta_deg), alpha=float(alpha_deg), n_grid=int(config.raster_n_grid))
 
 
 def bin_look_angles(beta_deg, alpha_deg, bin_deg: float):
@@ -190,7 +191,7 @@ def silhouette_at(loft: LoftSpec, beta_deg: float, alpha_deg: float, config: Fid
     projected-area centroid in the frame `basis` describes.
     """
     def build():
-        vertices, faces, normals = loft_module.mesh(loft)
+        vertices, faces, normals = loft_module.mesh(loft, config)
         look = loft_module.direction_from_beta_alpha(float(beta_deg), float(alpha_deg))
         look = look / np.linalg.norm(look)
         aux_u, aux_v, aux_w = _auxiliary_basis(look)
@@ -242,7 +243,7 @@ def silhouette_at(loft: LoftSpec, beta_deg: float, alpha_deg: float, config: Fid
             sigma=sigma, skew=skew,
             look=look)
 
-    return cache.memoized(raster_key(loft, beta_deg, alpha_deg, config.raster_n_grid), build)
+    return cache.memoized(raster_key(loft, beta_deg, alpha_deg, config), build)
 
 
 def _empty_raster(look):
@@ -312,15 +313,18 @@ def max_half_extent(loft: LoftSpec, config: FidelityConfig) -> float:
                 extent = max(extent, float(raster["half_extent"].max()))
         return dict(max_half_extent=np.array(extent))
 
-    key = cache.content_key("max_half_extent", schema=_SCHEMA_VERSION,
-                            mesh=loft_module.mesh_key(loft), n_grid=config.raster_n_grid)
+    key = cache.content_key(
+        "max_half_extent", schema=_SCHEMA_VERSION,
+        mesh=loft_module.mesh_key(loft, config.mesh_n_span, config.mesh_n_theta),
+        n_grid=config.raster_n_grid)
     return float(cache.memoized(key, build)["max_half_extent"])
 
 
 # --- the convex, occlusion-free table -----------------------------------------------------
 
 
-def convex_area_table(loft: LoftSpec, beta_step_deg: float = 2.0, alpha_step_deg: float = 5.0):
+def convex_area_table(loft: LoftSpec, config: FidelityConfig, beta_step_deg: float = 2.0,
+                      alpha_step_deg: float = 5.0):
     """Silhouette area on a (β, α) grid by the convex projected-area identity.
 
     Occlusion-free and fully vectorized, which is why §6 keeps it: it is the closed-form capture
@@ -328,7 +332,7 @@ def convex_area_table(loft: LoftSpec, beta_step_deg: float = 2.0, alpha_step_deg
     body — measured at >7 % side-on at low elevation — and the tier calibration publishes that.
     """
     def build():
-        vertices, faces, normals, areas = loft_module.mesh_with_areas(loft)
+        vertices, faces, normals, areas = loft_module.mesh_with_areas(loft, config)
         beta = np.arange(0.0, 180.0 + 1e-9, beta_step_deg)
         alpha = np.arange(0.0, 360.0 + 1e-9, alpha_step_deg)
         beta_grid, alpha_grid = np.meshgrid(beta, alpha, indexing="ij")
@@ -338,14 +342,15 @@ def convex_area_table(loft: LoftSpec, beta_step_deg: float = 2.0, alpha_step_deg
         return dict(beta_deg=beta, alpha_deg=alpha, area_m2=table,
                     planform_area_m2=np.array(float(planform)))
 
-    key = cache.content_key("convex_area", mesh=loft_module.mesh_key(loft),
-                            beta_step=float(beta_step_deg), alpha_step=float(alpha_step_deg))
+    key = cache.content_key(
+        "convex_area", mesh=loft_module.mesh_key(loft, config.mesh_n_span, config.mesh_n_theta),
+        beta_step=float(beta_step_deg), alpha_step=float(alpha_step_deg))
     return cache.memoized(key, build)
 
 
-def convex_area(loft: LoftSpec, beta_deg, alpha_deg):
+def convex_area(loft: LoftSpec, config: FidelityConfig, beta_deg, alpha_deg):
     """Bilinear lookup into `convex_area_table`, vectorized over a batch of arrival angles."""
-    table = convex_area_table(loft)
+    table = convex_area_table(loft, config)
     beta_axis, alpha_axis, areas = table["beta_deg"], table["alpha_deg"], table["area_m2"]
     beta = np.clip(np.asarray(beta_deg, dtype=float), 0.0, 180.0)
     alpha = np.mod(np.asarray(alpha_deg, dtype=float), 360.0)

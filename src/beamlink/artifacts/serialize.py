@@ -17,6 +17,7 @@ contract").
 
 from __future__ import annotations
 
+import collections.abc
 import dataclasses
 import typing
 from typing import Any, Mapping
@@ -39,21 +40,31 @@ def _resolved_hints(cls) -> dict[str, Any]:
     return typing.get_type_hints(cls)
 
 
+def _is_mapping_hint(hint) -> bool:
+    """Whether `hint` is a `Mapping[...]`/`dict[...]` of any flavour.
+
+    `typing.get_origin(Mapping[str, X])` is `collections.abc.Mapping`, which is NOT a `dict`
+    subclass — so a check written against `dict` silently misses every `Mapping`-annotated field, and
+    the values come back as plain dicts instead of the dataclasses they were written from. That is how
+    a study manifest's aggregation definitions lost their type on the way back off disk.
+    """
+    origin = typing.get_origin(hint)
+    if origin is None:
+        return False
+    try:
+        return issubclass(origin, collections.abc.Mapping)
+    except TypeError:
+        return False
+
+
 def _mapping_value_type(hint) -> Any | None:
     """For a `Mapping[str, X]`/`dict[str, X]` hint where X is a dataclass, return X."""
-    origin = typing.get_origin(hint)
-    if origin is None or not issubclass(origin, dict) and origin not in (dict, Mapping):
-        # typing.Mapping's origin is collections.abc.Mapping, which is not a dict subclass
-        try:
-            if not issubclass(origin, typing.cast(Any, Mapping)):
-                return None
-        except TypeError:
-            return None
+    if not _is_mapping_hint(hint):
+        return None
     args = typing.get_args(hint)
     if len(args) != 2:
         return None
-    value_type = args[1]
-    return value_type if dataclasses.is_dataclass(value_type) else None
+    return args[1] if dataclasses.is_dataclass(args[1]) else None
 
 
 def _optional_inner(hint) -> Any:
@@ -158,8 +169,7 @@ def from_json_safe(value: Any, hint: Any) -> Any:
         if args:
             return tuple(from_json_safe(v, a) for v, a in zip(value, args))
         return tuple(value)
-    if origin in (dict, Mapping) or (origin is not None and isinstance(origin, type)
-                                    and issubclass(origin, dict)):
+    if _is_mapping_hint(hint):
         args = typing.get_args(hint)
         value_hint = args[1] if len(args) == 2 else Any
         return {k: from_json_safe(v, value_hint) for k, v in value.items()}

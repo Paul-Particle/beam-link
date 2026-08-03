@@ -35,7 +35,7 @@ def test_silhouette_behaves_like_a_flat_lifting_body():
     """Belly-on beats edge-on several times over, opposite views agree for a closed body, and area
     falls monotonically as the beam moves off the belly."""
     loft = A.LoftSpec()
-    _, _, normals, areas = loft_module.mesh_with_areas(loft)
+    _, _, normals, areas = loft_module.mesh_with_areas(loft, STANDARD)
     belly = float(loft_module.convex_projected_area(
         loft_module.direction_from_beta_alpha(0.0, 0.0), normals, areas))
     edge = float(loft_module.convex_projected_area(
@@ -48,7 +48,7 @@ def test_silhouette_behaves_like_a_flat_lifting_body():
     assert abs(forward - backward) / forward < 0.02, f"{forward:.1f} vs {backward:.1f} m²"
 
     betas = np.linspace(0.0, 90.0, 19)
-    table = silhouette_module.convex_area(loft, betas, np.zeros(19))
+    table = silhouette_module.convex_area(loft, STANDARD, betas, np.zeros(19))
     assert np.all(np.diff(table) <= 1e-6), f"not monotone: {np.round(table, 1)}"
 
 
@@ -56,7 +56,7 @@ def test_the_raster_removes_the_convex_over_count():
     """Self-occlusion is real: side-on at low elevation the winglets and the far wing overlap in
     projection, and the z-buffer sees less area than the convex identity claims."""
     loft = A.LoftSpec()
-    convex = float(silhouette_module.convex_area(loft, 88.0, 90.0))
+    convex = float(silhouette_module.convex_area(loft, STANDARD, 88.0, 90.0))
     raster = float(silhouette_module.silhouette_at(loft, 88.0, 90.0, STANDARD)["area"])
     assert raster < 0.93 * convex, f"raster {raster:.0f} vs convex {convex:.0f} m²"
 

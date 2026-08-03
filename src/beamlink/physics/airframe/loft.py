@@ -39,15 +39,18 @@ def _winglet_prism(tip_center_x, y_tip, root_chord, tip_chord, height, fin_sweep
     return vertices, faces
 
 
-def make_mesh(loft: LoftSpec) -> tuple[np.ndarray, np.ndarray]:
+def make_mesh(loft: LoftSpec, n_span: int, n_theta: int) -> tuple[np.ndarray, np.ndarray]:
     """Closed triangle mesh: elliptical cross-sections lofted along the span.
 
     Chord and thickness are constant over the centre body (|u| < body_fraction of the half-span)
     and taper linearly to the tip beyond it; section centres move aft with |u| to give the sweep.
     Returns (vertices (N, 3) m, faces (M, 3) indices).
+
+    `n_span` and `n_theta` are the TESSELLATION, from the fidelity config — the shape is `loft`, and
+    the two are separate so the face count can be the lever §6 measures it to be (D14).
     """
     half_span = loft.full_span_m / 2.0
-    spanwise = np.linspace(-1.0, 1.0, loft.n_span)
+    spanwise = np.linspace(-1.0, 1.0, n_span)
     magnitude = np.abs(spanwise)
     taper = np.clip((magnitude - loft.body_fraction) / (1.0 - loft.body_fraction), 0.0, 1.0)
     chord = loft.root_chord_m - (loft.root_chord_m - loft.tip_chord_m) * taper
@@ -55,29 +58,29 @@ def make_mesh(loft: LoftSpec) -> tuple[np.ndarray, np.ndarray]:
     nose_tail_center = -loft.sweep_m * magnitude          # nose forward at centre, tips aft
     span_station = spanwise * half_span
 
-    angle = np.linspace(0.0, 2.0 * np.pi, loft.n_theta, endpoint=False)
+    angle = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
     cos_angle, sin_angle = np.cos(angle), np.sin(angle)
 
-    ring = np.empty((loft.n_span, loft.n_theta, 3))
+    ring = np.empty((n_span, n_theta, 3))
     ring[..., 0] = nose_tail_center[:, None] + (chord[:, None] / 2.0) * cos_angle[None, :]
     ring[..., 1] = span_station[:, None]
     ring[..., 2] = (thickness[:, None] / 2.0) * sin_angle[None, :]
     vertices = ring.reshape(-1, 3)
 
     def vertex_id(i, j):
-        return i * loft.n_theta + (j % loft.n_theta)
+        return i * n_theta + (j % n_theta)
 
     faces = []
-    for i in range(loft.n_span - 1):
-        for j in range(loft.n_theta):
+    for i in range(n_span - 1):
+        for j in range(n_theta):
             a, b, c, d = vertex_id(i, j), vertex_id(i, j + 1), vertex_id(i + 1, j + 1), vertex_id(i + 1, j)
             faces.append((a, b, c))
             faces.append((a, c, d))
 
-    for i in (0, loft.n_span - 1):        # cap both wing tips with a fan, wound to face outboard
+    for i in (0, n_span - 1):             # cap both wing tips with a fan, wound to face outboard
         center_index = len(vertices)
         vertices = np.vstack([vertices, ring[i].mean(axis=0)])
-        for j in range(loft.n_theta):
+        for j in range(n_theta):
             a, b = vertex_id(i, j), vertex_id(i, j + 1)
             faces.append((center_index, a, b) if i == 0 else (center_index, b, a))
 
@@ -222,37 +225,41 @@ def body_to_enu_matrix(attitudes_deg):
 # --- the cached mesh ----------------------------------------------------------------------
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 """Bumped whenever the set of arrays a cached mesh entry carries changes; see `silhouette`."""
 
 
-def mesh_key(loft: LoftSpec) -> str:
-    """The content key every cached quantity derived from this loft is filed under.
+def mesh_key(loft: LoftSpec, n_span: int, n_theta: int) -> str:
+    """The content key every cached quantity derived from this mesh is filed under.
 
-    The loft parameters are IN the key, so a run at a coarser mesh tier can never read a finer
-    mesh's raster back out — which the pre-SPEC look-angle dict could do (see `physics.cache`).
+    Both the SHAPE and the TESSELLATION are in the key, so a run at a coarser mesh tier can never
+    read a finer mesh's raster back out — which the pre-SPEC look-angle dict could do, because it was
+    keyed on the look angle alone (see `physics.cache`).
     """
-    return cache.content_key("mesh", schema=_SCHEMA_VERSION, loft=loft)
+    return cache.content_key("mesh", schema=_SCHEMA_VERSION, loft=loft, n_span=int(n_span),
+                             n_theta=int(n_theta))
 
 
-def _mesh_entry(loft: LoftSpec):
-    vertices, faces = make_mesh(loft)
+def _mesh_entry(loft: LoftSpec, n_span: int, n_theta: int):
+    vertices, faces = make_mesh(loft, n_span, n_theta)
     normals, areas = face_normals_areas(vertices, faces)
     return dict(vertices=vertices, faces=faces, normals=normals, areas=areas)
 
 
-def mesh(loft: LoftSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(vertices, faces, face normals) for one loft, cached by content key.
+def mesh(loft: LoftSpec, config) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(vertices, faces, face normals) at this tier's tessellation, cached by content key.
 
     This is BOTH the capture-path mesh and the mesh P3 emits, so the surface a viewer draws is
     exactly the surface the capture integral summed over — by construction rather than by paying
     2.6× the rasterisation cost to keep two of them equal (§8 item 6).
     """
-    entry = cache.memoized(mesh_key(loft), lambda: _mesh_entry(loft))
+    entry = cache.memoized(mesh_key(loft, config.mesh_n_span, config.mesh_n_theta),
+                           lambda: _mesh_entry(loft, config.mesh_n_span, config.mesh_n_theta))
     return entry["vertices"], entry["faces"], entry["normals"]
 
 
-def mesh_with_areas(loft: LoftSpec):
+def mesh_with_areas(loft: LoftSpec, config):
     """As `mesh`, plus per-face areas — what the convex, occlusion-free area table integrates."""
-    entry = cache.memoized(mesh_key(loft), lambda: _mesh_entry(loft))
+    entry = cache.memoized(mesh_key(loft, config.mesh_n_span, config.mesh_n_theta),
+                           lambda: _mesh_entry(loft, config.mesh_n_span, config.mesh_n_theta))
     return entry["vertices"], entry["faces"], entry["normals"], entry["areas"]
