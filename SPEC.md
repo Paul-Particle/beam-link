@@ -117,6 +117,11 @@ the manifest. That is the general form of the "pure focusing sweep" figure.
 
 ## 6. Fidelity
 
+**Run time against accuracy is the only trade axis, and every point on it is set from the config.**
+Nothing else — output size in particular — is a design constraint: the one place size ever mattered
+was the 15 MB cap on a published phone artifact, which is a property of that publishing route and not
+of the engine. A product is emitted at full precision in SI units and that is the end of it.
+
 Tiers vary method and resolution; they never vary shape, units or meaning (I5). Levers, in measured
 order of value:
 
@@ -203,31 +208,100 @@ From the audit of 2026-08-03. Verdicts are against §3 and §5.
 **Not defects** — `field`/`chain_reference` as engine-internal ground truth (§2), and the engine's
 own transform-grid resolution, measured adequate in §6.
 
-## 9. Decisions outstanding
+## 9. Decisions taken
 
-- **D1 — `elevation_deg` sign.** Currently opposite between the ground-emitter and relay branches,
-  recorded in the code as an open question. It cannot stay open in a schema: P2 needs one convention.
-- **D2 — field sampling: declared planes or a volume.** Cuts are cheap (~280 MB per run at today's
-  frame count); an honest volume is orders of magnitude larger. The cheap option is the viz-shaped
-  one, so this trade should be made deliberately, with a disk budget.
-- **D3 — is "best fixed aperture aspect over a trajectory" a product?** If yes it is an engine
-  optimisation with recorded objective; if no, the figure that needs it goes.
-- **D4 — is `sweeps` inside the engine?** Assumed yes throughout this document: it becomes the
-  trajectory and aggregate layer (P1, P9). Unconfirmed.
+Settled 2026-08-03. Recorded here rather than in a transcript, because the engine is to be built to
+completion against them and reviewed as a finished version (§12).
+
+- **D1 — elevation is ground-referenced, and defined per link leg.** The elevation of a leg's
+  receiving end as seen from its emitting end, above that end's local horizon. Ground→aircraft is
+  positive, +90° overhead; relay→aircraft is correctly negative, the aircraft being below a relay's
+  horizon. Rationale: every elevation *input* in the repo (`min_elevation_deg`, reference elevations,
+  `downrange_for_elevation`) is already ground-referenced and positive, while the emitted
+  `elevation_deg` was aircraft-referenced (−65.6° overhead) because `_capture_setup` measures from
+  the aircraft outwards — and the relay up-leg, measured at the station, came out positive in the
+  same dict. Per-leg definition dissolves that double key instead of renaming it. Nothing is lost on
+  the aircraft side: the arrival direction in the airframe frame is P2's (β, α).
+- **D2 — sampling geometry is a declared input, and all samplers ship together.** The run spec asks
+  for silhouette elements, planes, arbitrary points, or a volume; the engine solves once and
+  evaluates wherever asked. No sampling is privileged by the engine. The **default planes are
+  physically defined** — the aperture's own principal axes, which set the beam's transverse principal
+  axes — not the silhouette's principal axes in a display basis, which is what made the current F/F₂
+  pair viz-shaped. Rotational symmetry is only slightly broken, so those axes are the natural cut.
+  The volume sampler is built in v1 rather than deferred, so the capability is honest; routine runs
+  simply do not request it.
+- **D3 — no bespoke design-optimisation product.** A run may sweep a declared design parameter and
+  emit the objective per candidate, where the objective is a named aggregate (P9). "Best fixed
+  aperture aspect" is then a sweep over `fixed_emitter_aspect` against pass-integrated delivered
+  energy; econ's bespoke aperture scan becomes a sweep over diameter against capture at the design
+  edge; frequency and taper studies come free. Retires backlog item 18 and the `#(verify)` sizing
+  pass in econ together. A sweep is several scenarios in one study, products indexed by scenario —
+  the same shape at different parameter values, which is the permitted kind of repetition.
+- **D4 — the sweep loop is OUTSIDE the engine, and the engine plugs into any generic one.** The
+  engine's unit of work is *one scenario, including its trajectory* → products. Anything that varies
+  the scenario is a driver, and must be able to treat the engine as a black-box callable. Three
+  consequences, all binding on the design:
+  - `evaluate(spec) -> Products` and `write(products, run_dir)` are separate. An optimiser calls the
+    first and reads its objective straight off the emitted aggregate; the archival path calls both.
+    One physics path, two uses — not two paths.
+  - **No process-global state may affect a result.** Caches (the raster cache, atmosphere tables) are
+    correctness-neutral, explicitly keyed, and safe to share or persist across parallel calls.
+  - Trajectory-level reduction stays inside the unit of work (P9), because it is a definition-bearing
+    derived product. Only *scenario variation* moves out.
+
+### Consequences for the firewall
+
+The firewall is enforced by **package layout**, not by naming exceptions, so it has no holes and a
+new file inherits the rule from its directory:
+
+    engine/     — may import physics; owns products and their schema
+    artifacts/  — read-only loaders and dataclasses; imports nothing from engine/
+    viz/        — may import artifacts/ only
+    econ/       — may import artifacts/ only
+    drivers/    — may invoke engine/ (that is their job); may not reimplement any part of it
+
+A driver that calls `engine.evaluate()` computes no physics itself, so this is a classification, not
+an exemption — the same resolution as the Hankel ground truth in §2. Viz and econ never appear on the
+permitted side of any rule.
+
+### Still open
+
+- **Who owns cross-run aggregation?** Route- and corridor-level numbers — energy per flight over a
+  route served by N stations — span several engine runs, and they are exactly what econ consumes. If
+  econ derives them, I4 is broken. Proposal: the same reduction machinery, driver-side, emitting a
+  study manifest that references the runs it aggregated and records the aggregation definition. Then
+  "who derived this and how" is answerable for a corridor number the same way it is for a pass
+  number, and econ still only selects. Needs a ruling before P9 is written.
 
 ## 10. Order of work
 
-1. The two free speedups (§6) — no fidelity cost, and they make everything after this bearable.
-2. Schema and manifest: write §5 down as dataclasses, with a stated physical question per field,
-   before any engine change. Review gate.
-3. One solve: collapse `overlap_capture` and `channel_field` into a single field solver with
-   requested sampling (I1). This is new physics capability, not a move — the engine has no concept
-   of a field away from the aircraft today. Largest single piece.
-4. P1–P8 emission plus the manifest; the recompute checks of I6; the import firewall test of I8.
-5. P9 aggregates, with the two definitions from §1 as the first two named products.
-6. Rebuild viz against the contract; rewrite econ from scratch.
+1. The two free speedups (§6) — no fidelity cost, and they make everything after this bearable. The
+   raster cache becomes explicitly keyed and persistable here, which D4 requires anyway.
+2. Package layout of §9, and the import firewall test (I8), before there is anything to firewall.
+3. Schema and manifest: write §5 down as dataclasses, with a stated physical question per field.
+4. One solve: collapse `overlap_capture` and `channel_field` into a single field solver with
+   requested sampling — silhouette elements, planes, points and volume together (D2). This is new
+   physics capability, not a move: the engine has no concept of a field away from the aircraft today.
+   Largest single piece.
+5. `evaluate(spec) -> Products` and `write(products, run_dir)` (D4), P1–P8, the recompute checks of I6.
+6. P9 aggregates, with the two definitions from §1 as the first two named products, and their policy
+   constants as declared inputs.
+7. A minimal reference driver that sweeps a declared parameter (D3) — a demonstration of the plug
+   shape, deliberately thin and not privileged.
+8. Rebuild viz against the contract; rewrite econ from scratch.
 
 Fidelity tiers land with the schema (I5), not after it.
+
+## 12. Working mode
+
+The engine is built to completion against §9 and reviewed as a finished version, rather than
+supervised step by step. That puts the burden on this document: **every decision taken along the way
+is recorded here**, with its rationale and the measurement behind it where there is one, so that the
+review can be a discussion of recorded choices rather than an archaeology of the diff. A choice made
+in passing and not written down is a defect in the same way an unnamed derived quantity is.
+
+Viz and econ are expected to be broken while this happens. Econ is rewritten from scratch afterwards
+and nothing in the present econ constrains the design.
 
 ## 11. Evidence
 
