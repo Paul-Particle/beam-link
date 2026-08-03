@@ -37,7 +37,7 @@ file inherits the rule from the directory it is placed in:
 ## Running it
 
     uv sync
-    uv run pytest -q                                    # 104 checks: physics, the contract, the firewall
+    uv run pytest -q                                    # 105 checks: physics, the contract, the firewall
     uv run python -m beamlink.drivers.calibrate         # the fidelity error table below
     uv run python -m beamlink.viz.run_report runs/<id>  # one self-contained page for a run
 
