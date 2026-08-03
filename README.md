@@ -32,6 +32,10 @@ it on every run to stop it rotting while the direct case moves. Relay also earne
 physically: at a matched aperture it roughly doubled the direct case's delivered energy, and it
 is the weather-robust option, so it is not to be quietly dropped.
 
+**[SPEC.md](SPEC.md) is the target architecture** — the engine emits products, viz and econ consume
+them and never compute physics. The layout below describes the code as it stands, which does not yet
+conform; SPEC.md §8 is the backlog between the two.
+
 ## Layout
 
 | module | what it is |
