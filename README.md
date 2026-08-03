@@ -1,5 +1,10 @@
 # beamlink
 
+> **Archived 2026-08-03 and not continued.** See [`archive/README.md`](archive/README.md) for what was
+> carried forward and how it was verified; the project-wide archive record, including the
+> agent-memory entries, is in the research repo linked below. Only the BWB geometry was taken
+> forward — treat the rest as a record, not a starting position.
+
 A physics engine for beamed microwave power to an aircraft in flight, and the layers that read it.
 
 Split out of [`microwave-power-transmission`](https://github.com/Paul-Particle/microwave-power-transmission),
