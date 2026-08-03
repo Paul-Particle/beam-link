@@ -279,3 +279,129 @@ def test_the_corridor_layout_comes_from_the_real_geometry_not_a_flat_earth_fit()
         f"spherical {layout.station_spacing_km:.1f} km vs flat-earth {flat_earth:.1f} km")
     assert abs(layout.station_spacing_km / flat_earth - 1.0) < 0.1
     assert layout.serving_half_span_m() == pytest.approx(layout.station_spacing_km * 1e3 / 2.0)
+
+
+# --- the caches are correctness-neutral and persistable (D4) --------------------------------
+
+
+def test_the_raster_cache_is_content_keyed_and_survives_the_process(tmp_path, monkeypatch):
+    """The first of the two free speedups (§10 item 1), and the property D4 requires of it.
+
+    A cache that could change a result would be worse than no cache. Three things have to hold: a
+    disk read reproduces the computed value exactly, a different mesh does not collide with it, and
+    dropping the whole thing costs only time.
+    """
+    from beamlink.physics import cache, fidelity
+    from beamlink.physics.airframe import silhouette as silhouette_module
+
+    monkeypatch.setenv("BEAMLINK_CACHE_DIR", str(tmp_path))
+    standard = fidelity.config("standard")
+    loft = A.LoftSpec()
+
+    computed = silhouette_module.silhouette_at(loft, 42.0, 137.0, standard)
+    cache.clear_process_memo()
+    from_disk = silhouette_module.silhouette_at(loft, 42.0, 137.0, standard)
+    for key in ("element_x", "element_y", "incidence", "projected_area", "basis", "sigma", "skew"):
+        assert np.array_equal(computed[key], from_disk[key]), f"{key} changed on a cache round trip"
+
+    # A different loft must not read this entry back: the pre-SPEC dict was keyed on the look angle
+    # alone, so a coarser mesh could and did read a finer mesh's raster.
+    stubbier = A.LoftSpec(full_span_m=60.0)
+    assert (silhouette_module.raster_key(loft, 42.0, 137.0, standard)
+            != silhouette_module.raster_key(stubbier, 42.0, 137.0, standard))
+    coarser = fidelity.config("coarse")
+    assert (silhouette_module.raster_key(loft, 42.0, 137.0, standard)
+            != silhouette_module.raster_key(loft, 42.0, 137.0, coarser))
+
+    # And the tessellation is in the key too, which is what makes the mesh a fidelity lever (D14).
+    assert silhouette_module.silhouette_at(loft, 42.0, 137.0, coarser)["area"] != computed["area"]
+
+    for entry in tmp_path.glob("*.npz"):
+        entry.unlink()
+    cache.clear_process_memo()
+    recomputed = silhouette_module.silhouette_at(loft, 42.0, 137.0, standard)
+    assert np.array_equal(computed["element_x"], recomputed["element_x"]), (
+        "deleting the cache must cost time and nothing else")
+
+
+# --- the documented array shapes are the actual array shapes (I5, §5) -----------------------
+
+# What each product's arrays must lead with, from the docstrings in `artifacts/products.py`. This is a
+# transcription of the schema, kept here so the schema is asserted rather than described: a product
+# that returns a scalar where it promised a candidate axis makes a consumer branch, which is the kind
+# of surprise I5 exists to prevent (and P13 did exactly that until this test was written).
+_LEADING_AXES = {
+    "trajectory": {"positions_m": ("sample", 3), "attitudes_deg": ("sample", 3),
+                   "times_s": ("sample",), "positions_ecef_m": ("sample", 3),
+                   "ground_speed_ms": ("sample",)},
+    "geometry": {"slant_m": ("candidate", "leg", "sample"),
+                 "elevation_deg": ("candidate", "leg", "sample"),
+                 "horizon_blocked": ("candidate", "leg", "sample"),
+                 "arrival_beta_deg": ("candidate", "sample"),
+                 "arrival_alpha_deg": ("candidate", "sample")},
+    "silhouette": {"projected_area_m2": ("candidate", "sample"),
+                   "equal_area_radius_m": ("candidate", "sample"),
+                   "view_basis_body": ("candidate", "sample", 3, 3),
+                   "principal_half_extent_m": ("candidate", "sample", 2),
+                   "principal_sigma_m": ("candidate", "sample", 2),
+                   "principal_skew_m3": ("candidate", "sample", 2)},
+    "aperture": {"semi_major_m": ("candidate", "sample"), "semi_minor_m": ("candidate", "sample"),
+                 "equal_area_diameter_m": ("candidate", "sample"),
+                 "taper_exponent": ("candidate", "sample"), "focus_range_m": ("candidate", "sample"),
+                 "aspect": ("candidate", "sample"),
+                 "frame_axes_ecef": ("candidate", "sample", 3, 3),
+                 "origin_ecef_m": ("candidate", "sample", 3)},
+    "capture": {"geometric": ("candidate", "sample"), "incidence_weighted": ("candidate", "sample"),
+                "peak_areal_density_per_m2": ("candidate", "sample"),
+                "equivalent_disc_radius_m": ("candidate", "sample"),
+                "density_cap_exceeded": ("candidate", "sample"),
+                "skin_power_density_w_m2": ("candidate", "sample")},
+    "chain": {"eta_end_to_end": ("candidate", "sample"), "feasible": ("candidate", "sample")},
+    "power": {"grid_w": ("candidate", "sample"), "radiated_w": ("candidate", "leg", "sample"),
+              "at_receiver_w": ("candidate", "sample"),
+              "rectenna_terminals_w": ("candidate", "sample"),
+              "waste_w": ("candidate", "sample"), "rated_grid_w": ("candidate",)},
+    "atmosphere": {"loss_db": ("candidate", "leg", "sample"),
+                   "transmittance": ("candidate", "leg", "sample"),
+                   "gaseous_db": ("candidate", "leg", "sample"),
+                   "rain_db": ("candidate", "leg", "sample"),
+                   "cloud_db": ("candidate", "leg", "sample")},
+    "mass": {"payload_t": ("candidate",), "structure_t": ("candidate",), "systems_t": ("candidate",),
+             "motor_t": ("candidate",), "reserve_battery_t": ("candidate",),
+             "rectenna_t": ("candidate",), "mtow_t": ("candidate",),
+             "empty_fraction": ("candidate",), "residual_kg": ("candidate",)},
+    "flight_power": {"cruise_shaft_w": ("candidate",), "peak_shaft_w": ("candidate",),
+                     "required_w": ("candidate", "sample"), "peak_required_w": ("candidate",),
+                     "lift_to_drag": ("candidate",)},
+    "reserve": {"glide_range_km": ("candidate",), "glide_duration_s": ("candidate",),
+                "battery_duration_s": ("candidate",), "powered_fraction": ("candidate",)},
+}
+
+
+def test_every_product_has_the_leading_axes_it_documents():
+    """Checked on a run with TWO candidates and an unequal sample count, so a shape that only happens
+    to be right when both are 1 fails."""
+    trajectory = A.TrajectorySpec.straight_overflight(60e3, 11_000.0, 250.0, n_samples=7)
+    spec = A.RunSpec(
+        scenario=A.ScenarioSpec(aperture=A.ApertureSpec(diameter_m=100.0)),
+        trajectory=trajectory,
+        candidates=(A.CandidateAxis(parameter="aperture.diameter_m", values=(80.0, 120.0)),),
+        run_id="shapes")
+    products, manifest = physics.evaluate(spec)
+    sizes = {"candidate": 2, "sample": 7, "leg": 1}
+    for product_name, fields in _LEADING_AXES.items():
+        product = products.get(product_name)
+        assert product is not None, f"{product_name} was not produced"
+        for field_name, axes in fields.items():
+            array = getattr(product, field_name)
+            assert array is not None, f"{product_name}.{field_name} is None"
+            expected = tuple(sizes.get(axis, axis) for axis in axes)
+            assert np.shape(array) == expected, (
+                f"{product_name}.{field_name} is {np.shape(array)}, and §5 says {expected}")
+
+    # And the field's sample sets, whose point axis is the one thing that varies by sampling.
+    for name, sample_set in products.field.sets.items():
+        assert sample_set.intensity_w_m2.shape[:2] == (2, 7), f"{name}: {sample_set.intensity_w_m2.shape}"
+        assert sample_set.points_m.shape[:2] == (2, 7)
+        assert sample_set.points_m.shape[-1] == 3
+        assert sample_set.valid.shape == sample_set.intensity_w_m2.shape

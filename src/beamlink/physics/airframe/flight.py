@@ -111,17 +111,26 @@ def rectenna_mass_kg(belly_silhouette_area_m2, areal_density_kg_m2):
 
 
 def reserve(spec: AirframeSpec, cascade, design_speed_ms):
-    """P13's numbers: what the glide and the reserve battery buy, per candidate."""
+    """P13's numbers: what the glide and the reserve battery buy, per candidate.
+
+    Everything comes back with a candidate axis even where the value does not depend on the candidate
+    — the glide range is set by the airframe and the dropout altitude alone. P13 says (candidate,), so
+    P13 gets (candidate,): a product whose shape depends on which of its inputs happened to vary is a
+    product a consumer has to branch on, and I5 is about exactly that kind of surprise.
+    """
     cruise_terminals = (cruise_shaft_power_w(cascade["mtow_kg"], design_speed_ms, spec.lift_to_drag)
                         / spec.drivetrain_efficiency)
     battery_energy_j = (cascade["reserve_battery_kg"] * spec.battery_specific_energy_wh_per_kg
                         * 3600.0)
+    candidates = np.shape(cascade["mtow_kg"])
     # The glide uses the BARE airframe's lift-to-drag: the electric-propulsion integration bonus is
     # an energy-path advantage and is not available with the beam off.
-    range_km = glide_range_km(spec.airframe_lift_to_drag, spec.dropout_altitude_m)
+    range_km = np.broadcast_to(glide_range_km(spec.airframe_lift_to_drag,
+                                             spec.dropout_altitude_m), candidates).copy()
     return dict(
         glide_range_km=range_km,
         glide_duration_s=range_km * 1e3 / np.maximum(np.asarray(design_speed_ms, dtype=float), 1e-9),
         battery_duration_s=battery_energy_j / np.maximum(cruise_terminals, 1e-9),
-        powered_fraction=powered_fraction(design_speed_ms, spec.climb_rate_ms,
-                                          spec.airframe_lift_to_drag))
+        powered_fraction=np.broadcast_to(
+            powered_fraction(design_speed_ms, spec.climb_rate_ms, spec.airframe_lift_to_drag),
+            candidates).copy())

@@ -16,14 +16,12 @@ passes, and the calibration driver prints them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import numpy as np
 
 from beamlink.physics import aggregate, fidelity
 from beamlink.physics.beam_link import aperture as aperture_module
-from beamlink.physics.beam_link import capture as capture_module
-from beamlink.physics.beam_link import solver
 
 
 @dataclass(frozen=True)

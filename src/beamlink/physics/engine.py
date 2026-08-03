@@ -43,7 +43,7 @@ from beamlink import artifacts
 from beamlink.artifacts import products as product_types
 from beamlink.artifacts import serialize
 from beamlink.artifacts.manifest import Manifest, ProductStatus
-from beamlink.artifacts.spec import FieldSampling, RunSpec, ScenarioSpec
+from beamlink.artifacts.spec import RunSpec, ScenarioSpec
 from beamlink.physics import aggregate, fidelity, geo
 from beamlink.physics.airframe import flight
 from beamlink.physics.airframe import loft as loft_module

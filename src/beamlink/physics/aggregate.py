@@ -171,19 +171,3 @@ def definitions(span: str, serve_eta_floor: float) -> dict[str, AggregateDefinit
             note="Worst capture inside the served window — the design edge a fixed aperture has to "
                  "reach."),
     }
-
-
-def quantity_from_products(name: str, products) -> np.ndarray | None:
-    """Resolve an aggregate definition's `quantity` path against a Products bundle.
-
-    The definition names its input in the same words the product uses, and this is the one place
-    that mapping is written down; a definition naming something no product carries is a spec error
-    and shows up as a skipped aggregate rather than a silently wrong number.
-    """
-    if "/" in name:
-        return None                     # a ratio; the caller supplies both halves
-    product_name, _, field_name = name.partition(".")
-    product = products.get(product_name) if hasattr(products, "get") else None
-    if product is None:
-        return None
-    return getattr(product, field_name, None)

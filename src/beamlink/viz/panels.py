@@ -23,9 +23,17 @@ import plotly.graph_objects as go
 
 from beamlink import artifacts
 
-# ICNIRP 2020 / FCC OET-65 uncontrolled / IEEE C95.1-2019 all land on 10 W/m² above ~2 GHz. It lives
-# HERE, in the viewer, as an overlay on an emitted absolute field — never inside a product (§8 item 16).
+# Incident power density a member of the public may be exposed to, W/m². Above ~2 GHz ICNIRP 2020
+# (whole-body average, 30 min), FCC OET-65 "general population / uncontrolled" (1 mW/cm²) and
+# IEEE C95.1-2019 (unrestricted environment) all land on the same 10 W/m² plateau, so one number
+# covers every band this model uses; the controlled/occupational figure is 5× higher, which at these
+# gradients is under 20 % in radius — the same boundary one line-width out, and not worth drawing.
+#
+# It lives HERE, in the viewer, and ONLY here. The pre-SPEC `exposure_boundary` baked it into a
+# physics module together with a plot-window heuristic (§8 item 16); the verdict was that a
+# regulatory level is an overlay on an emitted field, which is why P5 emits absolute W/m².
 PUBLIC_EXPOSURE_LIMIT_W_M2 = 10.0
+OCCUPATIONAL_EXPOSURE_LIMIT_W_M2 = 50.0
 
 _TEMPLATE = "plotly_white"
 

@@ -1,17 +1,15 @@
 [project]
 name = "beamlink"
-version = "0.1.0"
-description = "Link budget and first-pass economics for microwave power beaming to aircraft"
+version = "0.2.0"
+description = "A physics engine for beamed microwave power to an aircraft, and the layers that read it"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
-    "pandas",
-    "plotly",
     "scipy>=1.17.1",
+    # viz/ only: plotly for the figures, contourpy to contour P5's emitted enclosed-energy field.
+    # Neither is importable from physics/ — tests/test_import_firewall.py asserts it.
+    "plotly",
     "contourpy",
-    # The plotly figures bake their heatmaps to PNG through matplotlib's colormaps
-    # (beam_link_animation._field_to_png) — a core render path, not just a diagnostic.
-    "matplotlib>=3.11.1",
 ]
 
 [project.optional-dependencies]

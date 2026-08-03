@@ -51,10 +51,6 @@ def local_enu(position_ecef):
     return east, north, up
 
 
-def altitude_of(position_ecef):
-    return np.linalg.norm(np.asarray(position_ecef, dtype=float), axis=-1) - R_EARTH
-
-
 def link(from_ecef, to_ecef):
     """(slant range m, elevation deg) of `to` as seen from `from`.
 

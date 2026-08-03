@@ -1,18 +1,18 @@
-"""Generate an ALTITUDE-RESOLVED atmospheric-absorption table for the beam-link engine.
+"""Generate an ALTITUDE-RESOLVED atmospheric-absorption table for the engine.
 
-Unlike generate_spectrum.py (which stores gaseous specific attenuation for a handful
-of named surface states), this walks the ITU-R standard atmosphere from sea level up
-through the stratosphere and stores gaseous specific attenuation as a function of BOTH
-frequency and altitude. The beam-link engine integrates it along a slant path, so the
-stratospheric dry-out (water vapour → ~0 above the tropopause) falls out of the profile
-itself rather than being asserted.
+This walks the ITU-R standard atmosphere from sea level up through the stratosphere and stores
+gaseous specific attenuation as a function of BOTH frequency and altitude. The engine integrates it
+along a slant path, so the stratospheric dry-out (water vapour → ~0 above the tropopause) falls out of
+the profile itself rather than being asserted. It is the ONE table the atmosphere model reads, and P10
+emits both its per-sample loss and its zenith spectrum from it; a separate specific-attenuation CSV for
+a figure to read is what `archive/pre-spec/generate_spectrum.py` used to produce, and that figure is
+now a panel over P10.
 
-itur is a heavy, generate-only dependency (astropy/scipy/pyproj), so it is NOT in
-pyproject; run this with an ephemeral install:
+itur is a heavy, generate-only dependency (astropy/scipy/pyproj), so it is an optional extra:
 
-    uv run --with itur python generate_atmosphere_profile.py
+    uv run --extra generators python -m beamlink.physics.beam_link.tables.generate_atmosphere_profile
 
-Output: data/atmosphere_profile.npz with
+Output: `beam_link/data/atmosphere_profile.npz` with
   frequency_ghz            (Nf,)          frequency grid
   altitude_m               (Nh,)          altitude grid
   gamma_gas_db_km          (Nh, Nf)       gaseous specific attenuation γ(h, f)
@@ -76,7 +76,7 @@ def build_profile():
 
 def main():
     p = build_profile()
-    out = Path(__file__).with_name("data") / "atmosphere_profile.npz"
+    out = Path(__file__).parents[1] / "data" / "atmosphere_profile.npz"
     out.parent.mkdir(exist_ok=True)
     np.savez_compressed(
         out,

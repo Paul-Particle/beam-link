@@ -11,17 +11,10 @@ import numpy as np
 
 SPEED_OF_LIGHT = 2.998e8   # m/s
 
-# Incident power density a member of the public may be exposed to, W/m². Above ~2 GHz ICNIRP 2020
-# (whole-body average, 30 min), FCC OET-65 "general population / uncontrolled" (1 mW/cm²) and
-# IEEE C95.1-2019 (unrestricted environment) all land on the same 10 W/m² plateau, so one constant
-# covers every band this model uses. The controlled/occupational figure is 5× higher.
-#
-# These are REFERENCE LEVELS, not engine parameters: no product bakes one in. The pre-SPEC
-# `exposure_boundary` did, together with a plot-window heuristic, which is why it is gone (§8 item
-# 16) — a regulatory line is a viewer overlay on the emitted field, and P5 emits the field in
-# absolute W/m² precisely so that overlay is possible.
-PUBLIC_EXPOSURE_LIMIT_W_M2 = 10.0
-OCCUPATIONAL_EXPOSURE_LIMIT_W_M2 = 50.0
+# The public and occupational exposure levels are deliberately NOT here. A regulatory level is a
+# viewer overlay on an emitted field (§8 item 16), P5 emits the field in absolute W/m² precisely so
+# that the overlay is possible, and no product bakes one in. They live in `viz/panels.py`, in one
+# place — having them here as well would be one number in two files, which is the drift I2 forbids.
 
 
 # --- beam coupling (Goubau) ---------------------------------------------------------------
@@ -57,13 +50,18 @@ def emitter_diameter_for_tau(frequency_ghz, slant_m, receiver_radius_m, tau_targ
                                          receiver_radius_m, tau_target)
 
 
+# --- a relation that is NOT on the chain ---------------------------------------------------
+# Kept because it is what makes a very large aperture arguable at all, and separated because
+# nothing in the engine multiplies by it: it is a requirement the design has to meet, not a factor.
+
+
 def surface_precision(frequency_hz, fraction=1 / 16):
     """Element-position KNOWLEDGE needed for phase correction (~λ/16), in m.
 
-    Not a mechanical flatness or rigidity requirement: a retrodirective array may flex freely
-    provided each element's position is known to this accuracy. The distinction is what keeps a
-    large tethered or aerostat-borne aperture on the table — 0.6 mm at 30 GHz is a metrology
-    problem, not a structural one.
+    Not a mechanical flatness or rigidity requirement: a retrodirective array may flex freely provided
+    each element's position is known to this accuracy. That distinction is what keeps a large tethered
+    or aerostat-borne aperture on the table — 0.6 mm at 30 GHz is a metrology problem, not a structural
+    one — and it is why `ApertureSpec.error_efficiency` is one number rather than a rigidity budget.
     """
     return wavelength(frequency_hz) * fraction
 

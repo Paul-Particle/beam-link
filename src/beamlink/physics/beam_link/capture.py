@@ -134,11 +134,6 @@ def overlap(context: solver.SolveContext, elements, incidence_floor, config: Fid
     return geometric, weighted, peak, solved
 
 
-def _peak_only(context: solver.SolveContext, config: FidelityConfig):
-    """The on-axis peak alone, for a compliance test that does not need the whole integral."""
-    return solver.solve(_ON_AXIS_SAMPLING, context, config).intensity_per_m2[:, 0]
-
-
 # --- the closed form ----------------------------------------------------------------------
 
 
