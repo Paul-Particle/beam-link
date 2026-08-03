@@ -50,7 +50,7 @@ Enforced by test, not convention (I8 below).
 |---|---|
 | I1 | **One solve per physical quantity per run.** Two code paths may not both compute the same field. Sampling one solve at different locations is not two solves. |
 | I2 | **No quantity appears under two names or two units.** No convenience aliases for consumers that would rather not branch. |
-| I3 | **Only the engine derives.** Every derived product names the primary it came from and carries its full definition (span, weighting, policy, statistic, sampling) as data. A derived product that cannot name its primary is illegal. |
+| I3 | **Derivation is owned and recorded.** Within a run the engine derives (P6–P9); across runs the driver does (D6). Every derived product names the inputs it came from and carries its full definition (span, weighting, policy, statistic, sampling) as data. A derived product that cannot name its inputs is illegal. |
 | I4 | **Consumers never derive.** They select, display, and cost. A consumer needing a different aggregate is a request for a new named engine product, not a local calculation. |
 | I5 | **Fidelity is part of product identity.** Same shape, same units, same semantics across tiers; method and resolution recorded per product. Mixing tiers within one presented result must be detectable. |
 | I6 | **Every derived product is recompute-checkable.** CI recomputes it from its primary and asserts agreement to a stated tolerance. This is what makes derived products safe rather than redundant. |
@@ -81,6 +81,10 @@ One `RunSpec` in, one run directory out.
 
 The manifest is the contract. A consumer pointed at a run learns from it alone what exists, at what
 fidelity, and what was asked for but not produced.
+
+A **study** is the same idea one level up (D6): `studies/<id>/manifest.json` names the runs it
+aggregated and the aggregation definition applied, with its results alongside in the same array format.
+Consumers load a study through the same `artifacts/` loaders they load a run through.
 
 ## 5. Product catalogue
 
@@ -380,16 +384,23 @@ as an unnamed derived quantity. Both domains must state their **power reference 
 the airframe's requirement and the link's delivered power quoted at the same named plane (rectenna
 terminals) — so the double count is structurally impossible rather than warned against.
 
-### Still open
+### D6 — cross-run aggregation is the driver's
 
-- **Who owns cross-run aggregation?** Route- and corridor-level numbers — energy per flight over a
-  route served by N stations — span several engine runs, and they are exactly what econ consumes. If
-  econ derives them, I4 is broken. Proposal: the same reduction machinery, driver-side, emitting a
-  study manifest that references the runs it aggregated and records the aggregation definition. Then
-  "who derived this and how" is answerable for a corridor number the same way it is for a pass
-  number, and econ still only selects. Needs a ruling before P9 is written. (With D4 settled this is
-  the driver's, since the driver already owns cross-scenario work — but it should be an explicit
-  ruling rather than an inference.)
+Route- and corridor-level numbers — energy per flight over a route served by N stations — span several
+engine runs, and they are exactly what econ consumes. The driver owns them, which follows from D4
+(it already owns cross-scenario work) and is now an explicit ruling rather than an inference.
+
+It uses the same reduction machinery and records the same way: a **study manifest** naming the runs it
+aggregated and the aggregation definition it applied. So "who derived this number and how" is
+answerable for a corridor figure exactly as it is for a pass figure, and econ still only selects.
+
+This is why I3 is worded as *derivation is owned and recorded* rather than "only the engine derives":
+the engine derives within a run, the driver derives across runs, and a consumer never derives at all.
+The line is not who is allowed to do arithmetic — it is that whoever does it is named in the output.
+
+### Nothing open
+
+All decisions needed to start are taken. Later ones get appended here as they are made (§11).
 
 ## 10. Order of work
 
