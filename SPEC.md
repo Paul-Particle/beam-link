@@ -1,8 +1,8 @@
 # beamlink — physics engine spec
 
-Status: **outline, agreed in principle, not yet implemented.** This document is the target shape.
-The current code does not conform; §8 is the backlog that gets it there and §9 lists the decisions
-still outstanding.
+Status: **outline, agreed in principle, not yet implemented.** This document is the target shape and
+the record of every decision behind it (§9). The current code does not conform; §8 is the backlog that
+gets it there. Built to completion and reviewed as a finished version — see §11.
 
 ## 1. What this is for
 
@@ -261,7 +261,7 @@ own transform-grid resolution, measured adequate in §6.
 ## 9. Decisions taken
 
 Settled 2026-08-03. Recorded here rather than in a transcript, because the engine is to be built to
-completion against them and reviewed as a finished version (§12).
+completion against them and reviewed as a finished version (§11).
 
 - **D1 — elevation is ground-referenced, and defined per link leg.** The elevation of a leg's
   receiving end as seen from its emitting end, above that end's local horizon. Ground→aircraft is
@@ -350,18 +350,6 @@ config. This is the one place in the repo where "oddly specific" is the correct 
 the driver is written last: its structure is a consequence of the finished engine and econ, not an
 input to either.
 
-### Still open
-
-- **Who owns cross-run aggregation?** Route- and corridor-level numbers — energy per flight over a
-  route served by N stations — span several engine runs, and they are exactly what econ consumes. If
-  econ derives them, I4 is broken. Proposal: the same reduction machinery, driver-side, emitting a
-  study manifest that references the runs it aggregated and records the aggregation definition. Then
-  "who derived this and how" is answerable for a corridor number the same way it is for a pass
-  number, and econ still only selects. Needs a ruling before P9 is written. (With D4 settled this is
-  the driver's, since the driver already owns cross-scenario work — but it should be an explicit
-  ruling rather than an inference.)
-*(D5 below settles the airframe question that was open here.)*
-
 ### D5 — the airframe is inside the engine
 
 `physics.airframe` alongside `physics.beam_link`: cruise and climb power, the mass cascade, glide
@@ -392,6 +380,17 @@ as an unnamed derived quantity. Both domains must state their **power reference 
 the airframe's requirement and the link's delivered power quoted at the same named plane (rectenna
 terminals) — so the double count is structurally impossible rather than warned against.
 
+### Still open
+
+- **Who owns cross-run aggregation?** Route- and corridor-level numbers — energy per flight over a
+  route served by N stations — span several engine runs, and they are exactly what econ consumes. If
+  econ derives them, I4 is broken. Proposal: the same reduction machinery, driver-side, emitting a
+  study manifest that references the runs it aggregated and records the aggregation definition. Then
+  "who derived this and how" is answerable for a corridor number the same way it is for a pass
+  number, and econ still only selects. Needs a ruling before P9 is written. (With D4 settled this is
+  the driver's, since the driver already owns cross-scenario work — but it should be an explicit
+  ruling rather than an inference.)
+
 ## 10. Order of work
 
 1. The two free speedups (§6) — no fidelity cost, and they make everything after this bearable. The
@@ -411,7 +410,7 @@ terminals) — so the double count is structurally impossible rather than warned
 
 Fidelity tiers land with the schema (I5), not after it.
 
-## 12. Working mode
+## 11. Working mode
 
 The engine is built to completion against §9 and reviewed as a finished version, rather than
 supervised step by step. That puts the burden on this document: **every decision taken along the way
@@ -434,7 +433,7 @@ airframe question above has to be settled now rather than discovered later, and 
 is general enough (D2) that the parked exposure work can return as a sampling request rather than as
 new physics, should exclusion-zone footprint turn out to be a siting cost.
 
-## 11. Evidence
+## 12. Evidence
 
 Measurements behind §1 and §6, taken 2026-08-03 on `92623bd`, reference case 5.8 GHz direct,
 100 m emitter, 11 km cruise, 10 MW delivered, clear air unless stated.
