@@ -56,6 +56,7 @@ Enforced by test, not convention (I8 below).
 | I6 | **Every derived product is recompute-checkable.** CI recomputes it from its primary and asserts agreement to a stated tolerance. This is what makes derived products safe rather than redundant. |
 | I7 | **Products carry physics, not presentation.** No label strings, no colours, no 0–1 normalised axes, no per-frame peak normalisation, no NaN-separated polylines, no layout or "how far to draw" arguments, no precision reduced for file size. |
 | I8 | **The import firewall is a test.** Consumers importing any physics module fails the suite. No exemptions. |
+| I9 | **The engine is vectorized over samples *and* over scenario candidates.** A batched call is the normal call; a single scenario is a batch of one. Data-dependent iteration runs lockstep with a config-set step count rather than branching per sample. Working memory is bounded by config-set chunking. See §6a. |
 
 Redundancy is not the enemy; **anonymity** is. A run may legitimately contain two efficiency figures
 provided each is named and defined. Two numbers both called "the pass efficiency" is the defect.
@@ -116,6 +117,44 @@ Scenarios without a receiver are legal: P5 and P4 exist, P3/P6/P7 do not, and co
 the manifest. That is the general form of the "pure focusing sweep" figure.
 
 ## 6. Fidelity
+
+### 6a. Vectorization
+
+This is expected to be the single largest lever on both run time and iteration speed, and it is a
+capability the driver and econ layers are entitled to rely on: a sweep evaluates as one batched call,
+and a search algorithm evaluates many candidate next steps at once.
+
+**Today it is a loop wearing a vectorized interface.** `evaluate`'s own docstring: *"An (n, 3)
+`plane_pos` is looped over and the results stacked, so every numeric entry becomes an array of length
+n."* That is why a pass costs 56–95 ms per sample. The encouraging part is that the expensive
+internals are already batch-shaped — `_axial_cuts` batches its FFT stack over propagation planes,
+`_overlap_taper_grid` batches over taper exponents — they are simply re-entered once per sample, so
+the batching is spent on the wrong axis. The work is to make (candidates × samples) the batch axis
+those kernels see, not to invent batching.
+
+Consequences, binding on the design:
+
+- **The scenario spec is batchable.** Design parameters may be arrays; products carry a leading
+  candidate axis; a run directory records that axis and the per-candidate parameter values. A single
+  scenario is a candidate axis of length 1, so there is one code path, not two.
+- **Data-dependent iteration goes lockstep.** The adaptive taper search already evaluates a full grid
+  and needs no change. The density-cap defocus bisection currently early-exits per sample; vectorized,
+  it runs a fixed number of bisection steps for every sample, with the count set by the fidelity
+  config as a tolerance. Marginally more arithmetic per sample, uniform cost, and it vectorizes.
+- **Ragged inner axes need a padding convention.** The silhouette element cloud has a different size
+  at every look angle, so batching across samples means padding plus a validity mask — the same
+  device P5 already uses for unresolved field regions, applied in the schema generally.
+- **Working memory is the binding resource, not output size.** Chunk sizes come from config (the
+  existing heuristic in `_axial_cuts` generalises), so a batch that would not fit is computed in
+  blocks rather than refused.
+- **The silhouette raster is the one kernel that does not vectorize for free** — it is a z-buffer loop
+  over mesh triangles, and the dominant cost. Batching it over look angles is a real piece of work;
+  the fidelity ladder's coarse-mesh and closed-form tiers (§6) are the alternatives, and the existing
+  convex silhouette table is the vectorized-but-occlusion-free path.
+
+Econ is expected to be vectorized in the same shape, which makes it an obligation on the artifacts
+layer: loaders expose arrays with named axes (candidate, sample, …), never per-sample objects that
+force a consumer to loop.
 
 **Run time against accuracy is the only trade axis, and every point on it is set from the config.**
 Nothing else — output size in particular — is a design constraint: the one place size ever mattered
@@ -258,11 +297,25 @@ new file inherits the rule from its directory:
     artifacts/  — read-only loaders and dataclasses; imports nothing from engine/
     viz/        — may import artifacts/ only
     econ/       — may import artifacts/ only
-    drivers/    — may invoke engine/ (that is their job); may not reimplement any part of it
+    drivers/    — may invoke engine/ AND econ/; may not reimplement any part of either
 
 A driver that calls `engine.evaluate()` computes no physics itself, so this is a classification, not
 an exemption — the same resolution as the Hankel ground truth in §2. Viz and econ never appear on the
 permitted side of any rule.
+
+**The driver owns sweeps, optimisation, and the orchestration between them.** It is the only layer
+that sees both sides, and it has to: an economic objective cannot be searched for in physics space
+without evaluating econ, and exhaustive sweeps are affordable only in the simplest cases, so anything
+else needs a search loop that alternates between asking the engine a physical question and asking econ
+what the answer is worth. Both modes are first-class — sweep *and* search — which is why I9 matters:
+a search that can only propose one candidate at a time wastes the batching that makes the search
+affordable.
+
+A driver is therefore allowed to be **specific**. Its workflow is dictated by the particular interplay
+of a given econ objective and the physics it depends on, and it takes that specificity through its
+config. This is the one place in the repo where "oddly specific" is the correct shape, and it is why
+the driver is written last: its structure is a consequence of the finished engine and econ, not an
+input to either.
 
 ### Still open
 
@@ -271,7 +324,18 @@ permitted side of any rule.
   econ derives them, I4 is broken. Proposal: the same reduction machinery, driver-side, emitting a
   study manifest that references the runs it aggregated and records the aggregation definition. Then
   "who derived this and how" is answerable for a corridor number the same way it is for a pass
-  number, and econ still only selects. Needs a ruling before P9 is written.
+  number, and econ still only selects. Needs a ruling before P9 is written. (With D4 settled this is
+  the driver's, since the driver already owns cross-scenario work — but it should be an explicit
+  ruling rather than an inference.)
+- **Is the airframe and flight model inside this engine?** `airframe` (cruise and climb power, the
+  mass cascade, glide reserve, lift-to-drag) is physics, and econ calls it directly today —
+  `econ_pass2` takes `CRUISE_MW` straight from `airframe.mass_buildup`, which the firewall forbids. It
+  is also a *different physical domain* from the link, and §5's catalogue is entirely link products,
+  so there is a real gap either way. It couples to the link in both directions: delivered power sets
+  what the aircraft can do, and rectenna mass feeds the mass cascade which sets the power required.
+  Recommendation: yes, inside — it is physics, econ must not compute it, and the catalogue gains a
+  flight-mechanics section whose products are indexed the same way. Needs a ruling because it widens
+  what "the engine" means.
 
 ## 10. Order of work
 
@@ -300,8 +364,20 @@ is recorded here**, with its rationale and the measurement behind it where there
 review can be a discussion of recorded choices rather than an archaeology of the diff. A choice made
 in passing and not written down is a defect in the same way an unnamed derived quantity is.
 
+**Physics first, in the shape agreed in §9. Driver and econ second, from what the finished physics
+actually look like.** Viz is also second, but is expected to need comparatively little rewriting: it
+was already reading per-frame physics, and most of its work becomes selection.
+
 Viz and econ are expected to be broken while this happens. Econ is rewritten from scratch afterwards
 and nothing in the present econ constrains the design.
+
+Building physics before its consumers is safe for a specific reason worth stating, since it is doing
+real work here: **derived products are additive.** A consumer that later needs a differently-defined
+aggregate is a new named P9 product over unchanged primaries, which I3/I6 make cheap and checkable.
+The ordering only bites if a consumer needs a physical quantity no primary carries — which is why the
+airframe question above has to be settled now rather than discovered later, and why the field sampler
+is general enough (D2) that the parked exposure work can return as a sampling request rather than as
+new physics, should exclusion-zone footprint turn out to be a siting cost.
 
 ## 11. Evidence
 
